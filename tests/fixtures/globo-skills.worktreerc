@@ -1,0 +1,13 @@
+# Representative global-skills legacy configuration.
+SYMLINK_PATHS=(
+  "uploads"
+  ".claude/settings.local.json"
+)
+RELINK_PATHS=(
+  "CLAUDE.md"
+  ".claude"
+)
+WORKTREE_COPY_CODEGRAPH=1
+WORKTREE_SLUG_MAX=60
+WORKTREE_INSTALL_CMD='pnpm install'
+WORKTREE_BUILD_CMD="pnpm exec turbo run build --filter='./packages/*'"

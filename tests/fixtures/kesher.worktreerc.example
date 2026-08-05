@@ -1,0 +1,10 @@
+# Representative Kesher legacy configuration.
+SYMLINK_PATHS=(
+)
+RELINK_PATHS=(
+)
+WORKTREE_ROOT="../repo-root"
+WORKTREE_DIR_PREFIX="kesher-"
+WORKTREE_SLUG_MAX=60
+WORKTREE_INSTALL_CMD='pnpm install'
+WORKTREE_BUILD_CMD='pnpm --filter @kesher/contracts --filter @kesher/db build'
