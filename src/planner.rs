@@ -1074,13 +1074,12 @@ mod tests {
             environment_allowlist: Vec::new(),
         }];
         let mut mismatch = value.clone();
-        if let Some(artifact) = mismatch.manifests[0].artifacts.first_mut() {
-            if let Some(Compensation::RestoreReplacedSymlink(compensation)) =
+        if let Some(artifact) = mismatch.manifests[0].artifacts.first_mut()
+            && let Some(Compensation::RestoreReplacedSymlink(compensation)) =
                 artifact.compensation.as_mut()
-            {
-                compensation.expected_current =
-                    ObjectId::new("ffffffffffffffffffffffffffffffffffffffff").unwrap();
-            }
+        {
+            compensation.expected_current =
+                ObjectId::new("ffffffffffffffffffffffffffffffffffffffff").unwrap();
         }
         assert!(plan_create(mismatch).is_err());
         let plan = plan_create(value).unwrap();

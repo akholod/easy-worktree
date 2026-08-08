@@ -406,10 +406,10 @@ fn validate_raw(raw: &RawConfig, path: &Path, source: &str) -> Result<(), Config
         return Err(invalid(path, "schema must be 1"));
     }
     if let Some(create) = &raw.create {
-        if let Some(cap) = create.slug_max_bytes {
-            if cap < 8 {
-                return Err(invalid(path, "create.slug_max_bytes must be at least 8"));
-            }
+        if let Some(cap) = create.slug_max_bytes
+            && cap < 8
+        {
+            return Err(invalid(path, "create.slug_max_bytes must be at least 8"));
         }
         if let Some(root) = &create.worktree_root {
             validate_root(root).map_err(|message| invalid(path, message))?;
@@ -418,15 +418,14 @@ fn validate_raw(raw: &RawConfig, path: &Path, source: &str) -> Result<(), Config
             validate_prefix(prefix).map_err(|message| invalid(path, message))?;
         }
     }
-    if let Some(git) = &raw.git {
-        if let Some(remote) = &git.remote {
-            if remote.trim().is_empty() || remote.chars().any(|c| c.is_control() || c == '\0') {
-                return Err(invalid(
-                    path,
-                    "git.remote must be a nonempty name without controls",
-                ));
-            }
-        }
+    if let Some(git) = &raw.git
+        && let Some(remote) = &git.remote
+        && (remote.trim().is_empty() || remote.chars().any(|c| c.is_control() || c == '\0'))
+    {
+        return Err(invalid(
+            path,
+            "git.remote must be a nonempty name without controls",
+        ));
     }
     for (name, rule) in &raw.file_rules {
         validate_name(name, path)?;
@@ -486,10 +485,10 @@ fn validate_raw(raw: &RawConfig, path: &Path, source: &str) -> Result<(), Config
             }
             _ => {}
         }
-        if let Some(source_root) = &rule.source_root {
-            if !["current_worktree", "primary_worktree"].contains(&source_root.as_str()) {
-                return Err(invalid(path, "invalid source_root"));
-            }
+        if let Some(source_root) = &rule.source_root
+            && !["current_worktree", "primary_worktree"].contains(&source_root.as_str())
+        {
+            return Err(invalid(path, "invalid source_root"));
         }
         for exclude in rule.excludes.as_deref().unwrap_or(&[]) {
             validate_relative(exclude).map_err(|message| invalid(path, message))?;
@@ -673,8 +672,8 @@ impl State {
                     .scalars
                     .insert("create.default_base".into(), provenance.clone());
             }
-            if create.slug_max_bytes.is_some() {
-                self.config.create.slug_max_bytes = create.slug_max_bytes.unwrap();
+            if let Some(slug_max_bytes) = create.slug_max_bytes {
+                self.config.create.slug_max_bytes = slug_max_bytes;
                 self.provenance
                     .scalars
                     .insert("create.slug_max_bytes".into(), provenance.clone());
@@ -692,13 +691,13 @@ impl State {
                     .insert("create.directory_prefix".into(), provenance.clone());
             }
         }
-        if let Some(git) = raw.git {
-            if let Some(remote) = git.remote {
-                self.config.git.remote = remote;
-                self.provenance
-                    .scalars
-                    .insert("git.remote".into(), provenance.clone());
-            }
+        if let Some(git) = raw.git
+            && let Some(remote) = git.remote
+        {
+            self.config.git.remote = remote;
+            self.provenance
+                .scalars
+                .insert("git.remote".into(), provenance.clone());
         }
         apply_rules(
             &mut self.config.file_rules,
@@ -724,13 +723,13 @@ impl State {
         Ok(())
     }
     fn apply_overrides(&mut self, overrides: &ConfigOverrides) -> Result<(), ConfigError> {
-        if let Some(value) = overrides.slug_max_bytes {
-            if value < 8 {
-                return Err(invalid(
-                    Path::new("<cli>"),
-                    "slug_max_bytes must be at least 8",
-                ));
-            }
+        if let Some(value) = overrides.slug_max_bytes
+            && value < 8
+        {
+            return Err(invalid(
+                Path::new("<cli>"),
+                "slug_max_bytes must be at least 8",
+            ));
         }
         if let Some(value) = &overrides.worktree_root {
             validate_root(value).map_err(|m| invalid(Path::new("<cli>"), m))?;

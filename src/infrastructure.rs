@@ -456,9 +456,12 @@ fn manifest_candidates(
     root: &Path,
     rule: &ManifestRuleSpec,
 ) -> Result<Vec<(PathBuf, PathBuf)>, PlanningError> {
-    ensure_no_symlink_components(root)?;
+    let root = root
+        .canonicalize()
+        .map_err(|error| planning("source_read", &error.to_string()))?;
+    ensure_no_symlink_components(&root)?;
     let mut paths = if rule.ignored_only {
-        ignored_candidates(root)?
+        ignored_candidates(&root)?
     } else {
         Vec::new()
     };
@@ -475,7 +478,7 @@ fn manifest_candidates(
             {
                 paths.push((source, source_path));
             } else if metadata.is_dir() && rule.kind == crate::config::FileRuleKind::CopyTree {
-                walk_candidates(root, &source, &mut paths)?;
+                walk_candidates(&root, &source, &mut paths)?;
             } else if metadata.is_dir() {
                 return Err(planning(
                     "source_type",
@@ -488,7 +491,7 @@ fn manifest_candidates(
                 ));
             }
         } else {
-            walk_candidates(root, Path::new(""), &mut paths)?;
+            walk_candidates(&root, Path::new(""), &mut paths)?;
         }
     }
     let matcher = GlobBuilder::new(&rule.source)
@@ -500,7 +503,7 @@ fn manifest_candidates(
     let mut result = Vec::new();
     for (relative, source) in paths {
         let matches = if rule.match_mode == crate::config::MatchMode::Path {
-            relative == PathBuf::from(&rule.source)
+            relative == Path::new(&rule.source)
                 || (rule.kind == crate::config::FileRuleKind::CopyTree
                     && relative.starts_with(Path::new(&rule.source)))
         } else {
@@ -555,13 +558,13 @@ fn ensure_no_symlink_components(path: &Path) -> Result<(), PlanningError> {
     };
     for component in path.components() {
         cursor.push(component.as_os_str());
-        if let Ok(metadata) = std::fs::symlink_metadata(&cursor) {
-            if metadata.file_type().is_symlink() {
-                return Err(planning(
-                    "unsafe_source",
-                    "source path contains a symlink component",
-                ));
-            }
+        if let Ok(metadata) = std::fs::symlink_metadata(&cursor)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(planning(
+                "unsafe_source",
+                "source path contains a symlink component",
+            ));
         }
     }
     Ok(())
@@ -1730,6 +1733,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn trusted_root_alias_is_allowed_but_nested_symlink_is_rejected() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir(temp.path().join("nested")).unwrap();
+        std::fs::write(temp.path().join("nested/file"), b"x").unwrap();
+        std::os::unix::fs::symlink(temp.path(), temp.path().join("root-alias")).unwrap();
+
+        let allowed = manifest_rule(
+            "schema = 1\n[file_rules.file]\nkind = \"copy\"\nsource = \"nested/file\"\ndestination = \"file\"\n",
+            "file",
+        );
+        assert_eq!(
+            manifest_candidates(&temp.path().join("root-alias"), &allowed)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        std::os::unix::fs::symlink("nested", temp.path().join("nested-alias")).unwrap();
+        let rejected = manifest_rule(
+            "schema = 1\n[file_rules.file]\nkind = \"copy\"\nsource = \"nested-alias/file\"\ndestination = \"file\"\n",
+            "file",
+        );
+        assert_eq!(
+            manifest_candidates(&temp.path().join("root-alias"), &rejected)
+                .unwrap_err()
+                .code,
+            "unsafe_source"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn relink_preserves_relative_and_absolute_targets() {
         let temp = TempDir::new().unwrap();
         std::fs::write(temp.path().join("file"), b"x").unwrap();
@@ -2201,14 +2236,14 @@ mod tests {
             .data
             .worktrees
             .iter()
-            .find(|worktree| worktree.path == linked)
+            .find(|worktree| same_path(&worktree.path, &linked))
             .unwrap();
         assert_eq!(linked_item.classification, WorktreeClass::Linked);
         let detached_item = detached_data
             .data
             .worktrees
             .iter()
-            .find(|worktree| worktree.path == detached)
+            .find(|worktree| same_path(&worktree.path, &detached))
             .unwrap();
         assert_eq!(detached_item.classification, WorktreeClass::Linked);
         assert!(detached_item.detached);
@@ -2228,7 +2263,7 @@ mod tests {
             .data
             .worktrees
             .iter()
-            .find(|worktree| worktree.path == bare)
+            .find(|worktree| same_path(&worktree.path, &bare))
             .unwrap();
         assert_eq!(bare_item.classification, WorktreeClass::Bare);
         assert_ne!(bare_item.classification, WorktreeClass::Primary);

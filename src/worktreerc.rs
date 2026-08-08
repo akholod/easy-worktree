@@ -86,10 +86,10 @@ impl Parser {
             if matches!(self.peek(), Some('#')) {
                 self.skip_comment();
             }
-            if let Some(char) = self.peek() {
-                if char != '\n' {
-                    return Err(vec![self.error("unexpected trailing token")]);
-                }
+            if let Some(char) = self.peek()
+                && char != '\n'
+            {
+                return Err(vec![self.error("unexpected trailing token")]);
             }
         }
         Ok((assignments, diagnostics))
