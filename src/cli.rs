@@ -33,6 +33,27 @@ pub enum Action {
         #[arg(long, value_name = "PATH")]
         path: Option<std::path::PathBuf>,
     },
+    Recover {
+        #[command(subcommand)]
+        action: RecoverAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecoverAction {
+    List {
+        #[arg(long)]
+        json: bool,
+        #[arg(long, value_name = "PATH")]
+        repo: Option<std::path::PathBuf>,
+    },
+    Show {
+        operation_id: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, value_name = "PATH")]
+        repo: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Debug, Args)]

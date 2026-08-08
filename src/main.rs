@@ -3,6 +3,8 @@ pub mod cli;
 pub mod config;
 pub mod domain;
 pub mod infrastructure;
+pub mod journal;
+pub mod journal_store;
 pub mod lifecycle;
 mod output;
 pub mod planner;
@@ -84,6 +86,39 @@ fn main() -> ExitCode {
             },
             json,
         ),
+        cli::Action::Recover { action } => match action {
+            cli::RecoverAction::List { json, repo } => (
+                Request::RecoverList {
+                    repo: repo.unwrap_or_else(|| PathBuf::from(".")),
+                },
+                json,
+            ),
+            cli::RecoverAction::Show {
+                operation_id,
+                json,
+                repo,
+            } => {
+                let id = match operation_id.parse() {
+                    Ok(id) => id,
+                    Err(_) => {
+                        return unavailable(
+                            "recover_show",
+                            true,
+                            json,
+                            "invalid_operation_id",
+                            "invalid operation id".into(),
+                        );
+                    }
+                };
+                (
+                    Request::RecoverShow {
+                        repo: repo.unwrap_or_else(|| PathBuf::from(".")),
+                        operation_id: id,
+                    },
+                    json,
+                )
+            }
+        },
         cli::Action::Config { action } => match action {
             cli::ConfigAction::Show {
                 json,

@@ -26,6 +26,8 @@ enum JsonData {
     Edited { path: crate::domain::PathDto },
     Doctor { checks: Vec<JsonCheck> },
     OperationPlan(crate::lifecycle::OperationPlan),
+    JournalList(Vec<crate::journal::Journal>),
+    Journal(crate::journal::Journal),
 }
 
 #[derive(serde::Serialize)]
@@ -83,6 +85,26 @@ pub fn render_text(outcome: &AppOutcome) -> Result<String, String> {
         Ok(ResponseData::OperationPlan(plan)) => serde_json::to_string_pretty(plan)
             .map_err(|e| e.to_string())
             .map(|s| format!("{s}\n")),
+        Ok(ResponseData::JournalList(items)) => {
+            let mut text = String::new();
+            for item in items {
+                writeln!(
+                    text,
+                    "{}\t{}\trevision {}",
+                    item.operation_id(),
+                    item.status().as_str(),
+                    item.revision()
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            Ok(text)
+        }
+        Ok(ResponseData::Journal(item)) => Ok(format!(
+            "operation {}\nstatus: {}\nrevision: {}\n",
+            item.operation_id(),
+            item.status().as_str(),
+            item.revision()
+        )),
         Err(failure) => Err(format!(
             "{}: {}",
             failure.diagnostic.code, failure.diagnostic.message
@@ -110,6 +132,8 @@ fn json_data(data: &ResponseData) -> JsonData {
                 .collect(),
         },
         ResponseData::OperationPlan(value) => JsonData::OperationPlan(value.clone()),
+        ResponseData::JournalList(value) => JsonData::JournalList(value.clone()),
+        ResponseData::Journal(value) => JsonData::Journal(value.clone()),
     }
 }
 

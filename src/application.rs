@@ -15,6 +15,16 @@ pub trait RepositoryPort {
     type Error: std::error::Error + Send + Sync + 'static;
     fn list(&self, path: &Path) -> Result<ListResult, Self::Error>;
 }
+pub trait RecoveryPort {
+    type Error: std::error::Error + Send + Sync + 'static;
+    fn recover_list(&self, repo: &Path) -> Result<Vec<crate::journal::Journal>, Self::Error>;
+    fn recover_show(
+        &self,
+        repo: &Path,
+        id: &crate::lifecycle::OperationId,
+    ) -> Result<crate::journal::Journal, Self::Error>;
+    fn recovery_error_code(error: &Self::Error) -> &'static str;
+}
 
 pub trait ConfigLocationPort {
     fn locations(&self, repo: &Path) -> Result<ConfigLocations, String>;
@@ -159,6 +169,8 @@ pub enum ResponseData {
     ConfigEdit(EditResult),
     Doctor(DoctorReport),
     OperationPlan(crate::lifecycle::OperationPlan),
+    JournalList(Vec<crate::journal::Journal>),
+    Journal(crate::journal::Journal),
 }
 
 pub fn operation_plan_data(plan: crate::lifecycle::OperationPlan) -> ResponseData {
@@ -246,6 +258,13 @@ pub enum Request {
     },
     CreatePlan(CreatePlanRequest),
     RemovePlan(RemovePlanRequest),
+    RecoverList {
+        repo: PathBuf,
+    },
+    RecoverShow {
+        repo: PathBuf,
+        operation_id: crate::lifecycle::OperationId,
+    },
 }
 
 pub struct Application<'a, R, S> {
@@ -255,7 +274,7 @@ pub struct Application<'a, R, S> {
 
 impl<'a, R, S> Application<'a, R, S>
 where
-    R: RepositoryPort,
+    R: RepositoryPort + RecoveryPort,
     S: ConfigLocationPort
         + ConfigFilePort
         + EditorPort
@@ -278,6 +297,41 @@ where
             Request::Doctor { path } => self.doctor(&path),
             Request::CreatePlan(request) => self.create_plan(request),
             Request::RemovePlan(request) => self.remove_plan(request),
+            Request::RecoverList { repo } => self.recover_list(&repo),
+            Request::RecoverShow { repo, operation_id } => self.recover_show(&repo, &operation_id),
+        }
+    }
+
+    fn recover_list(&self, repo: &Path) -> AppOutcome {
+        match self.repository.recover_list(repo) {
+            Ok(value) => {
+                AppOutcome::ok("recover_list", ResponseData::JournalList(value), Vec::new())
+            }
+            Err(error) => AppOutcome::fail(
+                "recover_list",
+                diagnostic(
+                    R::recovery_error_code(&error),
+                    error.to_string(),
+                    None,
+                    None,
+                    None,
+                ),
+            ),
+        }
+    }
+    fn recover_show(&self, repo: &Path, id: &crate::lifecycle::OperationId) -> AppOutcome {
+        match self.repository.recover_show(repo, id) {
+            Ok(value) => AppOutcome::ok("recover_show", ResponseData::Journal(value), Vec::new()),
+            Err(error) => AppOutcome::fail(
+                "recover_show",
+                diagnostic(
+                    R::recovery_error_code(&error),
+                    error.to_string(),
+                    None,
+                    None,
+                    None,
+                ),
+            ),
         }
     }
 
@@ -756,6 +810,22 @@ mod tests {
                 },
                 warnings: Vec::new(),
             })
+        }
+    }
+    impl RecoveryPort for FakeRepository {
+        type Error = io::Error;
+        fn recover_list(&self, _repo: &Path) -> Result<Vec<crate::journal::Journal>, Self::Error> {
+            Err(io::Error::other("unused"))
+        }
+        fn recover_show(
+            &self,
+            _repo: &Path,
+            _id: &crate::lifecycle::OperationId,
+        ) -> Result<crate::journal::Journal, Self::Error> {
+            Err(io::Error::other("unused"))
+        }
+        fn recovery_error_code(_error: &Self::Error) -> &'static str {
+            "journal_error"
         }
     }
 

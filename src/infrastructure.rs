@@ -14,7 +14,7 @@ use unicode_normalization::UnicodeNormalization;
 use crate::{
     application::{
         CreatePlanRequest, CreatePlanningFacts, CreateSourceRequest, LifecyclePlanningPort,
-        ManifestPlanningPort, ManifestRuleSpec, PlanningError, RemovePlanRequest,
+        ManifestPlanningPort, ManifestRuleSpec, PlanningError, RecoveryPort, RemovePlanRequest,
         RemovePlanningFacts, RepositoryPort,
     },
     domain::{
@@ -42,6 +42,14 @@ pub enum GitError {
 }
 
 pub struct GitCli;
+
+#[derive(Debug, thiserror::Error)]
+pub enum RecoveryError {
+    #[error("repository discovery failed: {0}")]
+    Repository(String),
+    #[error(transparent)]
+    Journal(#[from] crate::journal_store::JournalError),
+}
 
 pub fn repository_roots(path: &Path) -> Result<(PathBuf, PathBuf), GitError> {
     let root = match git(path, ["rev-parse", "--show-toplevel"]) {
@@ -138,6 +146,57 @@ impl RepositoryPort for GitCli {
             },
             warnings,
         })
+    }
+}
+
+impl RecoveryPort for GitCli {
+    type Error = RecoveryError;
+    fn recover_list(&self, repo: &Path) -> Result<Vec<crate::journal::Journal>, Self::Error> {
+        let common = discover(repo)
+            .map_err(|e| RecoveryError::Repository(e.to_string()))?
+            .common;
+        crate::journal_store::JournalStore::new(&common)
+            .list()
+            .map_err(RecoveryError::Journal)
+    }
+    fn recover_show(
+        &self,
+        repo: &Path,
+        id: &crate::lifecycle::OperationId,
+    ) -> Result<crate::journal::Journal, Self::Error> {
+        let common = discover(repo)
+            .map_err(|e| RecoveryError::Repository(e.to_string()))?
+            .common;
+        crate::journal_store::JournalStore::new(&common)
+            .read(id)
+            .map_err(RecoveryError::Journal)
+    }
+    fn recovery_error_code(error: &Self::Error) -> &'static str {
+        match error {
+            RecoveryError::Repository(_) => "repository_error",
+            RecoveryError::Journal(crate::journal_store::JournalError::NotFound) => {
+                "journal_not_found"
+            }
+            RecoveryError::Journal(crate::journal_store::JournalError::InvalidId) => {
+                "invalid_operation_id"
+            }
+            RecoveryError::Journal(crate::journal_store::JournalError::Corrupt(_)) => {
+                "journal_corrupt"
+            }
+            RecoveryError::Journal(crate::journal_store::JournalError::RepositoryBusy) => {
+                "repository_busy"
+            }
+            RecoveryError::Journal(crate::journal_store::JournalError::RevisionConflict) => {
+                "journal_revision_conflict"
+            }
+            RecoveryError::Journal(crate::journal_store::JournalError::ImmutableMismatch) => {
+                "journal_immutable_mismatch"
+            }
+            RecoveryError::Journal(crate::journal_store::JournalError::InvalidTransition) => {
+                "journal_invalid_transition"
+            }
+            RecoveryError::Journal(crate::journal_store::JournalError::Io(_)) => "journal_io",
+        }
     }
 }
 

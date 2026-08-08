@@ -15,6 +15,11 @@ impl OperationId {
         self.0
     }
 }
+impl fmt::Display for OperationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
 impl FromStr for OperationId {
     type Err = uuid::Error;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -524,6 +529,74 @@ impl OperationPlan {
     pub fn granted_consents(&self) -> &BTreeSet<ConsentId> {
         &self.granted_consents
     }
+    pub fn validate_persisted(&self) -> Result<(), String> {
+        if self.plan_schema_version != 1 {
+            return Err("unsupported operation plan schema".into());
+        }
+        let restored = Self::new(OperationPlanDraft {
+            operation_id: self.operation_id,
+            kind: self.kind,
+            repository: self.repository.clone(),
+            intent: self.intent.clone(),
+            preconditions: self.preconditions.clone(),
+            steps: self.steps.clone(),
+            risks: self.risks.clone(),
+            required_consents: self.required_consents.clone(),
+            granted_consents: self.granted_consents.clone(),
+        })?;
+        if restored != *self {
+            return Err("persisted operation plan is not canonical".into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_plan(step_count: usize) -> OperationPlan {
+    let repository = RepositoryIdentity {
+        common_dir: StoredPath::from(std::path::PathBuf::from("/r/.git")),
+        primary_root: StoredPath::from(std::path::PathBuf::from("/r")),
+        repository_oid: ObjectId::new("0000000000000000000000000000000000000000").unwrap(),
+    };
+    let branch = BranchName::new("feature").unwrap();
+    let source = CreateSource::NewBranch { branch, base: None };
+    let intent = OperationIntent::Create(CreateIntent {
+        repository: repository.clone(),
+        source: source.clone(),
+        destination: Some(StoredPath::from(std::path::PathBuf::from("/w"))),
+        selected_tasks: BTreeSet::new(),
+        skipped_rules: BTreeSet::new(),
+        granted_consents: BTreeSet::new(),
+    });
+    let steps = (0..step_count)
+        .map(|index| {
+            PlanStep::new(
+                StepId::new(format!("step-{index}")).unwrap(),
+                format!("step-{index}"),
+                StepAction::CreateWorktree {
+                    destination: StoredPath::from(std::path::PathBuf::from(format!("/w/{index}"))),
+                    source: source.clone(),
+                },
+                Vec::new(),
+                Vec::new(),
+                None,
+                false,
+            )
+            .unwrap()
+        })
+        .collect();
+    OperationPlan::new(OperationPlanDraft {
+        operation_id: OperationId::new(Uuid::new_v4()),
+        kind: OperationKind::Create,
+        repository,
+        intent,
+        preconditions: Vec::new(),
+        steps,
+        risks: Vec::new(),
+        required_consents: Vec::new(),
+        granted_consents: BTreeSet::new(),
+    })
+    .unwrap()
 }
 
 #[cfg(test)]
