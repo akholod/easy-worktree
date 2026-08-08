@@ -318,6 +318,70 @@ fn remove_dirty_worktree_requires_explicit_flag() {
     assert_eq!(json(&allowed)["data"]["kind"], "remove");
 }
 
+#[cfg(unix)]
+#[test]
+fn process_paths_resolve_through_repository_and_worktree_aliases() {
+    let fixture = RepoFixture::new();
+    let repo_alias = fixture._temp.path().join("repo-alias");
+    std::os::unix::fs::symlink(&fixture.repo, &repo_alias).unwrap();
+    let destination = fixture._temp.path().join("alias-destination");
+    let before_create = fixture.snapshot();
+    let create = fixture.command(&[
+        "create",
+        "--new",
+        "alias-feature",
+        "--base",
+        "HEAD",
+        "--repo",
+        repo_alias.to_str().unwrap(),
+        "--path",
+        destination.to_str().unwrap(),
+        "--plan",
+        "--json",
+    ]);
+    assert!(
+        create.status.success(),
+        "create failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&create.stdout),
+        String::from_utf8_lossy(&create.stderr)
+    );
+    assert_eq!(json(&create)["data"]["kind"], "create");
+    assert!(!destination.exists());
+    assert_eq!(before_create, fixture.snapshot());
+
+    let linked = fixture._temp.path().join("linked-real");
+    git(
+        &fixture.repo,
+        [
+            "worktree",
+            "add",
+            "-b",
+            "alias-linked",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let linked_alias = fixture._temp.path().join("linked-alias");
+    std::os::unix::fs::symlink(&linked, &linked_alias).unwrap();
+    let before_remove = fixture.snapshot();
+    let remove = fixture.command(&[
+        "remove",
+        linked_alias.to_str().unwrap(),
+        "--repo",
+        repo_alias.to_str().unwrap(),
+        "--plan",
+        "--json",
+    ]);
+    assert!(
+        remove.status.success(),
+        "remove failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    assert_eq!(json(&remove)["data"]["kind"], "remove");
+    assert!(linked.exists());
+    assert_eq!(before_remove, fixture.snapshot());
+}
+
 #[test]
 fn enabled_env_rule_is_manifested_without_writing_destination() {
     let fixture = RepoFixture::new();

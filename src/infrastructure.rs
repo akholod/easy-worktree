@@ -194,10 +194,12 @@ impl LifecyclePlanningPort for GitCli {
             .worktrees
             .iter()
             .filter_map(|item| {
-                let root = planner::normalize_lexical(item.path.clone());
-                let cwd = planner::normalize_lexical(request.invocation_cwd.clone());
-                (cwd == root || cwd.starts_with(&root))
-                    .then_some((root.components().count(), item.path.clone()))
+                path_is_within(&item.path, &request.invocation_cwd).then_some((
+                    planner::normalize_lexical(item.path.clone())
+                        .components()
+                        .count(),
+                    item.path.clone(),
+                ))
             })
             .max_by_key(|(depth, _)| *depth)
             .map(|(_, path)| path)
@@ -941,11 +943,19 @@ fn destination_facts(path: PathBuf) -> Result<DestinationFacts, PlanningError> {
         .parent()
         .ok_or_else(|| planning("unsafe_parent", "destination has no parent"))?
         .to_owned();
-    let mut cursor = parent.clone();
-    loop {
+    let mut cursor = PathBuf::new();
+    let mut passed_normal_component = false;
+    if parent.is_absolute() {
+        cursor.push(std::path::MAIN_SEPARATOR.to_string());
+    }
+    for component in parent.components() {
+        cursor.push(component.as_os_str());
         let metadata = std::fs::symlink_metadata(&cursor)
             .map_err(|error| planning("unsafe_parent", &error.to_string()))?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            if metadata.file_type().is_symlink() && !passed_normal_component {
+                continue;
+            }
             return Ok(DestinationFacts {
                 path: StoredPath::from(path),
                 state,
@@ -953,10 +963,9 @@ fn destination_facts(path: PathBuf) -> Result<DestinationFacts, PlanningError> {
                 parent_safe: false,
             });
         }
-        if cursor.parent().is_none() || cursor == Path::new("/") {
-            break;
+        if matches!(component, std::path::Component::Normal(_)) {
+            passed_normal_component = true;
         }
-        cursor = cursor.parent().unwrap().to_owned();
     }
     Ok(DestinationFacts {
         path: StoredPath::from(path),
@@ -976,10 +985,7 @@ fn resolve_worktree_target(
     } else {
         cwd.join(target)
     });
-    if let Some(item) = worktrees
-        .iter()
-        .find(|item| planner::normalize_lexical(item.path.clone()) == path)
-    {
+    if let Some(item) = worktrees.iter().find(|item| same_path(&item.path, &path)) {
         return Ok(item.clone());
     }
     let value = target.to_str().ok_or_else(|| {
@@ -1226,6 +1232,16 @@ fn same_path(left: &Path, right: &Path) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
     }
+}
+
+fn path_is_within(root: &Path, path: &Path) -> bool {
+    let root = root
+        .canonicalize()
+        .unwrap_or_else(|_| planner::normalize_lexical(root.to_owned()));
+    let path = path
+        .canonicalize()
+        .unwrap_or_else(|_| planner::normalize_lexical(path.to_owned()));
+    path == root || path.starts_with(&root)
 }
 
 fn parse_line(bytes: &[u8]) -> Result<&str, GitError> {
