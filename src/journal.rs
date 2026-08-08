@@ -102,6 +102,22 @@ impl Journal {
     pub fn steps(&self) -> &[JournalStep] {
         &self.steps
     }
+    pub fn started_step(&self) -> Option<&JournalStep> {
+        self.steps
+            .iter()
+            .find(|step| step.status == StepStatus::Started)
+    }
+    pub fn has_applied_steps(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|step| step.status == StepStatus::Applied)
+    }
+    pub fn is_unresolved(&self) -> bool {
+        matches!(
+            self.status,
+            OperationStatus::Pending | OperationStatus::Running | OperationStatus::NeedsAttention
+        ) || (self.status == OperationStatus::Failed && self.has_applied_steps())
+    }
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != 1 || self.operation_id != *self.plan.operation_id() {
             return Err("journal schema or identity mismatch".into());

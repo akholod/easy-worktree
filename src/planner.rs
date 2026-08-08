@@ -443,6 +443,12 @@ pub fn plan_create(input: CreatePlanInput) -> Result<OperationPlan, String> {
             )?));
         }
     }
+    preconditions.push(Precondition::BranchNotElsewhere(
+        branch_of(&input.intent.source).clone(),
+    ));
+    preconditions.push(Precondition::BranchNotCheckedOut(
+        branch_of(&input.intent.source).clone(),
+    ));
     let mut steps = Vec::new();
     let create_comp = Compensation::RemoveCreatedWorktree(CreatedWorktree {
         path: destination.clone(),
@@ -614,12 +620,6 @@ pub fn plan_create(input: CreatePlanInput) -> Result<OperationPlan, String> {
             ConsentRequirement { id, risks: values }
         })
         .collect();
-    preconditions.push(Precondition::BranchNotElsewhere(
-        branch_of(&input.intent.source).clone(),
-    ));
-    preconditions.push(Precondition::BranchNotCheckedOut(
-        branch_of(&input.intent.source).clone(),
-    ));
     let required_ids: BTreeSet<_> = required.iter().map(|c| c.id.clone()).collect();
     if !input.intent.granted_consents.is_subset(&required_ids) {
         return Err("intent contains unknown or unrequired granted consent".into());
@@ -664,6 +664,12 @@ pub fn plan_remove(input: RemovePlanInput) -> Result<OperationPlan, String> {
         Precondition::WorktreeClass {
             path: f.path.clone(),
             class: f.class,
+        },
+        Precondition::WorktreeUnlocked {
+            path: f.path.clone(),
+        },
+        Precondition::WorktreeNotPrunable {
+            path: f.path.clone(),
         },
         Precondition::NoOngoingGitOperation {
             path: f.path.clone(),
@@ -715,7 +721,11 @@ pub fn plan_remove(input: RemovePlanInput) -> Result<OperationPlan, String> {
                 message: "force delete local branch".into(),
             });
         }
-        let mut local_pre = pre.clone();
+        let mut local_pre = vec![
+            Precondition::CommonDirectory(input.intent.repository.common_dir.clone()),
+            Precondition::BranchNotElsewhere(f.branch.clone()),
+            Precondition::BranchNotCheckedOut(f.branch.clone()),
+        ];
         local_pre.push(Precondition::RefAt {
             reference: RefName::new(f.branch.as_str())?,
             oid: f.branch_oid.clone(),
@@ -751,7 +761,11 @@ pub fn plan_remove(input: RemovePlanInput) -> Result<OperationPlan, String> {
             kind: RiskKind::IrreversibleStep,
             message: "delete remote branch is irreversible".into(),
         });
-        let mut remote_pre = pre.clone();
+        let mut remote_pre = vec![
+            Precondition::CommonDirectory(input.intent.repository.common_dir.clone()),
+            Precondition::BranchNotElsewhere(f.branch.clone()),
+            Precondition::RemoteBranchNotDefault(remote.clone()),
+        ];
         remote_pre.push(Precondition::RemoteRefAt {
             remote: remote.remote.clone(),
             branch: remote.branch.clone(),
@@ -1379,5 +1393,243 @@ mod tests {
         let mut value = remove_input(intent);
         value.facts.remote_is_default = true;
         assert!(plan_remove(value).is_err());
+    }
+
+    #[test]
+    fn create_worktree_step_contains_complete_snapshot_guards() {
+        let branch = BranchName::new("feature").unwrap();
+        let plan = plan_create(input(
+            CreateSource::NewBranch {
+                branch: branch.clone(),
+                base: None,
+            },
+            CreateSourceFacts::NewBranch {
+                branch,
+                base_ref: RefName::new("main").unwrap(),
+                base_oid: oid(),
+                branch_absent: true,
+            },
+        ))
+        .unwrap();
+        let guards = plan.steps()[0].preconditions();
+        assert!(guards.iter().any(|guard| matches!(
+            guard,
+            Precondition::BranchNotElsewhere(branch) if branch.as_str() == "feature"
+        )));
+        assert!(guards.iter().any(|guard| matches!(
+            guard,
+            Precondition::BranchNotCheckedOut(branch) if branch.as_str() == "feature"
+        )));
+        assert!(guards.iter().any(|guard| matches!(
+            guard,
+            Precondition::RefAbsent(reference) if reference.as_str() == "feature"
+        )));
+        assert!(guards.iter().any(|guard| matches!(
+            guard,
+            Precondition::RefAt { reference, .. } if reference.as_str() == "main"
+        )));
+    }
+
+    #[test]
+    fn remove_deletion_steps_do_not_reuse_removed_worktree_guards() {
+        let intent = RemoveIntent::new(
+            repo(),
+            StoredPath::from(PathBuf::from("/w")),
+            true,
+            true,
+            true,
+            Some(RemoteBranch {
+                remote: RemoteName::new("origin").unwrap(),
+                branch: BranchName::new("feature").unwrap(),
+            }),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        let plan = plan_remove(remove_input(intent)).unwrap();
+        let worktree_guards = plan.steps()[0].preconditions();
+        assert!(
+            plan.preconditions()
+                .iter()
+                .any(|guard| matches!(guard, Precondition::WorktreeUnlocked { .. }))
+        );
+        assert!(
+            plan.preconditions()
+                .iter()
+                .any(|guard| matches!(guard, Precondition::WorktreeNotPrunable { .. }))
+        );
+        assert!(
+            worktree_guards
+                .iter()
+                .any(|guard| matches!(guard, Precondition::WorktreeRegistered { .. }))
+        );
+        assert!(
+            worktree_guards
+                .iter()
+                .any(|guard| matches!(guard, Precondition::WorktreeClass { .. }))
+        );
+        assert!(
+            worktree_guards
+                .iter()
+                .any(|guard| matches!(guard, Precondition::WorktreeUnlocked { .. }))
+        );
+        assert!(
+            worktree_guards
+                .iter()
+                .any(|guard| matches!(guard, Precondition::WorktreeNotPrunable { .. }))
+        );
+        assert!(
+            worktree_guards
+                .iter()
+                .any(|guard| matches!(guard, Precondition::WorktreeClean { .. }))
+        );
+        assert!(
+            worktree_guards
+                .iter()
+                .any(|guard| matches!(guard, Precondition::NoOngoingGitOperation { .. }))
+        );
+
+        for step in &plan.steps()[1..] {
+            assert!(step.preconditions().iter().all(|guard| {
+                !matches!(
+                    guard,
+                    Precondition::WorktreeRegistered { .. }
+                        | Precondition::WorktreeClass { .. }
+                        | Precondition::WorktreeUnlocked { .. }
+                        | Precondition::WorktreeNotPrunable { .. }
+                        | Precondition::WorktreeClean { .. }
+                        | Precondition::NoOngoingGitOperation { .. }
+                )
+            }));
+            assert!(
+                step.preconditions()
+                    .iter()
+                    .any(|guard| matches!(guard, Precondition::CommonDirectory(_)))
+            );
+            assert!(
+                step.preconditions()
+                    .iter()
+                    .any(|guard| matches!(guard, Precondition::BranchNotElsewhere(_)))
+            );
+        }
+        assert!(
+            plan.steps()[1]
+                .preconditions()
+                .iter()
+                .any(|guard| matches!(guard, Precondition::RefAt { .. }))
+        );
+        assert!(plan.steps()[1].preconditions().iter().any(|guard| matches!(
+            guard,
+            Precondition::BranchNotCheckedOut(branch) if branch.as_str() == "feature"
+        )));
+        assert!(
+            plan.steps()[2]
+                .preconditions()
+                .iter()
+                .any(|guard| matches!(guard, Precondition::RemoteRefAt { .. }))
+        );
+        assert!(plan.steps()[2].preconditions().iter().any(|guard| matches!(
+            guard,
+            Precondition::RemoteBranchNotDefault(target)
+                if target.remote.as_str() == "origin"
+                    && target.branch.as_str() == "feature"
+        )));
+    }
+
+    #[test]
+    fn remove_preconditions_roundtrip_with_canonical_new_guards() {
+        let intent = RemoveIntent::new(
+            repo(),
+            StoredPath::from(PathBuf::from("/w")),
+            true,
+            true,
+            true,
+            Some(RemoteBranch {
+                remote: RemoteName::new("origin").unwrap(),
+                branch: BranchName::new("feature").unwrap(),
+            }),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        let plan = plan_remove(remove_input(intent)).unwrap();
+        let wire = serde_json::to_value(&plan).unwrap();
+        let restored: OperationPlan = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(restored, plan);
+        assert!(
+            wire["preconditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|guard| guard.get("WorktreeUnlocked").is_some())
+        );
+        assert!(
+            wire["preconditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|guard| guard.get("WorktreeNotPrunable").is_some())
+        );
+        assert!(
+            wire["steps"][1]["preconditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|guard| guard.get("BranchNotCheckedOut").is_some())
+        );
+        assert!(
+            wire["steps"][2]["preconditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|guard| guard.get("RemoteBranchNotDefault").is_some())
+        );
+    }
+
+    #[test]
+    fn remove_branch_retention_variants_keep_the_same_step_guards() {
+        let retained = plan_remove(remove_input(remove_intent())).unwrap();
+        assert_eq!(retained.steps().len(), 1);
+
+        let local = RemoveIntent::new(
+            repo(),
+            StoredPath::from(PathBuf::from("/w")),
+            false,
+            true,
+            false,
+            None,
+            BTreeSet::new(),
+        )
+        .unwrap();
+        let local_plan = plan_remove(remove_input(local)).unwrap();
+        assert_eq!(
+            local_plan
+                .steps()
+                .iter()
+                .map(|step| step.name())
+                .collect::<Vec<_>>(),
+            vec!["remove.worktree", "remove.local-branch"]
+        );
+
+        let remote = RemoveIntent::new(
+            repo(),
+            StoredPath::from(PathBuf::from("/w")),
+            false,
+            false,
+            false,
+            Some(RemoteBranch {
+                remote: RemoteName::new("origin").unwrap(),
+                branch: BranchName::new("feature").unwrap(),
+            }),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        let remote_plan = plan_remove(remove_input(remote)).unwrap();
+        assert_eq!(
+            remote_plan
+                .steps()
+                .iter()
+                .map(|step| step.name())
+                .collect::<Vec<_>>(),
+            vec!["remove.worktree", "remove.remote-branch"]
+        );
     }
 }

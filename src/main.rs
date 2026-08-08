@@ -2,6 +2,7 @@ pub mod application;
 pub mod cli;
 pub mod config;
 pub mod domain;
+pub mod execution;
 pub mod infrastructure;
 pub mod journal;
 pub mod journal_store;

@@ -230,6 +230,12 @@ pub enum Precondition {
         path: StoredPath,
         class: crate::domain::WorktreeClass,
     },
+    WorktreeUnlocked {
+        path: StoredPath,
+    },
+    WorktreeNotPrunable {
+        path: StoredPath,
+    },
     WorktreeClean {
         path: StoredPath,
     },
@@ -238,6 +244,7 @@ pub enum Precondition {
     },
     BranchNotElsewhere(BranchName),
     BranchNotCheckedOut(BranchName),
+    RemoteBranchNotDefault(RemoteBranch),
     SourceManifest {
         rule: String,
         source: StoredPath,

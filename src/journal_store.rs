@@ -12,10 +12,27 @@ use uuid::Uuid;
 static FAIL_BEFORE_RENAME: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
+static FAIL_ON_WRITE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
 static FAIL_DIRECTORY_SYNC: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
 static FAULT_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn inject_fail_before_rename() {
+    FAIL_BEFORE_RENAME.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+#[cfg(test)]
+pub(crate) fn inject_fail_on_atomic_write(number: usize) {
+    FAIL_ON_WRITE.store(number, std::sync::atomic::Ordering::SeqCst);
+}
+#[cfg(test)]
+pub(crate) fn test_fault_guard() -> std::sync::MutexGuard<'static, ()> {
+    FAULT_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Debug, Error)]
 pub enum JournalError {
@@ -187,6 +204,12 @@ impl LockedJournalStore {
             .map_err(|_| JournalError::InvalidTransition)?;
         self.atomic_write(next, &self.store.path(next.operation_id())?)
     }
+    pub fn read(&self, id: &OperationId) -> Result<Journal, JournalError> {
+        self.store.read(id)
+    }
+    pub fn list(&self) -> Result<Vec<Journal>, JournalError> {
+        self.store.list()
+    }
     fn atomic_write(&self, journal: &Journal, path: &Path) -> Result<(), JournalError> {
         fs::create_dir_all(&self.store.dir)?;
         let temp = self.store.dir.join(format!(".{}.tmp", Uuid::new_v4()));
@@ -198,7 +221,9 @@ impl LockedJournalStore {
             file.flush()?;
             file.sync_all()?;
             #[cfg(test)]
-            if FAIL_BEFORE_RENAME.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            if FAIL_BEFORE_RENAME.swap(false, std::sync::atomic::Ordering::SeqCst)
+                || take_write_fault()
+            {
                 return Err(io::Error::other("injected pre-rename failure"));
             }
             fs::rename(&temp, path)?;
@@ -209,6 +234,22 @@ impl LockedJournalStore {
             let _ = fs::remove_file(&temp);
         }
         result.map_err(JournalError::Io)
+    }
+}
+#[cfg(test)]
+fn take_write_fault() -> bool {
+    use std::sync::atomic::Ordering;
+    loop {
+        let current = FAIL_ON_WRITE.load(Ordering::SeqCst);
+        if current == 0 {
+            return false;
+        }
+        if FAIL_ON_WRITE
+            .compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return current == 1;
+        }
     }
 }
 
@@ -320,7 +361,7 @@ mod tests {
 
     #[test]
     fn write_new_read_update_and_revision_guards() {
-        let _guard = FAULT_MUTEX.lock().unwrap();
+        let _guard = test_fault_guard();
         let temp = TempDir::new().unwrap();
         let mut store = LockedJournalStore::acquire(temp.path()).unwrap();
         let mut original = Journal::new(crate::lifecycle::test_plan(2));
@@ -424,7 +465,7 @@ mod tests {
 
     #[test]
     fn read_and_list_fail_closed_for_corruption_and_sort_valid_ids() {
-        let _guard = FAULT_MUTEX.lock().unwrap();
+        let _guard = test_fault_guard();
         let temp = TempDir::new().unwrap();
         let mut store = LockedJournalStore::acquire(temp.path()).unwrap();
         let first = Journal::new(crate::lifecycle::test_plan(1));
@@ -494,7 +535,7 @@ mod tests {
     #[test]
     fn lock_and_journal_files_are_private_and_lock_path_persists() {
         use std::{os::unix::fs::MetadataExt, os::unix::fs::PermissionsExt};
-        let _guard = FAULT_MUTEX.lock().unwrap();
+        let _guard = test_fault_guard();
         let temp = TempDir::new().unwrap();
         let lock = RepositoryLock::acquire(temp.path()).unwrap();
         let path = temp.path().join("ewtm/repository.lock");
@@ -526,7 +567,7 @@ mod tests {
     #[test]
     fn atomic_faults_clean_temps_and_keep_post_rename_success() {
         use std::sync::atomic::Ordering;
-        let _guard = FAULT_MUTEX.lock().unwrap();
+        let _guard = test_fault_guard();
         let temp = TempDir::new().unwrap();
         let mut store = LockedJournalStore::acquire(temp.path()).unwrap();
         FAIL_BEFORE_RENAME.store(true, Ordering::SeqCst);
