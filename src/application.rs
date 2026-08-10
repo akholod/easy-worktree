@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::lifecycle::RemoteBranch;
@@ -461,6 +461,21 @@ where
                 environment_allowlist,
             });
         }
+        let task_contracts = tasks
+            .iter()
+            .filter(|task| request.selected_tasks.contains(&task.name))
+            .map(|task| {
+                (
+                    task.name.clone(),
+                    crate::lifecycle::TaskContract {
+                        argv: task.argv.clone(),
+                        cwd: task.cwd.clone(),
+                        required: task.required,
+                        environment_allowlist: task.environment_allowlist.clone(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let intent = crate::lifecycle::CreateIntent {
             repository: facts.repository.clone(),
             source: facts.source,
@@ -468,6 +483,9 @@ where
             selected_tasks: request.selected_tasks.clone(),
             skipped_rules: request.skipped_rules.clone(),
             granted_consents: request.granted_consents.clone(),
+            task_contracts,
+            current_worktree_root: Some(facts.current_worktree_root.clone()),
+            artifact_rule_contracts: BTreeMap::new(),
         };
         let input = CreatePlanInput {
             operation_id: crate::planner::new_operation_id(),

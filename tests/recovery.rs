@@ -61,7 +61,25 @@ impl Fixture {
             "{}",
             String::from_utf8_lossy(&output.stdout)
         );
-        let plan = json(&output)["data"].clone();
+        let mut plan = json(&output)["data"].clone();
+        plan["plan_schema_version"] = serde_json::json!(1);
+        fn strip_archived_artifact_fields(value: &mut Value) {
+            match value {
+                Value::Object(object) => {
+                    if let Some(artifact) = object.get_mut("FileArtifact")
+                        && let Some(artifact) = artifact.as_object_mut()
+                    {
+                        artifact.remove("sensitive");
+                        artifact.remove("confirm");
+                        artifact.remove("mode_policy");
+                    }
+                    object.values_mut().for_each(strip_archived_artifact_fields);
+                }
+                Value::Array(values) => values.iter_mut().for_each(strip_archived_artifact_fields),
+                _ => {}
+            }
+        }
+        strip_archived_artifact_fields(&mut plan);
         let id = plan["operation_id"].as_str().unwrap().to_owned();
         let steps = plan["steps"]
             .as_array()
@@ -119,6 +137,25 @@ fn journal_snapshot(fixture: &Fixture) -> Vec<(PathBuf, Vec<u8>)> {
     paths
         .into_iter()
         .map(|path| (path.clone(), std::fs::read(path).unwrap()))
+        .collect()
+}
+
+fn state_snapshot(fixture: &Fixture) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(fixture.repo.join(".git"))
+        .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+        .unwrap_or_default();
+    paths.sort();
+    paths
+        .into_iter()
+        .filter(|path| path.file_name().and_then(|name| name.to_str()) != Some("index.lock"))
+        .map(|path| {
+            let bytes = if path.is_file() {
+                std::fs::read(&path).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            (path, bytes)
+        })
         .collect()
 }
 
@@ -185,6 +222,7 @@ fn valid_recovery_list_and_show_are_read_only_in_json_text_and_default_repo_mode
     let refs_before = git_output(&fixture.repo, ["show-ref"]);
     let worktrees_before = git_output(&fixture.repo, ["worktree", "list", "--porcelain", "-z"]);
     let journal_before = journal_snapshot(&fixture);
+    let state_before = state_snapshot(&fixture);
     let list = fixture.command(&[
         "recover",
         "list",
@@ -206,6 +244,7 @@ fn valid_recovery_list_and_show_are_read_only_in_json_text_and_default_repo_mode
     ]);
     assert!(show.status.success());
     assert_eq!(json(&show)["data"]["operation_id"], id);
+    assert_eq!(json(&show)["data"]["plan"]["plan_schema_version"], 1);
     let text = fixture.command(&[
         "recover",
         "show",
@@ -240,6 +279,7 @@ fn valid_recovery_list_and_show_are_read_only_in_json_text_and_default_repo_mode
         git_output(&fixture.repo, ["worktree", "list", "--porcelain", "-z"])
     );
     assert_eq!(journal_before, journal_snapshot(&fixture));
+    assert_eq!(state_before, state_snapshot(&fixture));
 }
 
 #[test]

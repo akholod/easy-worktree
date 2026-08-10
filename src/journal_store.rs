@@ -9,29 +9,51 @@ use thiserror::Error;
 use uuid::Uuid;
 
 #[cfg(test)]
-static FAIL_BEFORE_RENAME: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-#[cfg(test)]
-static FAIL_ON_WRITE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-#[cfg(test)]
-static FAIL_DIRECTORY_SYNC: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static FAIL_BEFORE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_ON_WRITE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FAIL_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 #[cfg(test)]
 static FAULT_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 pub(crate) fn inject_fail_before_rename() {
-    FAIL_BEFORE_RENAME.store(true, std::sync::atomic::Ordering::SeqCst);
+    FAIL_BEFORE_RENAME.with(|fault| fault.set(true));
 }
 #[cfg(test)]
 pub(crate) fn inject_fail_on_atomic_write(number: usize) {
-    FAIL_ON_WRITE.store(number, std::sync::atomic::Ordering::SeqCst);
+    FAIL_ON_WRITE.with(|fault| fault.set(number));
 }
 #[cfg(test)]
-pub(crate) fn test_fault_guard() -> std::sync::MutexGuard<'static, ()> {
-    FAULT_MUTEX
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+fn inject_fail_directory_sync() {
+    FAIL_DIRECTORY_SYNC.with(|fault| fault.set(true));
+}
+#[cfg(test)]
+pub(crate) struct TestFaultGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+#[cfg(test)]
+pub(crate) fn test_fault_guard() -> TestFaultGuard {
+    let guard = TestFaultGuard {
+        _lock: FAULT_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    };
+    reset_faults();
+    guard
+}
+#[cfg(test)]
+impl Drop for TestFaultGuard {
+    fn drop(&mut self) {
+        reset_faults();
+    }
+}
+#[cfg(test)]
+fn reset_faults() {
+    FAIL_BEFORE_RENAME.with(|fault| fault.set(false));
+    FAIL_ON_WRITE.with(|fault| fault.set(0));
+    FAIL_DIRECTORY_SYNC.with(|fault| fault.set(false));
 }
 
 #[derive(Debug, Error)]
@@ -221,9 +243,7 @@ impl LockedJournalStore {
             file.flush()?;
             file.sync_all()?;
             #[cfg(test)]
-            if FAIL_BEFORE_RENAME.swap(false, std::sync::atomic::Ordering::SeqCst)
-                || take_write_fault()
-            {
+            if FAIL_BEFORE_RENAME.with(std::cell::Cell::take) || take_write_fault() {
                 return Err(io::Error::other("injected pre-rename failure"));
             }
             fs::rename(&temp, path)?;
@@ -238,19 +258,15 @@ impl LockedJournalStore {
 }
 #[cfg(test)]
 fn take_write_fault() -> bool {
-    use std::sync::atomic::Ordering;
-    loop {
-        let current = FAIL_ON_WRITE.load(Ordering::SeqCst);
+    FAIL_ON_WRITE.with(|fault| {
+        let current = fault.get();
         if current == 0 {
-            return false;
+            false
+        } else {
+            fault.set(current - 1);
+            current == 1
         }
-        if FAIL_ON_WRITE
-            .compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            return current == 1;
-        }
-    }
+    })
 }
 
 fn open_private(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
@@ -275,7 +291,7 @@ fn set_private(file: &File) -> io::Result<()> {
 }
 fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(test)]
-    if FAIL_DIRECTORY_SYNC.swap(false, std::sync::atomic::Ordering::SeqCst) {
+    if FAIL_DIRECTORY_SYNC.with(std::cell::Cell::take) {
         return Err(io::Error::other("injected directory sync failure"));
     }
     #[cfg(unix)]
@@ -464,6 +480,39 @@ mod tests {
     }
 
     #[test]
+    fn archived_schema_one_journal_is_readable_without_mutation() {
+        let temp = TempDir::new().unwrap();
+        let journal = Journal::new(crate::lifecycle::test_plan(2));
+        let operation_id = *journal.operation_id();
+        let mut wire = serde_json::to_value(&journal).unwrap();
+        wire["plan"]["plan_schema_version"] = serde_json::json!(1);
+        let action = &mut wire["plan"]["steps"][1]["action"]["FileArtifact"];
+        action.as_object_mut().unwrap().remove("sensitive");
+        action.as_object_mut().unwrap().remove("confirm");
+        action.as_object_mut().unwrap().remove("mode_policy");
+        std::fs::create_dir_all(temp.path().join("ewtm/journal")).unwrap();
+        std::fs::write(
+            temp.path()
+                .join(format!("ewtm/journal/{operation_id}.json")),
+            serde_json::to_vec(&wire).unwrap(),
+        )
+        .unwrap();
+        let before = std::fs::read_dir(temp.path().join("ewtm/journal"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        let restored = JournalStore::new(temp.path()).read(&operation_id).unwrap();
+        assert_eq!(restored.operation_id(), &operation_id);
+        assert!(restored.validate().is_ok());
+        assert_eq!(JournalStore::new(temp.path()).list().unwrap().len(), 1);
+        let after = std::fs::read_dir(temp.path().join("ewtm/journal"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(before, after);
+    }
+
+    #[test]
     fn read_and_list_fail_closed_for_corruption_and_sort_valid_ids() {
         let _guard = test_fault_guard();
         let temp = TempDir::new().unwrap();
@@ -566,11 +615,10 @@ mod tests {
 
     #[test]
     fn atomic_faults_clean_temps_and_keep_post_rename_success() {
-        use std::sync::atomic::Ordering;
         let _guard = test_fault_guard();
         let temp = TempDir::new().unwrap();
         let mut store = LockedJournalStore::acquire(temp.path()).unwrap();
-        FAIL_BEFORE_RENAME.store(true, Ordering::SeqCst);
+        inject_fail_before_rename();
         assert!(matches!(
             store.write_new(&Journal::new(crate::lifecycle::test_plan(1))),
             Err(JournalError::Io(_))
@@ -582,7 +630,7 @@ mod tests {
                 == 0
         );
         let journal = Journal::new(crate::lifecycle::test_plan(1));
-        FAIL_DIRECTORY_SYNC.store(true, Ordering::SeqCst);
+        inject_fail_directory_sync();
         store.write_new(&journal).unwrap();
         assert_eq!(
             JournalStore::new(temp.path())

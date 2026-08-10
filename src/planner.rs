@@ -11,6 +11,70 @@ use std::{
 };
 use uuid::Uuid;
 
+pub(crate) fn artifact_digest(bytes: &[u8]) -> ObjectId {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(bytes);
+    ObjectId::new(format!("{:x}", hash.finalize())).expect("sha256 is always a valid object id")
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ManifestDigestArtifact {
+    pub source_root: StoredPath,
+    pub source: StoredPath,
+    pub destination: StoredPath,
+    pub kind: FileArtifactKind,
+    pub bytes: u64,
+    pub digest: ObjectId,
+    pub fingerprint: ObjectId,
+    pub link_target: Option<StoredPath>,
+    pub sensitive: bool,
+    pub confirm: bool,
+    pub mode_policy: FileModePolicy,
+}
+pub(crate) fn canonical_manifest_digest(
+    artifacts: &[ManifestDigestArtifact],
+    destination_root: &std::path::Path,
+) -> ObjectId {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for artifact in artifacts {
+        let source_relative = artifact
+            .source
+            .as_path()
+            .strip_prefix(artifact.source_root.as_path())
+            .unwrap_or(artifact.source.as_path());
+        let destination_relative = artifact
+            .destination
+            .as_path()
+            .strip_prefix(destination_root)
+            .unwrap_or(artifact.destination.as_path());
+        hash.update(source_relative.as_os_str().as_encoded_bytes());
+        hash.update([0]);
+        hash.update(destination_relative.as_os_str().as_encoded_bytes());
+        hash.update([0]);
+        hash.update(match artifact.kind {
+            FileArtifactKind::CopyFile => b"copy_file".as_slice(),
+            FileArtifactKind::CreateSymlink => b"create_symlink".as_slice(),
+            FileArtifactKind::RelinkSymlink => b"relink_symlink".as_slice(),
+        });
+        hash.update([0]);
+        hash.update(artifact.bytes.to_le_bytes());
+        hash.update(artifact.digest.as_str().as_bytes());
+        hash.update(artifact.fingerprint.as_str().as_bytes());
+        if let Some(target) = &artifact.link_target {
+            hash.update(target.as_path().as_os_str().as_encoded_bytes());
+        }
+        hash.update([
+            0,
+            artifact.sensitive as u8,
+            artifact.confirm as u8,
+            artifact.mode_policy as u8,
+        ]);
+    }
+    ObjectId::new(format!("{:x}", hash.finalize())).expect("sha256 is always a valid object id")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DestinationState {
     Absent,
@@ -52,6 +116,14 @@ pub enum FileArtifactKind {
     CreateSymlink,
     RelinkSymlink,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileModePolicy {
+    Private,
+    PreserveSafe,
+    NotApplicable,
+    LegacyUnspecified,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileArtifact {
     pub kind: FileArtifactKind,
@@ -62,6 +134,7 @@ pub struct FileArtifact {
     pub fingerprint: ObjectId,
     pub link_target: Option<StoredPath>,
     pub sensitive: bool,
+    pub mode_policy: FileModePolicy,
     pub confirm: bool,
     pub conflict: bool,
     pub overlap: bool,
@@ -71,6 +144,7 @@ pub struct FileArtifact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileActionManifest {
     pub rule: String,
+    pub source_root: StoredPath,
     pub artifacts: Vec<FileArtifact>,
     pub digest: ObjectId,
 }
@@ -116,6 +190,9 @@ pub struct RemoveFacts {
     pub branch_elsewhere: bool,
     pub dirty: bool,
     pub local_branch_safe_to_delete: bool,
+    pub safe_target_ref: RefName,
+    pub safe_target: ObjectId,
+    pub merge_provenance: MergeTargetProvenance,
     pub branch: BranchName,
     pub branch_oid: ObjectId,
     pub worktree_oid: ObjectId,
@@ -301,6 +378,23 @@ fn validate_source(
 }
 
 pub fn plan_create(input: CreatePlanInput) -> Result<OperationPlan, String> {
+    let mut input = input;
+    input.intent.task_contracts = input
+        .tasks
+        .iter()
+        .filter(|task| input.intent.selected_tasks.contains(&task.name))
+        .map(|task| {
+            (
+                task.name.clone(),
+                TaskContract {
+                    argv: task.argv.clone(),
+                    cwd: task.cwd.clone(),
+                    required: task.required,
+                    environment_allowlist: task.environment_allowlist.clone(),
+                },
+            )
+        })
+        .collect();
     if input.bare {
         return Err("repository is bare".into());
     }
@@ -358,7 +452,63 @@ pub fn plan_create(input: CreatePlanInput) -> Result<OperationPlan, String> {
     if !input.enabled_rules.is_subset(&input.known_rules) {
         return Err("enabled rule is unknown".into());
     }
-    let manifests = input.manifests;
+    input.intent.current_worktree_root = Some(input.current_worktree_root.clone());
+    let destination = input
+        .intent
+        .destination
+        .clone()
+        .unwrap_or_else(|| input.destination.path.clone());
+    input.intent.destination = Some(destination.clone());
+    let manifests = std::mem::take(&mut input.manifests);
+    input.intent.artifact_rule_contracts.clear();
+    for manifest in &manifests {
+        if manifest.artifacts.is_empty() {
+            continue;
+        }
+        let provenance = if manifest.source_root == input.repository.primary_root {
+            ArtifactSourceProvenance::Primary
+        } else if manifest.source_root == input.current_worktree_root {
+            ArtifactSourceProvenance::CurrentWorktree
+        } else {
+            return Err("manifest source root does not match repository facts".into());
+        };
+        let digest = canonical_manifest_digest(
+            &manifest
+                .artifacts
+                .iter()
+                .map(|artifact| ManifestDigestArtifact {
+                    source_root: manifest.source_root.clone(),
+                    source: artifact.source.clone(),
+                    destination: artifact.destination.clone(),
+                    kind: artifact.kind,
+                    bytes: artifact.bytes,
+                    digest: artifact.digest.clone(),
+                    fingerprint: artifact.fingerprint.clone(),
+                    link_target: artifact.link_target.clone(),
+                    sensitive: artifact.sensitive,
+                    confirm: artifact.confirm,
+                    mode_policy: artifact.mode_policy,
+                })
+                .collect::<Vec<_>>(),
+            destination.as_path(),
+        );
+        if input
+            .intent
+            .artifact_rule_contracts
+            .insert(
+                manifest.rule.clone(),
+                ArtifactRuleContract {
+                    provenance,
+                    source_root: manifest.source_root.clone(),
+                    manifest_digest: digest,
+                },
+            )
+            .is_some()
+        {
+            return Err("rule has duplicate artifact contracts".into());
+        }
+    }
+    let mut artifact_destinations = Vec::new();
     let mut rule_counts = BTreeMap::<String, usize>::new();
     let mut artifacts = Vec::new();
     for manifest in manifests {
@@ -374,6 +524,26 @@ pub fn plan_create(input: CreatePlanInput) -> Result<OperationPlan, String> {
             ));
         }
         *rule_counts.entry(manifest.rule.clone()).or_default() += 1;
+        let canonical_digest = canonical_manifest_digest(
+            &manifest
+                .artifacts
+                .iter()
+                .map(|artifact| ManifestDigestArtifact {
+                    source_root: manifest.source_root.clone(),
+                    source: artifact.source.clone(),
+                    destination: artifact.destination.clone(),
+                    kind: artifact.kind,
+                    bytes: artifact.bytes,
+                    digest: artifact.digest.clone(),
+                    fingerprint: artifact.fingerprint.clone(),
+                    link_target: artifact.link_target.clone(),
+                    sensitive: artifact.sensitive,
+                    confirm: artifact.confirm,
+                    mode_policy: artifact.mode_policy,
+                })
+                .collect::<Vec<_>>(),
+            destination.as_path(),
+        );
         for artifact in manifest.artifacts {
             if artifact.conflict || artifact.overlap {
                 return Err(format!(
@@ -381,8 +551,17 @@ pub fn plan_create(input: CreatePlanInput) -> Result<OperationPlan, String> {
                     manifest.rule
                 ));
             }
-            artifacts.push((manifest.rule.clone(), manifest.digest.clone(), artifact));
+            artifacts.push((
+                manifest.rule.clone(),
+                manifest.source_root.clone(),
+                canonical_digest.clone(),
+                artifact,
+            ));
+            artifact_destinations.push(artifacts.last().unwrap().3.destination.clone());
         }
+    }
+    if destination_paths_overlap(&artifact_destinations) {
+        return Err("file rule destinations overlap".into());
     }
     for rule in &input.enabled_rules {
         if !input.intent.skipped_rules.contains(rule) && rule_counts.get(rule) != Some(&1) {
@@ -391,16 +570,11 @@ pub fn plan_create(input: CreatePlanInput) -> Result<OperationPlan, String> {
             ));
         }
     }
-    artifacts.sort_by(|(left_rule, _, left), (right_rule, _, right)| {
+    artifacts.sort_by(|(left_rule, _, _, left), (right_rule, _, _, right)| {
         left_rule
             .cmp(right_rule)
             .then_with(|| left.destination.as_path().cmp(right.destination.as_path()))
     });
-    let destination = input
-        .intent
-        .destination
-        .clone()
-        .unwrap_or_else(|| input.destination.path.clone());
     let mut preconditions = vec![
         Precondition::CommonDirectory(input.repository.common_dir.clone()),
         Precondition::ExactlyOnePrimary,
@@ -433,9 +607,8 @@ pub fn plan_create(input: CreatePlanInput) -> Result<OperationPlan, String> {
             local_branch,
             ..
         } => {
-            preconditions.push(Precondition::RemoteRefAt {
-                remote: remote.clone(),
-                branch: remote_branch.clone(),
+            preconditions.push(Precondition::RefAt {
+                reference: RefName::new(format!("refs/remotes/{remote}/{remote_branch}"))?,
                 oid: remote_oid.clone(),
             });
             preconditions.push(Precondition::RefAbsent(RefName::new(
@@ -476,6 +649,18 @@ pub fn plan_create(input: CreatePlanInput) -> Result<OperationPlan, String> {
             oid: source_oid.clone(),
         });
     }
+    if let CreateSource::RemoteTracking {
+        remote,
+        remote_branch,
+        local_branch,
+    } = &input.intent.source
+    {
+        create_post.push(Postcondition::BranchUpstreamAt {
+            branch: local_branch.clone(),
+            remote: remote.clone(),
+            remote_branch: remote_branch.clone(),
+        });
+    }
     steps.push(step(
         "create.worktree",
         "create.worktree",
@@ -491,7 +676,7 @@ pub fn plan_create(input: CreatePlanInput) -> Result<OperationPlan, String> {
     let mut per_rule_index = BTreeMap::<String, usize>::new();
     let mut risks = Vec::new();
     let mut consent_risks = BTreeMap::<ConsentId, Vec<Risk>>::new();
-    for (rule, manifest_digest, artifact) in artifacts {
+    for (rule, source_root, manifest_digest, artifact) in artifacts {
         let index = per_rule_index
             .entry(rule.clone())
             .and_modify(|v| *v += 1)
@@ -556,18 +741,49 @@ pub fn plan_create(input: CreatePlanInput) -> Result<OperationPlan, String> {
             fingerprint: artifact.fingerprint,
             link_target: artifact.link_target,
             manifest_digest,
+            sensitive: artifact.sensitive,
+            confirm: artifact.confirm,
+            mode_policy: match artifact.kind {
+                FileArtifactKind::CopyFile if artifact.sensitive => FileModePolicy::Private,
+                FileArtifactKind::CopyFile => FileModePolicy::PreserveSafe,
+                FileArtifactKind::CreateSymlink | FileArtifactKind::RelinkSymlink => {
+                    FileModePolicy::NotApplicable
+                }
+            },
         };
         let manifest_precondition = match &action {
             StepAction::FileArtifact {
                 source,
                 destination,
+                bytes,
                 digest,
+                manifest_digest,
                 ..
-            } => Precondition::SourceManifest {
+            } => Precondition::ArtifactSourceAt {
                 rule: rule.clone(),
+                source_root,
                 source: source.clone(),
                 destination: destination.clone(),
+                bytes: *bytes,
                 digest: digest.clone(),
+                manifest_digest: manifest_digest.clone(),
+            },
+            _ => unreachable!(),
+        };
+        let artifact_precondition = match &action {
+            StepAction::FileArtifact {
+                kind,
+                destination,
+                fingerprint,
+                ..
+            } => match kind {
+                FileArtifactKind::CopyFile | FileArtifactKind::CreateSymlink => {
+                    Precondition::PathAbsent(destination.clone())
+                }
+                FileArtifactKind::RelinkSymlink => Precondition::SymlinkAt {
+                    path: destination.clone(),
+                    target_digest: fingerprint.clone(),
+                },
             },
             _ => unreachable!(),
         };
@@ -575,7 +791,7 @@ pub fn plan_create(input: CreatePlanInput) -> Result<OperationPlan, String> {
             &id,
             &id,
             action,
-            vec![manifest_precondition],
+            vec![manifest_precondition, artifact_precondition],
             vec![],
             artifact.compensation,
             false,
@@ -609,7 +825,7 @@ pub fn plan_create(input: CreatePlanInput) -> Result<OperationPlan, String> {
             vec![],
             vec![],
             None,
-            false,
+            true,
         )?);
     }
     let required: Vec<_> = consent_risks
@@ -625,7 +841,7 @@ pub fn plan_create(input: CreatePlanInput) -> Result<OperationPlan, String> {
         return Err("intent contains unknown or unrequired granted consent".into());
     }
     let grants = input.intent.granted_consents.clone();
-    OperationPlan::new(OperationPlanDraft {
+    let plan = OperationPlan::new(OperationPlanDraft {
         operation_id: input.operation_id,
         kind: OperationKind::Create,
         repository: input.repository,
@@ -635,7 +851,10 @@ pub fn plan_create(input: CreatePlanInput) -> Result<OperationPlan, String> {
         risks,
         required_consents: required,
         granted_consents: grants,
-    })
+    })?;
+    plan.validate_executable_plan()
+        .map_err(|error| format!("constructed create plan is not executable: {error}"))?;
+    Ok(plan)
 }
 
 pub fn plan_remove(input: RemovePlanInput) -> Result<OperationPlan, String> {
@@ -649,6 +868,9 @@ pub fn plan_remove(input: RemovePlanInput) -> Result<OperationPlan, String> {
     if f.dirty && !input.intent.allow_dirty_removal {
         return Err("dirty worktree requires allow-dirty-removal".into());
     }
+    if input.intent.delete_local_branch && f.branch_oid != f.worktree_oid {
+        return Err("local branch OID does not match worktree OID".into());
+    }
     if input.intent.worktree != f.path {
         return Err("intent worktree does not match facts".into());
     }
@@ -657,6 +879,12 @@ pub fn plan_remove(input: RemovePlanInput) -> Result<OperationPlan, String> {
     }
     let mut pre = vec![
         Precondition::CommonDirectory(input.intent.repository.common_dir.clone()),
+        Precondition::WorktreeAt {
+            path: f.path.clone(),
+            branch: f.branch.clone(),
+            oid: f.worktree_oid.clone(),
+            class: f.class,
+        },
         Precondition::WorktreeRegistered {
             path: f.path.clone(),
             oid: f.worktree_oid.clone(),
@@ -700,6 +928,17 @@ pub fn plan_remove(input: RemovePlanInput) -> Result<OperationPlan, String> {
         message: "remove worktree cannot be automatically recreated".into(),
     }];
     let mut required = Vec::new();
+    risks.push(Risk {
+        kind: RiskKind::RemoveWorktree,
+        message: "remove worktree".into(),
+    });
+    required.push(ConsentRequirement {
+        id: ConsentId::new("remove:worktree")?,
+        risks: vec![Risk {
+            kind: RiskKind::RemoveWorktree,
+            message: "remove worktree".into(),
+        }],
+    });
     if f.dirty {
         risks.push(Risk {
             kind: RiskKind::DirtyDataLoss,
@@ -728,8 +967,30 @@ pub fn plan_remove(input: RemovePlanInput) -> Result<OperationPlan, String> {
         ];
         local_pre.push(Precondition::RefAt {
             reference: RefName::new(f.branch.as_str())?,
-            oid: f.branch_oid.clone(),
+            oid: f.worktree_oid.clone(),
         });
+        if !input.intent.force_delete_local_branch {
+            local_pre.push(Precondition::RefAt {
+                reference: f.safe_target_ref.clone(),
+                oid: f.safe_target.clone(),
+            });
+            local_pre.push(Precondition::RefMergedInto {
+                reference: RefName::new(f.branch.as_str())?,
+                target_ref: Some(f.safe_target_ref.clone()),
+                target_oid: f.safe_target.clone(),
+                provenance: f.merge_provenance.clone(),
+            });
+            if let MergeTargetProvenance::Upstream {
+                branch,
+                upstream_ref,
+            } = &f.merge_provenance
+            {
+                local_pre.push(Precondition::BranchUpstreamIs {
+                    branch: branch.clone(),
+                    upstream_ref: upstream_ref.clone(),
+                });
+            }
+        }
         steps.push(step(
             "remove.local-branch",
             "remove.local-branch",
@@ -769,13 +1030,14 @@ pub fn plan_remove(input: RemovePlanInput) -> Result<OperationPlan, String> {
         remote_pre.push(Precondition::RemoteRefAt {
             remote: remote.remote.clone(),
             branch: remote.branch.clone(),
-            oid: remote_oid,
+            oid: remote_oid.clone(),
         });
         steps.push(step(
             "remove.remote-branch",
             "remove.remote-branch",
             StepAction::DeleteRemoteBranch {
                 target: remote.clone(),
+                expected_oid: Some(remote_oid),
             },
             remote_pre,
             vec![Postcondition::RemoteBranchDeleted(remote.clone())],
@@ -827,7 +1089,7 @@ pub fn plan_remove(input: RemovePlanInput) -> Result<OperationPlan, String> {
     if !input.intent.granted_consents.is_subset(&required_ids) {
         return Err("intent contains unknown or unrequired granted consent".into());
     }
-    OperationPlan::new(OperationPlanDraft {
+    let plan = OperationPlan::new(OperationPlanDraft {
         operation_id: input.operation_id,
         kind: OperationKind::Remove,
         repository: input.intent.repository.clone(),
@@ -837,12 +1099,16 @@ pub fn plan_remove(input: RemovePlanInput) -> Result<OperationPlan, String> {
         risks,
         required_consents: required,
         granted_consents: input.intent.granted_consents,
-    })
+    })?;
+    plan.validate_executable_plan()
+        .map_err(|error| format!("constructed remove plan is not executable: {error}"))?;
+    Ok(plan)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::{collections::BTreeSet, path::PathBuf};
 
     fn oid() -> ObjectId {
@@ -871,6 +1137,9 @@ mod tests {
             selected_tasks: BTreeSet::new(),
             skipped_rules: BTreeSet::new(),
             granted_consents: BTreeSet::new(),
+            task_contracts: BTreeMap::new(),
+            current_worktree_root: None,
+            artifact_rule_contracts: BTreeMap::new(),
         }
     }
     fn input(source: CreateSource, facts: CreateSourceFacts) -> CreatePlanInput {
@@ -893,6 +1162,119 @@ mod tests {
             manifests: Vec::new(),
             tasks: Vec::new(),
         }
+    }
+
+    fn executable_artifact_input(
+        kind: FileArtifactKind,
+        sensitive: bool,
+        replace_symlink: bool,
+        with_optional_task: bool,
+        required_task: bool,
+    ) -> CreatePlanInput {
+        let branch = BranchName::new("feature").unwrap();
+        let mut value = input(
+            CreateSource::NewBranch {
+                branch: branch.clone(),
+                base: None,
+            },
+            CreateSourceFacts::NewBranch {
+                branch,
+                base_ref: RefName::new("main").unwrap(),
+                base_oid: oid(),
+                branch_absent: true,
+            },
+        );
+        value.intent.destination = Some(value.destination.path.clone());
+        let target = StoredPath::from(PathBuf::from("/r/source/config"));
+        let target_bytes = target.as_path().as_os_str().as_encoded_bytes();
+        let digest = if matches!(
+            kind,
+            FileArtifactKind::CreateSymlink | FileArtifactKind::RelinkSymlink
+        ) {
+            artifact_digest(target_bytes)
+        } else {
+            oid()
+        };
+        let destination = StoredPath::from(PathBuf::from("/w/feature/config"));
+        value.known_rules.insert("config".into());
+        value.enabled_rules.insert("config".into());
+        value.destination.state = DestinationState::Absent;
+        value.manifests = vec![FileActionManifest {
+            rule: "config".into(),
+            source_root: StoredPath::from(PathBuf::from("/r")),
+            artifacts: vec![FileArtifact {
+                kind,
+                source: if matches!(kind, FileArtifactKind::CreateSymlink) {
+                    target.clone()
+                } else {
+                    StoredPath::from(PathBuf::from("/r/source/config"))
+                },
+                destination: destination.clone(),
+                bytes: if matches!(
+                    kind,
+                    FileArtifactKind::CreateSymlink | FileArtifactKind::RelinkSymlink
+                ) {
+                    target_bytes.len() as u64
+                } else {
+                    7
+                },
+                digest: digest.clone(),
+                fingerprint: digest.clone(),
+                link_target: if matches!(
+                    kind,
+                    FileArtifactKind::CreateSymlink | FileArtifactKind::RelinkSymlink
+                ) {
+                    Some(target.clone())
+                } else {
+                    None
+                },
+                sensitive,
+                mode_policy: if !matches!(kind, FileArtifactKind::CopyFile) {
+                    FileModePolicy::NotApplicable
+                } else if sensitive {
+                    FileModePolicy::Private
+                } else {
+                    FileModePolicy::PreserveSafe
+                },
+                confirm: false,
+                conflict: false,
+                overlap: false,
+                replace_symlink,
+                compensation: Some(if replace_symlink {
+                    Compensation::RestoreReplacedSymlink(ReplacedSymlink {
+                        path: destination,
+                        expected_current: digest.clone(),
+                        original_target: target,
+                    })
+                } else {
+                    Compensation::RemoveCreatedArtifact(CreatedArtifact {
+                        path: destination,
+                        fingerprint: digest,
+                    })
+                }),
+            }],
+            digest: oid(),
+        }];
+        if with_optional_task {
+            value.known_tasks.insert("build".into());
+            value.intent.selected_tasks.insert("build".into());
+            value.tasks.push(TaskSpec {
+                name: "build".into(),
+                argv: CommandArgv::new(
+                    vec!["build", "--check"]
+                        .into_iter()
+                        .map(String::from)
+                        .collect(),
+                )
+                .unwrap(),
+                cwd: StoredPath::from(PathBuf::from("/w/feature")),
+                enabled: true,
+                post_create: true,
+                required: required_task,
+                environment_allowlist: Vec::new(),
+            });
+        }
+        value
     }
 
     #[test]
@@ -986,30 +1368,33 @@ mod tests {
         value.intent.selected_tasks.insert("build".into());
         let artifact = |name: &str| FileArtifact {
             kind: FileArtifactKind::CopyFile,
-            source: StoredPath::from(PathBuf::from(name)),
-            destination: StoredPath::from(PathBuf::from(name)),
+            source: StoredPath::from(PathBuf::from(format!("/r/{name}"))),
+            destination: StoredPath::from(PathBuf::from(format!("/w/feature/{name}"))),
             bytes: 1,
             digest: oid(),
             fingerprint: oid(),
             link_target: None,
             sensitive: false,
+            mode_policy: FileModePolicy::PreserveSafe,
             confirm: false,
             conflict: false,
             overlap: false,
             replace_symlink: false,
             compensation: Some(Compensation::RemoveCreatedArtifact(CreatedArtifact {
-                path: StoredPath::from(PathBuf::from(name)),
+                path: StoredPath::from(PathBuf::from(format!("/w/feature/{name}"))),
                 fingerprint: oid(),
             })),
         };
         value.manifests = vec![
             FileActionManifest {
                 rule: "z-rule".into(),
+                source_root: StoredPath::from(PathBuf::from("/r")),
                 artifacts: vec![artifact("z")],
                 digest: oid(),
             },
             FileActionManifest {
                 rule: "a-rule".into(),
+                source_root: StoredPath::from(PathBuf::from("/r")),
                 artifacts: vec![artifact("a")],
                 digest: oid(),
             },
@@ -1017,7 +1402,7 @@ mod tests {
         value.tasks = vec![TaskSpec {
             name: "build".into(),
             argv: CommandArgv::new(vec!["build".into()]).unwrap(),
-            cwd: StoredPath::from(PathBuf::from("/r")),
+            cwd: StoredPath::from(PathBuf::from("/w/feature")),
             enabled: true,
             post_create: true,
             required: false,
@@ -1057,22 +1442,24 @@ mod tests {
         value.intent.selected_tasks.insert("test".into());
         value.manifests = vec![FileActionManifest {
             rule: "secret".into(),
+            source_root: StoredPath::from(PathBuf::from("/r")),
             artifacts: vec![FileArtifact {
                 kind: FileArtifactKind::RelinkSymlink,
-                source: StoredPath::from(PathBuf::from("a")),
-                destination: StoredPath::from(PathBuf::from("a")),
-                bytes: 1,
-                digest: oid(),
-                fingerprint: oid(),
+                source: StoredPath::from(PathBuf::from("/r/a")),
+                destination: StoredPath::from(PathBuf::from("/w/feature/a")),
+                bytes: 8,
+                digest: artifact_digest(b"original"),
+                fingerprint: artifact_digest(b"original"),
                 link_target: Some(StoredPath::from(PathBuf::from("original"))),
                 sensitive: false,
+                mode_policy: FileModePolicy::NotApplicable,
                 confirm: true,
                 conflict: false,
                 overlap: false,
                 replace_symlink: true,
                 compensation: Some(Compensation::RestoreReplacedSymlink(ReplacedSymlink {
-                    path: StoredPath::from(PathBuf::from("a")),
-                    expected_current: oid(),
+                    path: StoredPath::from(PathBuf::from("/w/feature/a")),
+                    expected_current: artifact_digest(b"original"),
                     original_target: StoredPath::from(PathBuf::from("original")),
                 })),
             }],
@@ -1081,7 +1468,7 @@ mod tests {
         value.tasks = vec![TaskSpec {
             name: "test".into(),
             argv: CommandArgv::new(vec!["test".into()]).unwrap(),
-            cwd: StoredPath::from(PathBuf::from("/r")),
+            cwd: StoredPath::from(PathBuf::from("/w/feature")),
             enabled: true,
             post_create: true,
             required: false,
@@ -1144,6 +1531,9 @@ mod tests {
                 branch_elsewhere: false,
                 dirty: false,
                 local_branch_safe_to_delete: true,
+                safe_target_ref: RefName::new("HEAD").unwrap(),
+                safe_target: oid(),
+                merge_provenance: MergeTargetProvenance::Primary,
                 branch: BranchName::new("feature").unwrap(),
                 branch_oid: oid(),
                 worktree_oid: oid(),
@@ -1296,6 +1686,7 @@ mod tests {
             fingerprint: oid(),
             link_target: None,
             sensitive: false,
+            mode_policy: FileModePolicy::PreserveSafe,
             confirm: false,
             conflict: false,
             overlap: false,
@@ -1304,6 +1695,7 @@ mod tests {
         };
         value.manifests = vec![FileActionManifest {
             rule: "env".into(),
+            source_root: StoredPath::from(PathBuf::from("/r")),
             artifacts: vec![artifact],
             digest: oid(),
         }];
@@ -1319,11 +1711,11 @@ mod tests {
         ));
         assert!(matches!(
             plan.preconditions()[1],
-            Precondition::WorktreeRegistered { .. }
+            Precondition::WorktreeAt { .. }
         ));
         assert!(matches!(
             plan.preconditions()[2],
-            Precondition::WorktreeClass { .. }
+            Precondition::WorktreeRegistered { .. }
         ));
         assert!(
             plan.preconditions()
@@ -1428,6 +1820,81 @@ mod tests {
             guard,
             Precondition::RefAt { reference, .. } if reference.as_str() == "main"
         )));
+    }
+
+    #[test]
+    fn generated_create_sources_and_remove_variants_are_executable() {
+        let branch = BranchName::new("feature").unwrap();
+        let sources = vec![
+            (
+                CreateSource::NewBranch {
+                    branch: branch.clone(),
+                    base: None,
+                },
+                CreateSourceFacts::NewBranch {
+                    branch: branch.clone(),
+                    base_ref: RefName::new("main").unwrap(),
+                    base_oid: oid(),
+                    branch_absent: true,
+                },
+            ),
+            (
+                CreateSource::ExistingLocal {
+                    branch: branch.clone(),
+                },
+                CreateSourceFacts::ExistingLocal {
+                    branch: branch.clone(),
+                    branch_oid: oid(),
+                    not_checked_out: true,
+                },
+            ),
+            (
+                CreateSource::RemoteTracking {
+                    remote: RemoteName::new("origin").unwrap(),
+                    remote_branch: branch.clone(),
+                    local_branch: branch.clone(),
+                },
+                CreateSourceFacts::RemoteTracking {
+                    remote: RemoteName::new("origin").unwrap(),
+                    remote_branch: branch.clone(),
+                    remote_oid: oid(),
+                    local_branch: branch,
+                    local_absent: true,
+                },
+            ),
+        ];
+        for (source, facts) in sources {
+            let mut value = input(source, facts);
+            value.intent.destination = Some(value.destination.path.clone());
+            assert!(
+                plan_create(value)
+                    .unwrap()
+                    .validate_executable_plan()
+                    .is_ok()
+            );
+        }
+        assert!(
+            plan_remove(remove_input(remove_intent()))
+                .unwrap()
+                .validate_executable_plan()
+                .is_ok()
+        );
+        let local = RemoveIntent::new(
+            repo(),
+            StoredPath::from(PathBuf::from("/w")),
+            false,
+            true,
+            false,
+            None,
+            BTreeSet::new(),
+        )
+        .unwrap();
+        assert!(
+            plan_remove(remove_input(local))
+                .unwrap()
+                .validate_executable_plan()
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1631,5 +2098,1195 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["remove.worktree", "remove.remote-branch"]
         );
+    }
+
+    #[test]
+    fn positive_schema2_planner_matrix_roundtrips_and_validates() {
+        let branch = BranchName::new("feature").unwrap();
+        let sources = [
+            (
+                "new",
+                CreateSource::NewBranch {
+                    branch: branch.clone(),
+                    base: None,
+                },
+                CreateSourceFacts::NewBranch {
+                    branch: branch.clone(),
+                    base_ref: RefName::new("main").unwrap(),
+                    base_oid: oid(),
+                    branch_absent: true,
+                },
+            ),
+            (
+                "existing",
+                CreateSource::ExistingLocal {
+                    branch: branch.clone(),
+                },
+                CreateSourceFacts::ExistingLocal {
+                    branch: branch.clone(),
+                    branch_oid: oid(),
+                    not_checked_out: true,
+                },
+            ),
+            (
+                "remote",
+                CreateSource::RemoteTracking {
+                    remote: RemoteName::new("origin").unwrap(),
+                    remote_branch: branch.clone(),
+                    local_branch: branch.clone(),
+                },
+                CreateSourceFacts::RemoteTracking {
+                    remote: RemoteName::new("origin").unwrap(),
+                    remote_branch: branch.clone(),
+                    remote_oid: oid(),
+                    local_branch: branch,
+                    local_absent: true,
+                },
+            ),
+        ];
+        for (name, source, facts) in sources {
+            let mut input = input(source, facts);
+            input.intent.destination = Some(input.destination.path.clone());
+            let plan = plan_create(input).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let restored: OperationPlan =
+                serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+            assert_eq!(restored, plan, "{name}: schema2 roundtrip");
+            restored
+                .validate_executable_plan()
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
+        for (name, intent) in [
+            ("remove clean", remove_intent()),
+            (
+                "remove dirty",
+                RemoveIntent::new(
+                    repo(),
+                    StoredPath::from(PathBuf::from("/w")),
+                    true,
+                    false,
+                    false,
+                    None,
+                    BTreeSet::new(),
+                )
+                .unwrap(),
+            ),
+            (
+                "remove local",
+                RemoveIntent::new(
+                    repo(),
+                    StoredPath::from(PathBuf::from("/w")),
+                    false,
+                    true,
+                    false,
+                    None,
+                    BTreeSet::new(),
+                )
+                .unwrap(),
+            ),
+            (
+                "remove local force",
+                RemoveIntent::new(
+                    repo(),
+                    StoredPath::from(PathBuf::from("/w")),
+                    false,
+                    true,
+                    true,
+                    None,
+                    BTreeSet::new(),
+                )
+                .unwrap(),
+            ),
+            (
+                "remove remote",
+                RemoveIntent::new(
+                    repo(),
+                    StoredPath::from(PathBuf::from("/w")),
+                    false,
+                    false,
+                    false,
+                    Some(RemoteBranch {
+                        remote: RemoteName::new("origin").unwrap(),
+                        branch: BranchName::new("feature").unwrap(),
+                    }),
+                    BTreeSet::new(),
+                )
+                .unwrap(),
+            ),
+            (
+                "remove local+remote",
+                RemoveIntent::new(
+                    repo(),
+                    StoredPath::from(PathBuf::from("/w")),
+                    false,
+                    true,
+                    false,
+                    Some(RemoteBranch {
+                        remote: RemoteName::new("origin").unwrap(),
+                        branch: BranchName::new("feature").unwrap(),
+                    }),
+                    BTreeSet::new(),
+                )
+                .unwrap(),
+            ),
+        ] {
+            let plan = plan_remove(remove_input(intent)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let restored: OperationPlan =
+                serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+            assert_eq!(restored, plan, "{name}: schema2 roundtrip");
+            restored
+                .validate_executable_plan()
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            if name.contains("remote") {
+                assert!(matches!(
+                    restored.steps().last().unwrap().action(),
+                    StepAction::DeleteRemoteBranch {
+                        expected_oid: Some(_),
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn positive_create_contract_matrix_is_canonical_and_executable() {
+        let cases = [
+            (
+                "normal copy",
+                FileArtifactKind::CopyFile,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                "sensitive private copy",
+                FileArtifactKind::CopyFile,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                "create symlink",
+                FileArtifactKind::CreateSymlink,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                "relink symlink",
+                FileArtifactKind::RelinkSymlink,
+                false,
+                true,
+                false,
+                false,
+            ),
+            (
+                "optional task",
+                FileArtifactKind::CopyFile,
+                false,
+                false,
+                true,
+                false,
+            ),
+            (
+                "required task",
+                FileArtifactKind::CopyFile,
+                false,
+                false,
+                true,
+                true,
+            ),
+            (
+                "artifact and task suffix",
+                FileArtifactKind::CreateSymlink,
+                false,
+                false,
+                true,
+                false,
+            ),
+        ];
+        for (name, kind, sensitive, replace, task, required) in cases {
+            let plan = plan_create(executable_artifact_input(
+                kind, sensitive, replace, task, required,
+            ))
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let restored: OperationPlan =
+                serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+            assert_eq!(restored, plan, "{name}: schema2 roundtrip");
+            restored
+                .validate_executable_plan()
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let artifact = restored
+                .steps()
+                .iter()
+                .find_map(|step| match step.action() {
+                    StepAction::FileArtifact {
+                        kind, mode_policy, ..
+                    } => Some((*kind, *mode_policy)),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                artifact.1,
+                if sensitive {
+                    FileModePolicy::Private
+                } else if matches!(kind, FileArtifactKind::CopyFile) {
+                    FileModePolicy::PreserveSafe
+                } else {
+                    FileModePolicy::NotApplicable
+                },
+                "{name}: mode policy"
+            );
+            let ids: Vec<_> = restored
+                .required_consents()
+                .iter()
+                .map(|consent| consent.id.as_str())
+                .collect();
+            let mut expected = Vec::new();
+            if sensitive || replace {
+                expected.push("file-rule:config");
+            }
+            if task {
+                expected.push("task:build");
+            }
+            assert_eq!(ids, expected, "{name}: consent order");
+        }
+    }
+
+    #[test]
+    fn linked_worktree_source_root_is_authoritative() {
+        let mut value =
+            executable_artifact_input(FileArtifactKind::CopyFile, false, false, false, false);
+        value.repository.primary_root = StoredPath::from(PathBuf::from("/primary"));
+        value.intent.repository = value.repository.clone();
+        value.primary_root = StoredPath::from(PathBuf::from("/primary"));
+        value.current_worktree_root = StoredPath::from(PathBuf::from("/linked"));
+        value.manifests[0].source_root = StoredPath::from(PathBuf::from("/linked"));
+        value.manifests[0].artifacts[0].source =
+            StoredPath::from(PathBuf::from("/linked/source/config"));
+        let plan = plan_create(value).unwrap();
+        let restored: OperationPlan =
+            serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+        assert_eq!(restored, plan);
+        assert!(restored.validate_executable_plan().is_ok());
+    }
+
+    #[test]
+    fn same_rule_mixed_source_roots_are_not_executable() {
+        let mut value =
+            executable_artifact_input(FileArtifactKind::CopyFile, false, false, false, false);
+        let second = value.manifests[0].artifacts[0].clone();
+        value.manifests[0].artifacts.push(FileArtifact {
+            source: StoredPath::from(PathBuf::from("/r/source/other")),
+            destination: StoredPath::from(PathBuf::from("/w/feature/other")),
+            compensation: Some(Compensation::RemoveCreatedArtifact(CreatedArtifact {
+                path: StoredPath::from(PathBuf::from("/w/feature/other")),
+                fingerprint: second.fingerprint.clone(),
+            })),
+            ..second
+        });
+        let mut plan = plan_create(value).unwrap();
+        let mut artifact_steps: Vec<_> = plan
+            .steps_mut()
+            .iter_mut()
+            .filter(|step| matches!(step.action(), StepAction::FileArtifact { .. }))
+            .collect();
+        assert_eq!(artifact_steps.len(), 2);
+        if let StepAction::FileArtifact { source, .. } = artifact_steps[1].action_mut() {
+            *source = StoredPath::from(PathBuf::from("/linked/source/other"));
+        }
+        for guard in artifact_steps[1].preconditions_mut() {
+            if let Precondition::ArtifactSourceAt {
+                source_root,
+                source,
+                ..
+            } = guard
+            {
+                *source_root = StoredPath::from(PathBuf::from("/linked"));
+                *source = StoredPath::from(PathBuf::from("/linked/source/other"));
+            }
+        }
+        let restored: OperationPlan =
+            serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+        assert!(restored.validate_persisted().is_ok());
+        assert!(restored.validate_executable_plan().is_err());
+    }
+
+    #[test]
+    fn artifact_source_outside_persisted_source_root_is_not_executable() {
+        let mut plan = plan_create({
+            let mut value =
+                executable_artifact_input(FileArtifactKind::CopyFile, false, false, false, false);
+            value.repository.primary_root = StoredPath::from(PathBuf::from("/primary"));
+            value.intent.repository = value.repository.clone();
+            value.primary_root = StoredPath::from(PathBuf::from("/primary"));
+            value.current_worktree_root = StoredPath::from(PathBuf::from("/linked"));
+            value.manifests[0].source_root = StoredPath::from(PathBuf::from("/linked"));
+            value.manifests[0].artifacts[0].source =
+                StoredPath::from(PathBuf::from("/linked/source/config"));
+            value
+        })
+        .unwrap();
+        if let StepAction::FileArtifact { source, .. } = plan.steps_mut()[1].action_mut() {
+            *source = StoredPath::from(PathBuf::from("/outside/source/config"));
+        }
+        for guard in plan.steps_mut()[1].preconditions_mut() {
+            if let Precondition::ArtifactSourceAt { source, .. } = guard {
+                *source = StoredPath::from(PathBuf::from("/outside/source/config"));
+            }
+        }
+        assert!(plan.validate_persisted().is_ok());
+        assert!(plan.validate_executable_plan().is_err());
+    }
+
+    #[test]
+    fn coordinated_arbitrary_manifest_digest_is_not_executable() {
+        let mut plan = plan_create(executable_artifact_input(
+            FileArtifactKind::CopyFile,
+            false,
+            false,
+            false,
+            false,
+        ))
+        .unwrap();
+        let arbitrary = ObjectId::new("fedcba9876543210fedcba9876543210fedcba98").unwrap();
+        for step in plan.steps_mut() {
+            if let StepAction::FileArtifact {
+                manifest_digest, ..
+            } = step.action_mut()
+            {
+                *manifest_digest = arbitrary.clone();
+            }
+            for guard in step.preconditions_mut() {
+                if let Precondition::ArtifactSourceAt {
+                    manifest_digest, ..
+                } = guard
+                {
+                    *manifest_digest = arbitrary.clone();
+                }
+            }
+        }
+        assert!(plan.validate_persisted().is_ok());
+        assert!(plan.validate_executable_plan().is_err());
+    }
+
+    #[test]
+    fn archived_schema1_remote_delete_without_lease_is_readable_only() {
+        let intent = RemoveIntent::new(
+            repo(),
+            StoredPath::from(PathBuf::from("/w")),
+            false,
+            false,
+            false,
+            Some(RemoteBranch {
+                remote: RemoteName::new("origin").unwrap(),
+                branch: BranchName::new("feature").unwrap(),
+            }),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        let mut wire = serde_json::to_value(plan_remove(remove_input(intent)).unwrap()).unwrap();
+        wire["plan_schema_version"] = json!(1);
+        wire["steps"][1]["action"]["DeleteRemoteBranch"]
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_oid");
+        let restored: OperationPlan = serde_json::from_value(wire).unwrap();
+        assert!(restored.validate_persisted().is_ok());
+        assert!(restored.validate_executable_plan().is_err());
+    }
+
+    #[test]
+    fn crafted_create_contract_mutations_are_shape_valid_but_not_executable() {
+        fn visit(
+            value: &mut serde_json::Value,
+            key: &str,
+            f: &mut dyn FnMut(&mut serde_json::Value),
+        ) {
+            if let Some(object) = value.as_object_mut() {
+                if let Some(found) = object.get_mut(key) {
+                    f(found);
+                }
+                for child in object.values_mut() {
+                    visit(child, key, f);
+                }
+            } else if let Some(array) = value.as_array_mut() {
+                for child in array {
+                    visit(child, key, f);
+                }
+            }
+        }
+        fn remove_variant(value: &mut serde_json::Value, key: &str) {
+            if let Some(array) = value.as_array_mut() {
+                array.retain(|item| item.get(key).is_none());
+                for child in array {
+                    remove_variant(child, key);
+                }
+            } else if let Some(object) = value.as_object_mut() {
+                for child in object.values_mut() {
+                    remove_variant(child, key);
+                }
+            }
+        }
+        let copy = serde_json::to_value(
+            plan_create(executable_artifact_input(
+                FileArtifactKind::CopyFile,
+                true,
+                false,
+                true,
+                false,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let symlink = serde_json::to_value(
+            plan_create(executable_artifact_input(
+                FileArtifactKind::CreateSymlink,
+                false,
+                false,
+                false,
+                false,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let relink = serde_json::to_value(
+            plan_create(executable_artifact_input(
+                FileArtifactKind::RelinkSymlink,
+                false,
+                true,
+                false,
+                false,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        type Mutation = (
+            &'static str,
+            serde_json::Value,
+            Box<dyn Fn(&mut serde_json::Value)>,
+        );
+        let cases: Vec<Mutation> = vec![
+            (
+                "sensitive Private to PreserveSafe",
+                copy.clone(),
+                Box::new(|v| visit(v, "mode_policy", &mut |x| *x = json!("preserve_safe"))),
+            ),
+            (
+                "symlink target bytes",
+                symlink.clone(),
+                Box::new(|v| visit(v, "bytes", &mut |x| *x = json!(99))),
+            ),
+            (
+                "symlink digest without target",
+                symlink.clone(),
+                Box::new(|v| {
+                    visit(v, "digest", &mut |x| {
+                        *x = json!("fedcba9876543210fedcba9876543210fedcba98")
+                    })
+                }),
+            ),
+            (
+                "relink target bytes",
+                relink.clone(),
+                Box::new(|v| visit(v, "bytes", &mut |x| *x = json!(99))),
+            ),
+            (
+                "relink digest without target",
+                relink.clone(),
+                Box::new(|v| {
+                    visit(v, "digest", &mut |x| {
+                        *x = json!("fedcba9876543210fedcba9876543210fedcba98")
+                    })
+                }),
+            ),
+            (
+                "symlink PathAbsent versus SymlinkAt",
+                symlink.clone(),
+                Box::new(|v| {
+                    remove_variant(v, "PathAbsent");
+                }),
+            ),
+            (
+                "relink SymlinkAt versus PathAbsent",
+                relink.clone(),
+                Box::new(|v| {
+                    remove_variant(v, "SymlinkAt");
+                }),
+            ),
+            (
+                "artifact compensation changed",
+                copy.clone(),
+                Box::new(|v| visit(v, "compensation", &mut |x| *x = serde_json::Value::Null)),
+            ),
+            (
+                "file-rule consent missing",
+                copy.clone(),
+                Box::new(|v| v["required_consents"].as_array_mut().unwrap().clear()),
+            ),
+            (
+                "file-rule consent extra",
+                copy.clone(),
+                Box::new(|v| {
+                    let mut c = v["required_consents"][0].clone();
+                    c["id"] = json!("file-rule:extra");
+                    v["required_consents"].as_array_mut().unwrap().push(c);
+                }),
+            ),
+            (
+                "file-rule wrong risk",
+                copy.clone(),
+                Box::new(|v| v["risks"][0]["kind"] = json!("dirty_data_loss")),
+            ),
+            (
+                "task consent missing",
+                copy.clone(),
+                Box::new(|v| {
+                    v["required_consents"].as_array_mut().unwrap().remove(1);
+                }),
+            ),
+            (
+                "task consent extra",
+                copy.clone(),
+                Box::new(|v| {
+                    let mut c = v["required_consents"][1].clone();
+                    c["id"] = json!("task:extra");
+                    v["required_consents"].as_array_mut().unwrap().push(c);
+                }),
+            ),
+            (
+                "task wrong risk",
+                copy.clone(),
+                Box::new(|v| v["risks"][1]["kind"] = json!("delete_local_branch")),
+            ),
+            (
+                "task before artifact",
+                copy.clone(),
+                Box::new(|v| {
+                    let steps = v["steps"].as_array_mut().unwrap();
+                    steps.swap(1, 2);
+                }),
+            ),
+            (
+                "task irreversible false",
+                copy.clone(),
+                Box::new(|v| visit(v, "irreversible", &mut |x| *x = json!(false))),
+            ),
+            (
+                "task compensation injected",
+                copy.clone(),
+                Box::new(|v| {
+                    visit(
+                        v,
+                        "compensation",
+                        &mut |x| *x = json!({"RemoveCreatedArtifact":{"path":"/w/feature/config","fingerprint":"0123456789012345678901234567890123456789"}}),
+                    )
+                }),
+            ),
+            (
+                "selected task mismatch",
+                copy.clone(),
+                Box::new(|v| {
+                    v["intent"]["Create"]["selected_tasks"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!("missing"))
+                }),
+            ),
+        ];
+        for (name, mut value, mutate) in cases {
+            mutate(&mut value);
+            let plan: OperationPlan = serde_json::from_value(value.clone())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            if name == "task compensation injected" {
+                assert!(
+                    plan.validate_persisted().is_err(),
+                    "{name}: persisted invariant"
+                );
+                continue;
+            }
+            assert!(plan.validate_persisted().is_ok(), "{name}: persisted shape");
+            assert!(
+                plan.validate_executable_plan().is_err(),
+                "{name}: remained executable"
+            );
+            crate::lifecycle::assert_shape_valid_but_not_executable(value);
+            assert!(!name.is_empty());
+        }
+    }
+
+    #[test]
+    fn coordinated_grant_sets_must_match_intent() {
+        let base = serde_json::to_value(
+            plan_create(executable_artifact_input(
+                FileArtifactKind::CopyFile,
+                true,
+                false,
+                false,
+                false,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        for (name, mutate) in [
+            (
+                "top-level-only grant",
+                Box::new(|v: &mut serde_json::Value| {
+                    v["granted_consents"] = json!(["file-rule:config"])
+                }) as Box<dyn Fn(&mut serde_json::Value)>,
+            ),
+            (
+                "intent-only grant",
+                Box::new(|v: &mut serde_json::Value| {
+                    v["intent"]["Create"]["granted_consents"] = json!(["file-rule:config"])
+                }),
+            ),
+        ] {
+            let mut value = base.clone();
+            mutate(&mut value);
+            crate::lifecycle::assert_shape_valid_but_not_executable(value);
+            assert!(!name.is_empty());
+        }
+    }
+
+    #[test]
+    fn granted_create_and_remove_plans_roundtrip_executable() {
+        let mut create =
+            executable_artifact_input(FileArtifactKind::CopyFile, true, false, false, false);
+        create
+            .intent
+            .granted_consents
+            .insert(ConsentId::new("file-rule:config").unwrap());
+        let create_plan = plan_create(create).unwrap();
+        assert!(create_plan.validate_executable_plan().is_ok());
+        let mut remove_intent = remove_intent();
+        remove_intent
+            .granted_consents
+            .insert(ConsentId::new("remove:worktree").unwrap());
+        let remove_plan = plan_remove(remove_input(remove_intent)).unwrap();
+        assert!(remove_plan.validate_executable_plan().is_ok());
+    }
+
+    #[test]
+    fn crafted_remove_mutations_are_persisted_but_not_executable() {
+        fn each_object(
+            value: &mut serde_json::Value,
+            key: &str,
+            f: &mut dyn FnMut(&mut serde_json::Value),
+        ) {
+            if let Some(object) = value.as_object_mut() {
+                if let Some(found) = object.get_mut(key) {
+                    f(found);
+                }
+                for child in object.values_mut() {
+                    each_object(child, key, f);
+                }
+            } else if let Some(array) = value.as_array_mut() {
+                for child in array {
+                    each_object(child, key, f);
+                }
+            }
+        }
+        fn remove_variant(value: &mut serde_json::Value, key: &str) {
+            if let Some(array) = value.as_array_mut() {
+                array.retain(|item| item.get(key).is_none());
+                for item in array {
+                    remove_variant(item, key);
+                }
+            } else if let Some(object) = value.as_object_mut() {
+                for child in object.values_mut() {
+                    remove_variant(child, key);
+                }
+            }
+        }
+        let full = RemoveIntent::new(
+            repo(),
+            StoredPath::from(PathBuf::from("/w")),
+            false,
+            true,
+            true,
+            Some(RemoteBranch {
+                remote: RemoteName::new("origin").unwrap(),
+                branch: BranchName::new("feature").unwrap(),
+            }),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        let base = serde_json::to_value(plan_remove(remove_input(full)).unwrap()).unwrap();
+        type Mutation = (&'static str, Box<dyn Fn(&mut serde_json::Value)>);
+        let mut mutations: Vec<Mutation> = Vec::new();
+        mutations.push((
+            "CommonDirectory",
+            Box::new(|v| remove_variant(v, "CommonDirectory")),
+        ));
+        mutations.push((
+            "WorktreeAt path",
+            Box::new(|v| each_object(v, "WorktreeAt", &mut |x| x["path"] = json!("/other"))),
+        ));
+        mutations.push((
+            "WorktreeAt branch",
+            Box::new(|v| each_object(v, "WorktreeAt", &mut |x| x["branch"] = json!("other"))),
+        ));
+        mutations.push((
+            "WorktreeAt OID",
+            Box::new(|v| {
+                each_object(v, "WorktreeAt", &mut |x| {
+                    x["oid"] = json!("fedcba9876543210fedcba9876543210fedcba98")
+                })
+            }),
+        ));
+        mutations.push((
+            "WorktreeAt class",
+            Box::new(|v| each_object(v, "WorktreeAt", &mut |x| x["class"] = json!("primary"))),
+        ));
+        mutations.push((
+            "WorktreeAt missing",
+            Box::new(|v| remove_variant(v, "WorktreeAt")),
+        ));
+        mutations.push((
+            "WorktreeRemoved path",
+            Box::new(|v| each_object(v, "WorktreeRemoved", &mut |x| x["path"] = json!("/other"))),
+        ));
+        mutations.push((
+            "WorktreeRemoved OID",
+            Box::new(|v| {
+                each_object(v, "WorktreeRemoved", &mut |x| {
+                    x["oid"] = json!("fedcba9876543210fedcba9876543210fedcba98")
+                })
+            }),
+        ));
+        mutations.push((
+            "WorktreeRemoved duplicate",
+            Box::new(|v| {
+                each_object(v, "postconditions", &mut |x| {
+                    if let Some(a) = x.as_array_mut()
+                        && let Some(item) = a
+                            .iter()
+                            .find(|x| x.get("WorktreeRemoved").is_some())
+                            .cloned()
+                    {
+                        a.push(item);
+                    }
+                })
+            }),
+        ));
+        mutations.push((
+            "action-vs-intent path",
+            Box::new(|v| each_object(v, "RemoveWorktree", &mut |x| x["path"] = json!("/other"))),
+        ));
+        mutations.push((
+            "local action branch",
+            Box::new(|v| {
+                each_object(v, "DeleteLocalBranch", &mut |x| {
+                    x["branch"] = json!("other")
+                })
+            }),
+        ));
+        mutations.push((
+            "local RefAt OID",
+            Box::new(|v| {
+                each_object(v, "RefAt", &mut |x| {
+                    x["oid"] = json!("fedcba9876543210fedcba9876543210fedcba98")
+                })
+            }),
+        ));
+        mutations.push((
+            "BranchDeleted missing",
+            Box::new(|v| remove_variant(v, "BranchDeleted")),
+        ));
+        mutations.push((
+            "remote action target",
+            Box::new(|v| {
+                each_object(v, "DeleteRemoteBranch", &mut |x| {
+                    x["target"]["branch"] = json!("other")
+                })
+            }),
+        ));
+        mutations.push((
+            "default guard",
+            Box::new(|v| {
+                each_object(v, "RemoteBranchNotDefault", &mut |x| {
+                    x["remote"] = json!("other")
+                })
+            }),
+        ));
+        mutations.push((
+            "RemoteRefAt remote",
+            Box::new(|v| each_object(v, "RemoteRefAt", &mut |x| x["remote"] = json!("other"))),
+        ));
+        mutations.push((
+            "RemoteRefAt branch",
+            Box::new(|v| each_object(v, "RemoteRefAt", &mut |x| x["branch"] = json!("other"))),
+        ));
+        mutations.push((
+            "RemoteBranchDeleted missing",
+            Box::new(|v| remove_variant(v, "RemoteBranchDeleted")),
+        ));
+        mutations.push((
+            "RemoteBranchDeleted wrong",
+            Box::new(|v| {
+                each_object(v, "RemoteBranchDeleted", &mut |x| {
+                    x["branch"] = json!("other")
+                })
+            }),
+        ));
+        for (name, mutate) in mutations {
+            let mut value = base.clone();
+            mutate(&mut value);
+            let plan: OperationPlan =
+                serde_json::from_value(value.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(plan.validate_persisted().is_ok(), "{name}: shape");
+            assert!(
+                plan.validate_executable_plan().is_err(),
+                "{name}: executable"
+            );
+            crate::lifecycle::assert_shape_valid_but_not_executable(value);
+        }
+    }
+
+    #[test]
+    fn isolated_remove_safety_and_consent_mutations_are_rejected() {
+        fn visit(
+            value: &mut serde_json::Value,
+            key: &str,
+            f: &mut dyn FnMut(&mut serde_json::Value),
+        ) {
+            if let Some(object) = value.as_object_mut() {
+                if let Some(found) = object.get_mut(key) {
+                    f(found);
+                }
+                for child in object.values_mut() {
+                    visit(child, key, f);
+                }
+            } else if let Some(array) = value.as_array_mut() {
+                for child in array {
+                    visit(child, key, f);
+                }
+            }
+        }
+        fn remove_variant(value: &mut serde_json::Value, key: &str) {
+            if let Some(array) = value.as_array_mut() {
+                array.retain(|item| item.get(key).is_none());
+                for child in array {
+                    remove_variant(child, key);
+                }
+            } else if let Some(object) = value.as_object_mut() {
+                for child in object.values_mut() {
+                    remove_variant(child, key);
+                }
+            }
+        }
+        fn local_merge_plan(force: bool) -> serde_json::Value {
+            let intent = RemoveIntent::new(
+                repo(),
+                StoredPath::from(PathBuf::from("/w")),
+                false,
+                true,
+                force,
+                Some(RemoteBranch {
+                    remote: RemoteName::new("origin").unwrap(),
+                    branch: BranchName::new("feature").unwrap(),
+                }),
+                BTreeSet::new(),
+            )
+            .unwrap();
+            serde_json::to_value(plan_remove(remove_input(intent)).unwrap()).unwrap()
+        }
+        let merge = local_merge_plan(false);
+        let force = local_merge_plan(true);
+        type Mutation = (
+            &'static str,
+            serde_json::Value,
+            Box<dyn Fn(&mut serde_json::Value)>,
+        );
+        let mut cases: Vec<Mutation> = vec![
+            (
+                "RefMergedInto missing",
+                merge.clone(),
+                Box::new(|v| remove_variant(v, "RefMergedInto")),
+            ),
+            (
+                "RefMergedInto target_ref None",
+                merge.clone(),
+                Box::new(|v| {
+                    visit(v, "RefMergedInto", &mut |x| {
+                        x["target_ref"] = serde_json::Value::Null
+                    })
+                }),
+            ),
+            (
+                "RefMergedInto target_ref wrong",
+                merge.clone(),
+                Box::new(|v| {
+                    visit(v, "RefMergedInto", &mut |x| {
+                        x["target_ref"] = json!("other")
+                    })
+                }),
+            ),
+            (
+                "RefMergedInto target_oid wrong",
+                merge.clone(),
+                Box::new(|v| {
+                    visit(v, "RefMergedInto", &mut |x| {
+                        x["target_oid"] = json!("fedcba9876543210fedcba9876543210fedcba98")
+                    })
+                }),
+            ),
+            (
+                "merge-target RefAt missing",
+                merge.clone(),
+                Box::new(|v| {
+                    v["steps"][1]["preconditions"]
+                        .as_array_mut()
+                        .unwrap()
+                        .retain(|x| {
+                            x.get("RefAt")
+                                .and_then(|r| r.get("reference"))
+                                .is_none_or(|r| r != "HEAD")
+                        })
+                }),
+            ),
+            (
+                "merge-target RefAt wrong ref",
+                merge.clone(),
+                Box::new(|v| {
+                    v["steps"][1]["preconditions"]
+                        .as_array_mut()
+                        .unwrap()
+                        .iter_mut()
+                        .filter_map(|x| x.get_mut("RefAt"))
+                        .for_each(|x| x["reference"] = json!("other"))
+                }),
+            ),
+            (
+                "merge-target RefAt wrong OID",
+                merge.clone(),
+                Box::new(|v| {
+                    v["steps"][1]["preconditions"]
+                        .as_array_mut()
+                        .unwrap()
+                        .iter_mut()
+                        .filter_map(|x| x.get_mut("RefAt"))
+                        .for_each(|x| {
+                            if x["reference"] == "HEAD" {
+                                x["oid"] = json!("fedcba9876543210fedcba9876543210fedcba98");
+                            }
+                        })
+                }),
+            ),
+            (
+                "nonforce missing merge proof",
+                merge.clone(),
+                Box::new(|v| remove_variant(v, "RefMergedInto")),
+            ),
+            (
+                "force merge proof injected",
+                force.clone(),
+                Box::new(|v| {
+                    let guard = json!({"RefMergedInto":{"reference":"feature","target_ref":"HEAD","target_oid":"0123456789012345678901234567890123456789"}});
+                    v["steps"][1]["preconditions"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(guard);
+                }),
+            ),
+            (
+                "BranchDeleted wrong",
+                force.clone(),
+                Box::new(|v| {
+                    for post in v["steps"][1]["postconditions"].as_array_mut().unwrap() {
+                        if post.get("BranchDeleted").is_some() {
+                            post["BranchDeleted"] = json!("other");
+                        }
+                    }
+                }),
+            ),
+            (
+                "BranchDeleted duplicate",
+                force.clone(),
+                Box::new(|v| {
+                    let posts = v["steps"][1]["postconditions"].as_array_mut().unwrap();
+                    let item = posts
+                        .iter()
+                        .find(|x| x.get("BranchDeleted").is_some())
+                        .unwrap()
+                        .clone();
+                    posts.push(item);
+                }),
+            ),
+            (
+                "RemoteRefAt OID wrong",
+                force.clone(),
+                Box::new(|v| {
+                    visit(v, "RemoteRefAt", &mut |x| {
+                        x["oid"] = json!("fedcba9876543210fedcba9876543210fedcba98")
+                    })
+                }),
+            ),
+            (
+                "RemoteRefAt duplicate",
+                force.clone(),
+                Box::new(|v| {
+                    let guards = v["steps"][2]["preconditions"].as_array_mut().unwrap();
+                    let item = guards
+                        .iter()
+                        .find(|x| x.get("RemoteRefAt").is_some())
+                        .unwrap()
+                        .clone();
+                    guards.push(item);
+                }),
+            ),
+            (
+                "remote expected OID missing",
+                force.clone(),
+                Box::new(|v| {
+                    visit(v, "DeleteRemoteBranch", &mut |x| {
+                        x.as_object_mut().unwrap().remove("expected_oid");
+                    })
+                }),
+            ),
+            (
+                "remote expected OID wrong",
+                force.clone(),
+                Box::new(|v| {
+                    visit(v, "DeleteRemoteBranch", &mut |x| {
+                        x["expected_oid"] = json!("fedcba9876543210fedcba9876543210fedcba98")
+                    })
+                }),
+            ),
+            (
+                "RemoteBranchNotDefault missing",
+                force.clone(),
+                Box::new(|v| remove_variant(v, "RemoteBranchNotDefault")),
+            ),
+            (
+                "RemoteBranchNotDefault duplicate",
+                force.clone(),
+                Box::new(|v| {
+                    let guards = v["steps"][2]["preconditions"].as_array_mut().unwrap();
+                    let item = guards
+                        .iter()
+                        .find(|x| x.get("RemoteBranchNotDefault").is_some())
+                        .unwrap()
+                        .clone();
+                    guards.push(item);
+                }),
+            ),
+            (
+                "remote deletion not final",
+                force.clone(),
+                Box::new(|v| {
+                    let steps = v["steps"].as_array_mut().unwrap();
+                    let remote = steps.pop().unwrap();
+                    steps.insert(1, remote);
+                }),
+            ),
+        ];
+        let consent_base = force.clone();
+        for (id, risk) in [
+            ("remove:worktree", "remove_worktree"),
+            ("remove:local-branch", "delete_local_branch"),
+            ("remove:force-local-branch", "force_delete_local_branch"),
+            ("remove:remote:origin/feature", "delete_remote_branch"),
+        ] {
+            cases.push((
+                "consent missing",
+                consent_base.clone(),
+                Box::new(move |v| {
+                    v["required_consents"]
+                        .as_array_mut()
+                        .unwrap()
+                        .retain(|x| x["id"] != id);
+                }),
+            ));
+            cases.push((
+                "consent extra",
+                consent_base.clone(),
+                Box::new(move |v| {
+                    let c = json!({"id":"remove:extra","risks":[{"kind":risk,"message":"extra"}]});
+                    v["required_consents"].as_array_mut().unwrap().push(c);
+                }),
+            ));
+            cases.push((
+                "consent wrong RiskKind",
+                consent_base.clone(),
+                Box::new(move |v| {
+                    for c in v["required_consents"].as_array_mut().unwrap() {
+                        if c["id"] == id {
+                            c["risks"][0]["kind"] = json!("dirty_data_loss");
+                        }
+                    }
+                }),
+            ));
+        }
+        for risk in [
+            "remove_worktree",
+            "delete_local_branch",
+            "force_delete_local_branch",
+            "delete_remote_branch",
+        ] {
+            cases.push((
+                "plan Risk missing",
+                consent_base.clone(),
+                Box::new(move |v| {
+                    v["risks"]
+                        .as_array_mut()
+                        .unwrap()
+                        .retain(|x| x["kind"] != risk);
+                }),
+            ));
+        }
+        for (name, mut value, mutate) in cases {
+            mutate(&mut value);
+            let plan: OperationPlan = serde_json::from_value(value.clone())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert!(plan.validate_persisted().is_ok(), "{name}: persisted shape");
+            assert!(
+                plan.validate_executable_plan().is_err(),
+                "{name}: remained executable"
+            );
+            crate::lifecycle::assert_shape_valid_but_not_executable(value);
+        }
+    }
+
+    #[test]
+    fn empty_enabled_manifest_emits_no_artifact_contract_and_is_executable() {
+        let branch = BranchName::new("feature").unwrap();
+        let mut value = input(
+            CreateSource::NewBranch {
+                branch: branch.clone(),
+                base: None,
+            },
+            CreateSourceFacts::NewBranch {
+                branch,
+                base_ref: RefName::new("main").unwrap(),
+                base_oid: oid(),
+                branch_absent: true,
+            },
+        );
+        value.known_rules.insert("empty".into());
+        value.enabled_rules.insert("empty".into());
+        let empty_digest = canonical_manifest_digest(&[], value.destination.path.as_path());
+        value.manifests = vec![FileActionManifest {
+            rule: "empty".into(),
+            source_root: value.repository.primary_root.clone(),
+            artifacts: Vec::new(),
+            digest: empty_digest,
+        }];
+
+        let plan = plan_create(value).unwrap();
+        let OperationIntent::Create(intent) = plan.intent() else {
+            panic!("expected create intent");
+        };
+        assert!(intent.artifact_rule_contracts.is_empty());
+        assert!(
+            plan.steps()
+                .iter()
+                .all(|step| !matches!(step.action(), StepAction::FileArtifact { .. }))
+        );
+        assert!(plan.validate_executable_plan().is_ok());
     }
 }

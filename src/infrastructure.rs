@@ -7,7 +7,6 @@ use std::{
 };
 
 use globset::GlobBuilder;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 
@@ -372,7 +371,12 @@ impl LifecyclePlanningPort for GitCli {
         } else {
             (None, false)
         };
-        let safe_target = safety_target(&request.repo, target.upstream.as_deref(), &primary_oid)?;
+        let (safe_target_ref, safe_target, merge_provenance) = safety_target(
+            &request.repo,
+            target.branch.as_deref().unwrap_or(branch.as_str()),
+            target.upstream.as_deref(),
+            &primary_oid,
+        )?;
         let local_safe = is_ancestor(&request.repo, &branch_oid, &safe_target)?;
         let ongoing = ongoing_git_operation(&target.path)?;
         let branch_elsewhere = listing.data.worktrees.iter().any(|item| {
@@ -388,6 +392,9 @@ impl LifecyclePlanningPort for GitCli {
             branch_elsewhere,
             dirty: target.status == CheckoutStatus::Dirty,
             local_branch_safe_to_delete: local_safe,
+            safe_target_ref,
+            safe_target,
+            merge_provenance,
             branch,
             branch_oid,
             worktree_oid,
@@ -466,6 +473,7 @@ impl ManifestPlanningPort for GitCli {
                 manifest_digest(&artifacts, facts.destination.path.as_path(), &source_root);
             manifests.push(FileActionManifest {
                 rule: spec.name,
+                source_root: StoredPath::from(source_root),
                 artifacts,
                 digest,
             });
@@ -477,14 +485,16 @@ impl ManifestPlanningPort for GitCli {
                 destinations.push(artifact.destination.as_path().to_owned());
             }
         }
-        destinations.sort();
-        for pair in destinations.windows(2) {
-            if pair[0] == pair[1] || pair[1].starts_with(&pair[0]) {
-                return Err(planning(
-                    "manifest_overlap",
-                    "file rule destinations overlap",
-                ));
-            }
+        if crate::lifecycle::destination_paths_overlap(
+            &destinations
+                .into_iter()
+                .map(StoredPath::from)
+                .collect::<Vec<_>>(),
+        ) {
+            return Err(planning(
+                "manifest_overlap",
+                "file rule destinations overlap",
+            ));
         }
         Ok(manifests)
     }
@@ -717,43 +727,27 @@ fn excluded(relative: &Path, excludes: &[String]) -> Result<bool, PlanningError>
 }
 
 fn digest_bytes(bytes: &[u8]) -> ObjectId {
-    let mut hash = Sha256::new();
-    hash.update(bytes);
-    ObjectId::new(format!("{:x}", hash.finalize())).expect("sha256 is always a valid object id")
+    crate::planner::artifact_digest(bytes)
 }
 
 fn manifest_digest(artifacts: &[FileArtifact], root: &Path, source_root: &Path) -> ObjectId {
-    let mut hash = Sha256::new();
-    for artifact in artifacts {
-        let source_relative = artifact
-            .source
-            .as_path()
-            .strip_prefix(source_root)
-            .unwrap_or(artifact.source.as_path());
-        let destination_relative = artifact
-            .destination
-            .as_path()
-            .strip_prefix(root)
-            .unwrap_or(artifact.destination.as_path());
-        hash.update(source_relative.as_os_str().as_encoded_bytes());
-        hash.update([0]);
-        hash.update(destination_relative.as_os_str().as_encoded_bytes());
-        hash.update([0]);
-        hash.update(match artifact.kind {
-            FileArtifactKind::CopyFile => b"copy_file".as_slice(),
-            FileArtifactKind::CreateSymlink => b"create_symlink".as_slice(),
-            FileArtifactKind::RelinkSymlink => b"relink_symlink".as_slice(),
-        });
-        hash.update([0]);
-        hash.update(artifact.bytes.to_le_bytes());
-        hash.update(artifact.digest.as_str().as_bytes());
-        hash.update(artifact.fingerprint.as_str().as_bytes());
-        if let Some(target) = &artifact.link_target {
-            hash.update(target.as_path().as_os_str().as_encoded_bytes());
-        }
-        hash.update([0]);
-    }
-    ObjectId::new(format!("{:x}", hash.finalize())).expect("sha256 is always a valid object id")
+    let contracts = artifacts
+        .iter()
+        .map(|artifact| crate::planner::ManifestDigestArtifact {
+            source_root: StoredPath::from(source_root.to_owned()),
+            source: artifact.source.clone(),
+            destination: artifact.destination.clone(),
+            kind: artifact.kind,
+            bytes: artifact.bytes,
+            digest: artifact.digest.clone(),
+            fingerprint: artifact.fingerprint.clone(),
+            link_target: artifact.link_target.clone(),
+            sensitive: artifact.sensitive,
+            confirm: artifact.confirm,
+            mode_policy: artifact.mode_policy,
+        })
+        .collect::<Vec<_>>();
+    crate::planner::canonical_manifest_digest(&contracts, root)
 }
 
 fn make_artifact(
@@ -843,6 +837,13 @@ fn make_artifact(
         fingerprint,
         link_target,
         sensitive: spec.sensitive,
+        mode_policy: match kind {
+            FileArtifactKind::CopyFile if spec.sensitive => crate::planner::FileModePolicy::Private,
+            FileArtifactKind::CopyFile => crate::planner::FileModePolicy::PreserveSafe,
+            FileArtifactKind::CreateSymlink | FileArtifactKind::RelinkSymlink => {
+                crate::planner::FileModePolicy::NotApplicable
+            }
+        },
         confirm: spec.confirm,
         conflict: false,
         overlap: false,
@@ -1128,12 +1129,27 @@ fn is_ancestor(
 
 fn safety_target(
     repo: &Path,
+    branch: &str,
     upstream: Option<&str>,
     primary_oid: &ObjectId,
-) -> Result<ObjectId, PlanningError> {
+) -> Result<(RefName, ObjectId, crate::lifecycle::MergeTargetProvenance), PlanningError> {
     match upstream {
-        Some(reference) => git_oid(repo, reference),
-        None => Ok(primary_oid.clone()),
+        Some(reference) => Ok((
+            RefName::new(reference.to_owned())
+                .map_err(|message| planning("invalid_upstream", &message))?,
+            git_oid(repo, reference)?,
+            crate::lifecycle::MergeTargetProvenance::Upstream {
+                branch: crate::lifecycle::BranchName::new(branch.to_owned())
+                    .map_err(|message| planning("invalid_upstream", &message))?,
+                upstream_ref: RefName::new(reference.to_owned())
+                    .map_err(|message| planning("invalid_upstream", &message))?,
+            },
+        )),
+        None => Ok((
+            RefName::new("HEAD").expect("HEAD is a valid ref name"),
+            primary_oid.clone(),
+            crate::lifecycle::MergeTargetProvenance::Primary,
+        )),
     }
 }
 
@@ -1754,7 +1770,13 @@ mod tests {
         run_git(&repo, ["add", "tracked"]);
         run_git(&repo, ["commit", "-m", "initial"]);
         let primary = ObjectId::new("0123456789012345678901234567890123456789").unwrap();
-        let error = safety_target(&repo, Some("refs/heads/does-not-exist"), &primary).unwrap_err();
+        let error = safety_target(
+            &repo,
+            "feature",
+            Some("refs/heads/does-not-exist"),
+            &primary,
+        )
+        .unwrap_err();
         assert_eq!(error.code, "git_facts");
     }
 
@@ -2011,6 +2033,7 @@ mod tests {
             fingerprint: a,
             link_target: None,
             sensitive: false,
+            mode_policy: crate::planner::FileModePolicy::PreserveSafe,
             confirm: false,
             conflict: false,
             overlap: false,
