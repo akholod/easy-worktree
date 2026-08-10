@@ -988,7 +988,10 @@ mod tests {
 
         let (temp, plan, destination, staging) = copy_fixture();
         let root = temp.path();
-        let source = root.join("artifact");
+        let source = match artifact_step(&plan).action() {
+            StepAction::CopyFileV3 { source, .. } => source.clone().into_path(),
+            _ => unreachable!(),
+        };
         let before = fs::read(root.join("tracked")).unwrap();
         let guard = infrastructure::arm_observation_fifo_swap(&source);
         let outcome = ExecutionEngine::new(ProductionBackend::new(root.to_owned()))
@@ -1525,7 +1528,11 @@ mod tests {
                 "{outcome:?}"
             );
             assert_eq!(infrastructure::artifact_fault_invocation_count(point), 1);
-            assert_eq!(fs::read_link(artifact_destination(&plan)).unwrap(), source);
+            let desired_target = match artifact_step(&plan).action() {
+                StepAction::CreateSymlinkV3 { desired, .. } => desired.target.clone().into_path(),
+                _ => unreachable!(),
+            };
+            assert_eq!(fs::read_link(artifact_destination(&plan)).unwrap(), desired_target);
             assert_eq!(
                 artifact_probe(&mut ProductionBackend::new(root.to_owned()), &plan),
                 ProbeVerdict::Applied
@@ -1582,13 +1589,17 @@ mod tests {
             vec![manifest],
         );
         let final_path = artifact_destination(&plan);
+        let desired_target = match artifact_step(&plan).action() {
+            StepAction::CreateSymlinkV3 { desired, .. } => desired.target.clone().into_path(),
+            _ => unreachable!(),
+        };
         fs::create_dir(&destination).unwrap();
         let mut backend = ProductionBackend::new(root.to_owned());
         assert_eq!(
             artifact_probe(&mut backend, &plan),
             ProbeVerdict::NotApplied
         );
-        symlink(&source, &final_path).unwrap();
+        symlink(&desired_target, &final_path).unwrap();
         assert_eq!(artifact_probe(&mut backend, &plan), ProbeVerdict::Applied);
         fs::remove_file(&final_path).unwrap();
         symlink("wrong", &final_path).unwrap();
