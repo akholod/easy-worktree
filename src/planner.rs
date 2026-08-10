@@ -798,15 +798,19 @@ fn descriptor_v3(
     }
 }
 
+struct V3PlanningContext<'a> {
+    operation_id: &'a OperationId,
+    step_id: &'a StepId,
+    checkout_oid: &'a ObjectId,
+    destination_root: &'a StoredPath,
+}
+
 fn v3_action_parts(
-    operation_id: &OperationId,
-    step_id: &StepId,
     rule: &str,
     source_root: StoredPath,
     artifact: &FileArtifact,
     manifest_digest: ObjectId,
-    checkout_oid: &ObjectId,
-    destination_root: &StoredPath,
+    context: V3PlanningContext<'_>,
 ) -> Result<
     (
         StepAction,
@@ -816,6 +820,12 @@ fn v3_action_parts(
     ),
     String,
 > {
+    let V3PlanningContext {
+        operation_id,
+        step_id,
+        checkout_oid,
+        destination_root,
+    } = context;
     match artifact.kind {
         FileArtifactKind::CopyFile => {
             let ArtifactSourceExpectationV3::Regular(source_state) = &artifact.source_expectation
@@ -925,7 +935,6 @@ fn v3_action_parts(
             else {
                 unreachable!()
             };
-            let manifest_digest = manifest_digest;
             Ok((
                 StepAction::RelinkSymlinkV3 {
                     rule: rule.into(),
@@ -1310,14 +1319,16 @@ pub fn plan_create(input: CreatePlanInput) -> Result<OperationPlan, String> {
         let manifest_digest = rule_digests[&rule].clone();
         let step_id = StepId::new(id.clone())?;
         let (action, _expected, staging, compensation) = v3_action_parts(
-            &input.operation_id,
-            &step_id,
             &rule,
             source_root.clone(),
             &artifact,
             manifest_digest.clone(),
-            &source_oid,
-            &destination,
+            V3PlanningContext {
+                operation_id: &input.operation_id,
+                step_id: &step_id,
+                checkout_oid: &source_oid,
+                destination_root: &destination,
+            },
         )?;
         let source_expectation = artifact.source_expectation.clone();
         let manifest_precondition = Precondition::ArtifactSourceAtV3 {

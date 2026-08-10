@@ -785,7 +785,7 @@ fn relink_checkout_facts(
         ));
     }
     let old_target = observe_committed_tree_symlink(
-        &facts.repository.primary_root.as_path(),
+        facts.repository.primary_root.as_path(),
         &checkout_oid,
         checkout_relative_path,
     )?;
@@ -809,7 +809,7 @@ fn observe_committed_tree_symlink(
         OsString::from("--full-tree"),
         OsString::from(commit_oid.as_str()),
         OsString::from("--"),
-        OsString::from(std::ffi::OsString::from_vec(path.to_vec())),
+        std::ffi::OsString::from_vec(path.to_vec()),
     ];
     let listing =
         git(repo, args).map_err(|error| planning("tree_subprocess", &error.to_string()))?;
