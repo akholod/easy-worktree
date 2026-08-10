@@ -1307,6 +1307,7 @@ mod tests {
                 overlap: false,
                 replace_symlink: false,
                 compensation: None,
+                relink_facts: None,
             }],
             digest: crate::planner::artifact_digest(b"fixture-manifest-placeholder"),
         }

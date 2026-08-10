@@ -1567,6 +1567,7 @@ impl OperationPlan {
                         || crate::planner::artifact_digest(
                             desired.target.as_path().as_os_str().as_encoded_bytes(),
                         ) != desired.target_digest
+                        || !valid_symlink_payload(desired)
                     {
                         return Err("invalid v3 symlink placement or target".into());
                     }
@@ -1654,6 +1655,9 @@ impl OperationPlan {
                         || crate::planner::artifact_digest(
                             desired_new.target.as_path().as_os_str().as_encoded_bytes(),
                         ) != desired_new.target_digest
+                        || !valid_symlink_payload(expected_source)
+                        || !valid_symlink_payload(expected_old)
+                        || !valid_symlink_payload(desired_new)
                     {
                         return Err("invalid v3 relink contract".into());
                     }
@@ -1706,6 +1710,8 @@ impl OperationPlan {
                     if source_guards.len() != 1
                         || tree_guards.len() != 1
                         || destination_guards.len() != 1
+                        || step.preconditions().len() != 5
+                        || step.preconditions().iter().any(|p| matches!(p, Precondition::PathAbsent(path) if path == final_path))
                         || replacement_absent != 1
                         || backup_absent != 1
                         || !matches!(source_guards[0], Precondition::ArtifactSourceAtV3 { rule: r, source_root: sr, source: s, expectation: ArtifactSourceExpectationV3::Symlink(v), manifest_digest: md } if r == rule && sr == source_root && s == source && v == desired_new && md == manifest_digest)
@@ -2156,13 +2162,22 @@ fn absolute_normalized(path: &std::path::Path) -> bool {
             )
         })
 }
-fn relative_is_safe(path: &std::path::Path) -> bool {
+pub(crate) fn relative_is_safe_for_planning(path: &std::path::Path) -> bool {
     path.components().all(|component| match component {
         std::path::Component::Normal(value) => {
             value != ".git" && value != ".ewtm" && value != "ewtm"
         }
         _ => false,
     })
+}
+fn relative_is_safe(path: &std::path::Path) -> bool {
+    relative_is_safe_for_planning(path)
+}
+fn valid_symlink_payload(value: &SymlinkStateV3) -> bool {
+    let bytes = value.target.as_path().as_os_str().as_encoded_bytes();
+    !bytes.is_empty()
+        && !bytes.contains(&0)
+        && crate::planner::artifact_digest(bytes) == value.target_digest
 }
 fn contained_strict(path: &std::path::Path, root: &std::path::Path) -> bool {
     absolute_normalized(root)

@@ -469,7 +469,8 @@ impl ManifestPlanningPort for GitCli {
                     source_root.clone(),
                     relative,
                     source,
-                    destination,
+                    destination.clone(),
+                    relink_checkout_facts(facts, &destination, &spec)?,
                 )?);
             }
             artifacts
@@ -755,19 +756,104 @@ fn manifest_digest(artifacts: &[FileArtifact], root: &Path, source_root: &Path) 
     crate::planner::canonical_manifest_digest(&contracts, root)
 }
 
+fn relink_checkout_facts(
+    facts: &CreatePlanningFacts,
+    destination: &Path,
+    spec: &ManifestRuleSpec,
+) -> Result<Option<planner::RelinkCheckoutFacts>, PlanningError> {
+    if spec.kind != crate::config::FileRuleKind::Relink {
+        return Ok(None);
+    }
+    let checkout_oid = match &facts.source_facts {
+        CreateSourceFacts::NewBranch { base_oid, .. } => base_oid,
+        CreateSourceFacts::ExistingLocal { branch_oid, .. } => branch_oid,
+        CreateSourceFacts::RemoteTracking { remote_oid, .. } => remote_oid,
+    }
+    .clone();
+    let checkout_relative_path = destination
+        .strip_prefix(facts.destination.path.as_path())
+        .map_err(|_| planning("relink_path", "relink destination is outside checkout"))?;
+    if !crate::lifecycle::relative_is_safe_for_planning(checkout_relative_path)
+        || checkout_relative_path.as_os_str().as_encoded_bytes().is_empty()
+    {
+        return Err(planning("relink_path", "relink checkout path is not normalized"));
+    }
+    let old_target = observe_committed_tree_symlink(
+        &facts.repository.primary_root.as_path(),
+        &checkout_oid,
+        checkout_relative_path,
+    )?;
+    Ok(Some(planner::RelinkCheckoutFacts {
+        checkout_oid,
+        checkout_relative_path: StoredPath::from(checkout_relative_path.to_owned()),
+        expected_old: old_target,
+    }))
+}
+
+fn observe_committed_tree_symlink(
+    repo: &Path,
+    commit_oid: &ObjectId,
+    relative: &Path,
+) -> Result<crate::lifecycle::SymlinkStateV3, PlanningError> {
+    let path = relative.as_os_str().as_encoded_bytes();
+    let args = vec![
+        OsString::from("--literal-pathspecs"),
+        OsString::from("ls-tree"),
+        OsString::from("-z"),
+        OsString::from("--full-tree"),
+        OsString::from(commit_oid.as_str()),
+        OsString::from("--"),
+        OsString::from(std::ffi::OsString::from_vec(path.to_vec())),
+    ];
+    let listing = git(repo, args).map_err(|error| planning("tree_subprocess", &error.to_string()))?;
+    let object = parse_tree_listing(&listing.stdout, path)?;
+    let blob = git(repo, ["cat-file", "blob", object.as_str()])
+        .map_err(|error| planning("tree_object", &error.to_string()))?;
+    if blob.stdout.is_empty() || blob.stdout.contains(&0) {
+        return Err(planning("tree_invalid_target", "committed symlink target is empty or contains NUL"));
+    }
+    let target = StoredPath::from(PathBuf::from(OsString::from_vec(blob.stdout)));
+    Ok(crate::lifecycle::SymlinkStateV3 { target: target.clone(), target_digest: digest_bytes(target.as_path().as_os_str().as_encoded_bytes()) })
+}
+
+fn parse_tree_listing(stdout: &[u8], expected_path: &[u8]) -> Result<ObjectId, PlanningError> {
+    if stdout.is_empty() {
+        return Err(planning("tree_missing", "committed checkout entry is missing"));
+    }
+    if !stdout.ends_with(&[0]) {
+        return Err(planning("tree_malformed", "committed tree output lacks terminal NUL"));
+    }
+    let records: Vec<_> = stdout[..stdout.len() - 1].split(|byte| *byte == 0).collect();
+    if records.len() != 1 || records[0].is_empty() {
+        return Err(planning("tree_multiple", "committed tree returned an invalid record count"));
+    }
+    let tab = records[0].iter().position(|byte| *byte == b'\t')
+        .ok_or_else(|| planning("tree_malformed", "committed tree record lacks tab separator"))?;
+    let (header, stored_path) = (&records[0][..tab], &records[0][tab + 1..]);
+    let fields: Vec<_> = header.split(|byte| *byte == b' ').collect();
+    if fields.len() != 3 || fields.iter().any(|field| field.is_empty()) {
+        return Err(planning("tree_malformed", "malformed committed tree header"));
+    }
+    if stored_path != expected_path {
+        return Err(planning("tree_malformed_path", "committed tree path differs from requested path"));
+    }
+    if fields[0] != b"120000" || fields[1] != b"blob" {
+        return Err(planning("tree_wrong_kind", "committed checkout entry is not one symlink"));
+    }
+    let object = std::str::from_utf8(fields[2])
+        .map_err(|_| planning("tree_malformed_oid", "committed tree object id is not ASCII"))?;
+    ObjectId::new(object.to_owned())
+        .map_err(|_| planning("tree_malformed_oid", "committed tree object id is invalid"))
+}
+
 fn make_artifact(
     spec: &ManifestRuleSpec,
     root: PathBuf,
     _relative: PathBuf,
     source: PathBuf,
     destination: PathBuf,
+    relink_facts: Option<planner::RelinkCheckoutFacts>,
 ) -> Result<FileArtifact, PlanningError> {
-    if spec.kind == crate::config::FileRuleKind::Relink {
-        return Err(planning(
-            "relink_v3_unavailable",
-            "relink planning is unavailable in v3",
-        ));
-    }
     let observed = readonly_observe_absolute_node(&source)
         .map_err(|error| planning("source_read", &error.to_string()))?
         .ok_or_else(|| planning("source_read", "source disappeared or is not observable"))?;
@@ -837,7 +923,31 @@ fn make_artifact(
                     source_expectation,
                 )
             }
-            crate::config::FileRuleKind::Relink => unreachable!(),
+            crate::config::FileRuleKind::Relink => {
+                let ObservedNode::Symlink { target } = observed else {
+                    return Err(planning("source_type", "relink source must be a symlink"));
+                };
+                let _facts = relink_facts.as_ref().ok_or_else(|| planning("relink_tree", "relink checkout facts are missing"))?;
+                if target.as_os_str().as_encoded_bytes().is_empty()
+                    || target.as_os_str().as_encoded_bytes().contains(&0)
+                {
+                    return Err(planning("source_type", "relink target is empty or contains NUL"));
+                }
+                let digest = digest_bytes(target.as_os_str().as_encoded_bytes());
+                let target_len = target.as_os_str().as_encoded_bytes().len() as u64;
+                let target_path = StoredPath::from(target);
+                (
+                    FileArtifactKind::RelinkSymlink,
+                    target_len,
+                    digest.clone(),
+                    digest.clone(),
+                    Some(target_path.clone()),
+                    None,
+                    crate::lifecycle::ArtifactSourceExpectationV3::Symlink(
+                        crate::lifecycle::SymlinkStateV3 { target: target_path, target_digest: digest },
+                    ),
+                )
+            }
         };
     let _ = root;
     Ok(FileArtifact {
@@ -862,6 +972,7 @@ fn make_artifact(
         overlap: false,
         replace_symlink: spec.kind == crate::config::FileRuleKind::Relink,
         compensation,
+        relink_facts,
     })
 }
 
@@ -2970,7 +3081,128 @@ mod tests {
                     vec![rule],
                 )
                 .unwrap_err();
-            assert_eq!(error.code, "relink_v3_unavailable");
+            assert!(error.code.starts_with("tree_"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relink_reads_old_target_from_exact_checkout_commit() {
+        let temp = TempDir::new().unwrap();
+        run_git(temp.path(), ["init"]);
+        std::fs::write(temp.path().join("payload"), b"payload").unwrap();
+        std::os::unix::fs::symlink("old\n", temp.path().join("link")).unwrap();
+        run_git(temp.path(), ["add", "."]);
+        run_git(temp.path(), ["commit", "-m", "old"]);
+        let checkout_oid = git_oid(temp.path(), "HEAD").unwrap();
+        std::fs::remove_file(temp.path().join("link")).unwrap();
+        std::os::unix::fs::symlink("new\n", temp.path().join("link")).unwrap();
+        run_git(temp.path(), ["add", "."]);
+        run_git(temp.path(), ["commit", "-m", "moved-head"]);
+        std::os::unix::fs::symlink("new\n", temp.path().join("source-link")).unwrap();
+
+        let destination = temp.path().join("future");
+        let mut facts = manifest_facts(temp.path(), &destination);
+        facts.repository.repository_oid = checkout_oid.clone();
+        if let CreateSourceFacts::NewBranch { base_oid, .. } = &mut facts.source_facts {
+            *base_oid = checkout_oid.clone();
+        }
+        let request = crate::application::CreatePlanRequest {
+            repo: temp.path().to_owned(),
+            invocation_cwd: temp.path().to_owned(),
+            source: crate::application::CreateSourceRequest::New {
+                branch: "feature".into(),
+                base: Some("HEAD".into()),
+            },
+            custom_path: None,
+            selected_tasks: BTreeSet::new(),
+            skipped_rules: BTreeSet::new(),
+            granted_consents: BTreeSet::new(),
+        };
+        let manifests = GitCli
+            .plan_manifests(
+                &request,
+                &facts,
+                vec![manifest_rule(
+                    "schema = 1\n[file_rules.link]\nkind = \"relink\"\nsource = \"source-link\"\ndestination = \"link\"\non_conflict = \"replace_symlink_only\"\n",
+                    "link",
+                )],
+            )
+            .unwrap();
+        let artifact = &manifests[0].artifacts[0];
+        let crate::lifecycle::ArtifactSourceExpectationV3::Symlink(desired) = &artifact.source_expectation else { panic!("missing persisted desired state") };
+        let checkout = artifact.relink_facts.as_ref().unwrap();
+        assert_eq!(checkout.checkout_oid, checkout_oid);
+        assert_eq!(checkout.checkout_relative_path.as_path(), Path::new("link"));
+        assert_eq!(checkout.expected_old.target.as_path(), Path::new("old\n"));
+        assert_eq!(desired.target.as_path(), Path::new("new\n"));
+
+        let intent = crate::lifecycle::CreateIntent {
+            repository: facts.repository.clone(),
+            source: facts.source.clone(),
+            destination: Some(facts.destination.path.clone()),
+            selected_tasks: BTreeSet::new(),
+            skipped_rules: BTreeSet::new(),
+            granted_consents: BTreeSet::new(),
+            task_contracts: std::collections::BTreeMap::new(),
+            current_worktree_root: None,
+            artifact_rule_contracts: std::collections::BTreeMap::new(),
+        };
+        let plan = planner::plan_create(planner::CreatePlanInput {
+            operation_id: planner::new_operation_id(),
+            repository: facts.repository.clone(),
+            intent,
+            bare: facts.bare,
+            primary_count: facts.primary_count,
+            invocation_cwd: StoredPath::from(facts.invocation_cwd.clone()),
+            primary_root: facts.primary_root.clone(),
+            current_worktree_root: facts.current_worktree_root.clone(),
+            destination: facts.destination.clone(),
+            source_facts: facts.source_facts.clone(),
+            branch_checked_out: facts.branch_checked_out,
+            branch_collision: facts.branch_collision,
+            known_rules: ["link".to_owned()].into_iter().collect(),
+            enabled_rules: ["link".to_owned()].into_iter().collect(),
+            known_tasks: BTreeSet::new(),
+            manifests,
+            tasks: Vec::new(),
+        })
+        .unwrap();
+        plan.validate_executable_plan().unwrap();
+        let wire = serde_json::to_value(&plan).unwrap();
+        let wire_text = wire.to_string();
+        assert!(!wire_text.contains("relink_internal"));
+        let restored: crate::lifecycle::OperationPlan = serde_json::from_value(wire).unwrap();
+        restored.validate_executable_plan().unwrap();
+        let step = &plan.steps()[1];
+        assert!(matches!(step.action(), crate::lifecycle::StepAction::RelinkSymlinkV3 { .. }));
+        assert_eq!(step.preconditions().len(), 5);
+        assert_eq!(step.preconditions().iter().filter(|guard| matches!(guard, crate::lifecycle::Precondition::PathAbsent(_))).count(), 2);
+        assert!(matches!(step.compensation(), Some(crate::lifecycle::Compensation::RestoreReplacedSymlinkV3(_))));
+    }
+
+    #[test]
+    fn tree_listing_parser_closes_framing_header_kind_and_raw_path() {
+        let oid = "0123456789012345678901234567890123456789";
+        let valid = |path: &[u8]| {
+            let mut value = format!("120000 blob {oid}").into_bytes();
+            value.push(b'\t');
+            value.extend_from_slice(path);
+            value.push(0);
+            value
+        };
+        assert_eq!(parse_tree_listing(b"", b"x").unwrap_err().code, "tree_missing");
+        assert_eq!(parse_tree_listing(&valid(b"x")[..valid(b"x").len() - 1], b"x").unwrap_err().code, "tree_malformed");
+        assert_eq!(parse_tree_listing(b"a\0b\0", b"a").unwrap_err().code, "tree_multiple");
+        assert_eq!(parse_tree_listing(b"120000 blob\tx\0", b"x").unwrap_err().code, "tree_malformed");
+        assert_eq!(parse_tree_listing(b"120000 blob nope\tx\0", b"x").unwrap_err().code, "tree_malformed_oid");
+        assert_eq!(parse_tree_listing(b"100644 blob 0123456789012345678901234567890123456789\tx\0", b"x").unwrap_err().code, "tree_wrong_kind");
+        assert_eq!(parse_tree_listing(b"120000 tree 0123456789012345678901234567890123456789\tx\0", b"x").unwrap_err().code, "tree_wrong_kind");
+        assert_eq!(parse_tree_listing(b"120000 blob 0123456789012345678901234567890123456789\tx\0", b"y").unwrap_err().code, "tree_malformed_path");
+        assert_eq!(parse_tree_listing(&valid(b"a\tb"), b"a\tb").unwrap().as_str(), oid);
+        #[cfg(unix)] {
+            let raw = b"raw-\xff";
+            assert_eq!(parse_tree_listing(&valid(raw), raw).unwrap().as_str(), oid);
         }
     }
 
@@ -3108,6 +3340,7 @@ mod tests {
             overlap: false,
             replace_symlink: false,
             compensation: None,
+            relink_facts: None,
         };
         let mut changed = artifact.clone();
         changed.destination = StoredPath::from(temp.path().join("future/b"));
@@ -3288,7 +3521,7 @@ mod tests {
                     vec![relink],
                 )
                 .unwrap_err();
-            assert_eq!(error.code, "relink_v3_unavailable");
+            assert!(error.code.starts_with("tree_"));
         }
     }
 
