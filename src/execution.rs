@@ -93,11 +93,18 @@ pub trait ExecutionBackend {
     fn discover_repository(&mut self) -> Result<Self::Repository, Self::Error>;
     fn repository_common_dir<'a>(&self, repository: &'a Self::Repository) -> &'a Path;
     fn repository_matches_plan(&self, repository: &Self::Repository, plan: &OperationPlan) -> bool;
-    fn supports_precondition(&self, precondition: &Precondition) -> bool;
+    fn supports_precondition(
+        &self,
+        plan: &OperationPlan,
+        step: Option<&PlanStep>,
+        precondition: &Precondition,
+    ) -> bool;
     fn supports_action(&self, action: &StepAction) -> bool;
     fn probe_capability(&self, step: &PlanStep) -> ProbeCapability;
     fn check_precondition(
         &mut self,
+        plan: &OperationPlan,
+        step: Option<&PlanStep>,
         precondition: &Precondition,
     ) -> Result<ConditionResult, Self::Error>;
     fn invoke(&mut self, step: &PlanStep) -> Result<(), Self::Error>;
@@ -166,7 +173,7 @@ impl<B: ExecutionBackend> ExecutionEngine<B> {
         let mut journal = Journal::new(plan.clone());
         store.write_new(&journal)?;
         for step in plan.steps() {
-            if let Some(condition) = self.check_all(step.preconditions())? {
+            if let Some(condition) = self.check_all(&plan, Some(step), step.preconditions())? {
                 return Ok(ExecutionOutcome::Paused {
                     operation_id: *plan.operation_id(),
                     step_id: step.id().clone(),
@@ -220,18 +227,18 @@ impl<B: ExecutionBackend> ExecutionEngine<B> {
 
     fn scan_support(&self, plan: &OperationPlan) -> Result<(), ExecutionError<B::Error>> {
         for condition in plan.preconditions() {
-            if !self.backend.supports_precondition(condition) {
+            if !self.backend.supports_precondition(plan, None, condition) {
                 return Err(ExecutionError::UnsupportedPlan(
                     "unsupported plan precondition".into(),
                 ));
             }
         }
         for step in plan.steps() {
-            if step
-                .preconditions()
-                .iter()
-                .any(|condition| !self.backend.supports_precondition(condition))
-            {
+            if step.preconditions().iter().any(|condition| {
+                !self
+                    .backend
+                    .supports_precondition(plan, Some(step), condition)
+            }) {
                 return Err(ExecutionError::UnsupportedPlan(
                     "unsupported step precondition".into(),
                 ));
@@ -253,12 +260,14 @@ impl<B: ExecutionBackend> ExecutionEngine<B> {
     }
     fn check_all(
         &mut self,
+        plan: &OperationPlan,
+        step: Option<&PlanStep>,
         conditions: &[Precondition],
     ) -> Result<Option<Precondition>, ExecutionError<B::Error>> {
         for condition in conditions {
             match self
                 .backend
-                .check_precondition(condition)
+                .check_precondition(plan, step, condition)
                 .map_err(ExecutionError::Backend)?
             {
                 ConditionResult::Satisfied => {}
@@ -271,11 +280,11 @@ impl<B: ExecutionBackend> ExecutionEngine<B> {
         &mut self,
         plan: &OperationPlan,
     ) -> Result<Option<Precondition>, ExecutionError<B::Error>> {
-        if let Some(condition) = self.check_all(plan.preconditions())? {
+        if let Some(condition) = self.check_all(plan, None, plan.preconditions())? {
             return Ok(Some(condition));
         }
         for step in plan.steps() {
-            if let Some(condition) = self.check_all(step.preconditions())? {
+            if let Some(condition) = self.check_all(plan, Some(step), step.preconditions())? {
                 return Ok(Some(condition));
             }
         }
@@ -466,7 +475,12 @@ mod tests {
         ) -> bool {
             repository == plan.repository()
         }
-        fn supports_precondition(&self, _condition: &Precondition) -> bool {
+        fn supports_precondition(
+            &self,
+            _plan: &OperationPlan,
+            _step: Option<&PlanStep>,
+            _condition: &Precondition,
+        ) -> bool {
             self.supports
         }
         fn supports_action(&self, _action: &StepAction) -> bool {
@@ -485,6 +499,8 @@ mod tests {
         }
         fn check_precondition(
             &mut self,
+            _plan: &OperationPlan,
+            _step: Option<&PlanStep>,
             _condition: &Precondition,
         ) -> Result<ConditionResult, Self::Error> {
             self.checks += 1;

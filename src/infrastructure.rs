@@ -115,7 +115,12 @@ impl RepositoryPort for GitCli {
                 }
                 if !bare {
                     match git(&record.path, ["status", "--porcelain=v2", "--branch", "-z"]) {
-                        Ok(output) => apply_status(&mut item, &output.stdout)?,
+                        Ok(output) => {
+                            apply_status(&mut item, &output.stdout)?;
+                            if let Some(branch) = item.branch.as_deref() {
+                                item.upstream = readonly_branch_upstream(&record.path, branch)?;
+                            }
+                        }
                         Err(error) => {
                             item.status = CheckoutStatus::Unknown;
                             warnings.push(warning(
@@ -1093,8 +1098,10 @@ fn ongoing_git_operation(path: &Path) -> Result<bool, PlanningError> {
         } else {
             path.join(state_path)
         };
-        if std::fs::symlink_metadata(state_path).is_ok() {
-            return Ok(true);
+        match std::fs::symlink_metadata(state_path) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(planning("ongoing_probe", &error.to_string())),
         }
     }
     Ok(false)
@@ -1584,6 +1591,405 @@ fn os_string(value: &[u8]) -> std::ffi::OsString {
 
 struct Output {
     stdout: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ObservedNode {
+    Regular { bytes: Vec<u8>, mode: u32 },
+    Directory,
+    Symlink { target: PathBuf },
+}
+
+#[cfg(unix)]
+pub(crate) fn readonly_observe_node(
+    trusted_root: &Path,
+    path: &Path,
+) -> Result<Option<ObservedNode>, GitError> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, open, openat, readlinkat, statat};
+    use std::{fs::File, io::Read};
+
+    let planned_root = planner::normalize_lexical(trusted_root.to_owned());
+    let path = planner::normalize_lexical(path.to_owned());
+    let relative = path
+        .strip_prefix(&planned_root)
+        .map_err(|_| GitError::Parse("path is outside trusted root".into()))?;
+    let trusted_root = planned_root
+        .canonicalize()
+        .map_err(|error| GitError::Discovery(error.to_string()))?;
+    let mut dirfd = open(
+        &trusted_root,
+        OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| GitError::Command(error.to_string()))?;
+    let components: Vec<_> = relative.components().collect();
+    if components.is_empty() {
+        return Ok(Some(ObservedNode::Directory));
+    }
+    for component in components.iter().take(components.len() - 1) {
+        let std::path::Component::Normal(name) = component else {
+            return Ok(None);
+        };
+        dirfd = match openat(
+            &dirfd,
+            *name,
+            OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(value) => value,
+            Err(error) if observation_mismatch(error) => return Ok(None),
+            Err(error) => return Err(GitError::Command(error.to_string())),
+        };
+    }
+    let std::path::Component::Normal(name) = components[components.len() - 1] else {
+        return Ok(None);
+    };
+    let stat = match statat(&dirfd, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(value) => value,
+        Err(error) if observation_mismatch(error) => return Ok(None),
+        Err(error) => return Err(GitError::Command(error.to_string())),
+    };
+    let file_type = FileType::from_raw_mode(stat.st_mode);
+    if file_type.is_symlink() {
+        let target = match readlinkat(&dirfd, name, Vec::new()) {
+            Ok(value) => value.into_bytes(),
+            Err(error) if observation_mismatch(error) => return Ok(None),
+            Err(error) => return Err(GitError::Command(error.to_string())),
+        };
+        return Ok(Some(ObservedNode::Symlink {
+            target: PathBuf::from(std::ffi::OsString::from_vec(target)),
+        }));
+    }
+    if file_type.is_dir() {
+        return Ok(Some(ObservedNode::Directory));
+    }
+    if !file_type.is_file() {
+        return Ok(None);
+    }
+    let final_fd = match openat(
+        &dirfd,
+        name,
+        OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(value) => value,
+        Err(error) if observation_mismatch(error) => return Ok(None),
+        Err(error) => return Err(GitError::Command(error.to_string())),
+    };
+    let final_stat = fstat(&final_fd).map_err(|error| GitError::Command(error.to_string()))?;
+    if !FileType::from_raw_mode(final_stat.st_mode).is_file() {
+        return Ok(None);
+    }
+    let mut file = File::from(final_fd);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| GitError::Command(error.to_string()))?;
+    Ok(Some(ObservedNode::Regular {
+        bytes,
+        mode: final_stat.st_mode & 0o7777,
+    }))
+}
+
+#[cfg(unix)]
+fn observation_mismatch(error: rustix::io::Errno) -> bool {
+    matches!(
+        error,
+        rustix::io::Errno::NOENT | rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR
+    )
+}
+
+#[cfg(not(unix))]
+pub(crate) fn readonly_observe_node(
+    _trusted_root: &Path,
+    _path: &Path,
+) -> Result<Option<ObservedNode>, GitError> {
+    Err(GitError::Parse(
+        "descriptor-relative observations unsupported on this platform".into(),
+    ))
+}
+
+/// The small read-only surface used by the execution backend.  Keeping the
+/// command runner here ensures execution never gets access to mutation
+/// plumbing.
+pub(crate) fn readonly_ref_oid(
+    cwd: &Path,
+    reference: &str,
+) -> Result<Option<crate::lifecycle::ObjectId>, GitError> {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &format!("{reference}^{{commit}}"),
+        ])
+        .output()
+        .map_err(|e| GitError::Command(e.to_string()))?;
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        return Err(GitError::Command(
+            String::from_utf8_lossy(&output.stderr).trim().into(),
+        ));
+    }
+    let value = parse_line(&output.stdout)?;
+    crate::lifecycle::ObjectId::new(value.trim().to_owned())
+        .map(Some)
+        .map_err(GitError::Parse)
+}
+
+pub(crate) fn readonly_ancestor(
+    cwd: &Path,
+    ancestor: &crate::lifecycle::ObjectId,
+    descendant: &crate::lifecycle::ObjectId,
+) -> Result<bool, GitError> {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            ancestor.as_str(),
+            descendant.as_str(),
+        ])
+        .output()
+        .map_err(|e| GitError::Command(e.to_string()))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(GitError::Command(
+            String::from_utf8_lossy(&output.stderr).trim().into(),
+        )),
+    }
+}
+
+pub(crate) fn readonly_branch_upstream(
+    cwd: &Path,
+    branch: &str,
+) -> Result<Option<String>, GitError> {
+    let output = git(
+        cwd,
+        [
+            "for-each-ref",
+            "--format=%(upstream)",
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
+    let value = parse_line(&output.stdout)?;
+    Ok((!value.is_empty()).then(|| value.to_owned()))
+}
+
+pub(crate) fn readonly_remote_ref(
+    cwd: &Path,
+    remote: &str,
+    branch: &str,
+) -> Result<Option<crate::lifecycle::ObjectId>, GitError> {
+    readonly_validate_remote(cwd, remote)?;
+    let reference = format!("refs/heads/{branch}");
+    let output = git(cwd, ["ls-remote", "--refs", remote, &reference])?;
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| GitError::Parse("non-UTF-8 remote ref".into()))?;
+    let lines: Vec<_> = text.lines().filter(|line| !line.is_empty()).collect();
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    if lines.len() != 1 {
+        return Err(GitError::Parse("duplicate remote ref".into()));
+    }
+    let (oid, name) = lines[0]
+        .split_once('\t')
+        .ok_or_else(|| GitError::Parse("malformed remote ref".into()))?;
+    if name != reference {
+        return Err(GitError::Parse("mismatched remote ref".into()));
+    }
+    crate::lifecycle::ObjectId::new(oid.to_owned())
+        .map(Some)
+        .map_err(GitError::Parse)
+}
+
+pub(crate) fn readonly_remote_default(cwd: &Path, remote: &str) -> Result<String, GitError> {
+    readonly_validate_remote(cwd, remote)?;
+    let output = git(cwd, ["ls-remote", "--symref", remote, "HEAD"])?;
+    let mut found = None;
+    for line in String::from_utf8(output.stdout)
+        .map_err(|_| GitError::Parse("non-UTF-8 remote HEAD".into()))?
+        .lines()
+    {
+        if let Some(value) = line.strip_prefix("ref: ") {
+            let (reference, name) = value
+                .split_once('\t')
+                .ok_or_else(|| GitError::Parse("malformed remote HEAD".into()))?;
+            if name != "HEAD" {
+                return Err(GitError::Parse("malformed remote HEAD".into()));
+            }
+            if found.replace(reference.to_owned()).is_some() {
+                return Err(GitError::Parse("duplicate remote HEAD".into()));
+            }
+        }
+    }
+    found.ok_or_else(|| GitError::Parse("remote HEAD has no symbolic reference".into()))
+}
+
+fn readonly_validate_remote(cwd: &Path, remote: &str) -> Result<(), GitError> {
+    if remote.is_empty()
+        || remote.starts_with('-')
+        || remote.contains("://")
+        || !remote
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        || remote.starts_with('.')
+        || remote.ends_with('.')
+    {
+        return Err(GitError::Parse("invalid remote identity".into()));
+    }
+    let key = format!("remote.{remote}.url");
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(["config", "--get", &key])
+        .output()
+        .map_err(|error| GitError::Command(error.to_string()))?;
+    if output.status.code() == Some(1) {
+        return Err(GitError::Parse("remote is not configured".into()));
+    }
+    if !output.status.success() {
+        return Err(GitError::Command(
+            String::from_utf8_lossy(&output.stderr).trim().into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn readonly_list(path: &Path) -> Result<ListResult, GitError> {
+    let result = GitCli.list(path)?;
+    if let Some(warning) = result
+        .warnings
+        .iter()
+        .find(|warning| warning.code != "worktree_prunable")
+    {
+        return Err(GitError::Parse(format!(
+            "incomplete repository observation: {}",
+            warning.code
+        )));
+    }
+    Ok(result)
+}
+
+pub(crate) fn readonly_safe_directory(path: &Path) -> Result<bool, GitError> {
+    Ok(matches!(
+        readonly_observe_absolute_node(path)?,
+        Some(ObservedNode::Directory)
+    ))
+}
+
+pub(crate) fn readonly_safe_parent_of(path: &Path) -> Result<bool, GitError> {
+    let normalized = planner::normalize_lexical(path.to_owned());
+    let parent = normalized
+        .parent()
+        .ok_or_else(|| GitError::Parse("path has no parent".into()))?;
+    readonly_safe_directory(parent)
+}
+
+pub(crate) fn readonly_observe_absolute_node(
+    path: &Path,
+) -> Result<Option<ObservedNode>, GitError> {
+    let path = planner::normalize_lexical(path.to_owned());
+    if !path.is_absolute() {
+        return Err(GitError::Parse(
+            "absolute observation requires an absolute path".into(),
+        ));
+    }
+    let root = platform_alias_root(&path);
+    readonly_observe_node(&root, &path)
+}
+
+#[cfg(unix)]
+pub(crate) fn readonly_final_absent(path: &Path) -> Result<bool, GitError> {
+    use rustix::fs::{AtFlags, Mode, OFlags, open, openat, statat};
+
+    let path = planner::normalize_lexical(path.to_owned());
+    if !path.is_absolute() {
+        return Err(GitError::Parse(
+            "absolute observation requires an absolute path".into(),
+        ));
+    }
+    let planned_root = platform_alias_root(&path);
+    let relative = path
+        .strip_prefix(&planned_root)
+        .map_err(|_| GitError::Parse("path is outside trusted root".into()))?;
+    let components: Vec<_> = relative.components().collect();
+    let Some(std::path::Component::Normal(final_name)) = components.last() else {
+        return Ok(false);
+    };
+    let final_name = *final_name;
+    let canonical_root = planned_root
+        .canonicalize()
+        .map_err(|error| GitError::Discovery(error.to_string()))?;
+    let mut parent = open(
+        &canonical_root,
+        OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| GitError::Command(error.to_string()))?;
+    for component in components.iter().take(components.len() - 1) {
+        let std::path::Component::Normal(name) = component else {
+            return Ok(false);
+        };
+        parent = match openat(
+            &parent,
+            *name,
+            OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(value) => value,
+            Err(error) if observation_mismatch(error) => return Ok(false),
+            Err(error) => return Err(GitError::Command(error.to_string())),
+        };
+    }
+    match statat(&parent, final_name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => Ok(false),
+        Err(error) if error == rustix::io::Errno::NOENT => Ok(true),
+        Err(error) if observation_mismatch(error) => Ok(false),
+        Err(error) => Err(GitError::Command(error.to_string())),
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn readonly_final_absent(_path: &Path) -> Result<bool, GitError> {
+    Err(GitError::Parse(
+        "descriptor-relative observations unsupported on this platform".into(),
+    ))
+}
+
+fn platform_alias_root(path: &Path) -> PathBuf {
+    let Some(first) = path.components().find_map(|component| match component {
+        std::path::Component::Normal(name) => Some(name),
+        _ => None,
+    }) else {
+        return PathBuf::from("/");
+    };
+    let prefix = Path::new("/").join(first);
+    #[cfg(unix)]
+    if let Ok(metadata) = std::fs::symlink_metadata(&prefix)
+        && metadata.file_type().is_symlink()
+        && let Ok(target) = prefix.canonicalize()
+        && target.is_dir()
+    {
+        return prefix;
+    }
+    PathBuf::from("/")
+}
+
+pub(crate) fn readonly_same_path(left: &Path, right: &Path) -> bool {
+    same_path(left, right)
+}
+
+pub(crate) fn readonly_normalize(path: PathBuf) -> PathBuf {
+    planner::normalize_lexical(path)
+}
+
+pub(crate) fn readonly_ongoing(path: &Path) -> Result<bool, GitError> {
+    ongoing_git_operation(path).map_err(|error| GitError::Command(error.message))
 }
 
 fn git<I, A>(cwd: &Path, args: I) -> Result<Output, GitError>

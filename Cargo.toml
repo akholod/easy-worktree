@@ -18,5 +18,8 @@ thiserror = "2.0.17"
 toml = "0.9.8"
 unicode-normalization = "0.1.25"
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
 [dev-dependencies]
 tempfile = "3"

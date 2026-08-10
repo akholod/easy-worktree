@@ -9,6 +9,7 @@ pub mod journal_store;
 pub mod lifecycle;
 mod output;
 pub mod planner;
+pub mod production_backend;
 mod system;
 mod tui;
 mod worktreerc;

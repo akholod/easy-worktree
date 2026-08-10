@@ -446,6 +446,7 @@ dependencies = [
  "fs4",
  "globset",
  "ratatui",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
