@@ -1684,10 +1684,11 @@ pub(crate) fn readonly_observe_node(
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|error| GitError::Command(error.to_string()))?;
-    Ok(Some(ObservedNode::Regular {
-        bytes,
-        mode: final_stat.st_mode & 0o7777,
-    }))
+    #[cfg(target_os = "macos")]
+    let mode = u32::from(final_stat.st_mode & 0o7777);
+    #[cfg(not(target_os = "macos"))]
+    let mode = final_stat.st_mode & 0o7777;
+    Ok(Some(ObservedNode::Regular { bytes, mode }))
 }
 
 #[cfg(unix)]
