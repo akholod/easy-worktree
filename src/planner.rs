@@ -749,9 +749,19 @@ fn descriptor_v3(
                 ArtifactSourceExpectationV3::Symlink(value) => value.clone(),
                 _ => return Err("relink checkout facts are missing".into()),
             };
-            let checkout = artifact.relink_facts.as_ref().ok_or_else(|| "relink checkout facts are missing".to_owned())?;
+            let checkout = artifact
+                .relink_facts
+                .as_ref()
+                .ok_or_else(|| "relink checkout facts are missing".to_owned())?;
             let expected_old = checkout.expected_old.clone();
-            let checkout_relative_path = StoredPath::from(artifact.destination.as_path().strip_prefix(destination_root.as_path()).map_err(|_| "relink destination is outside checkout")?.to_owned());
+            let checkout_relative_path = StoredPath::from(
+                artifact
+                    .destination
+                    .as_path()
+                    .strip_prefix(destination_root.as_path())
+                    .map_err(|_| "relink destination is outside checkout")?
+                    .to_owned(),
+            );
             if expected_old == desired {
                 return Err("relink old and desired targets are identical".into());
             }
@@ -769,8 +779,18 @@ fn descriptor_v3(
                 destination: artifact.destination.clone(),
                 expected_old: expected_old.clone(),
                 desired_new: desired,
-                replacement_staging: artifact_staging_v3(operation_id, step_id, ArtifactStagingRoleV3::RelinkReplacement, artifact.destination.as_path())?,
-                backup_staging: artifact_staging_v3(operation_id, step_id, ArtifactStagingRoleV3::RelinkBackup, artifact.destination.as_path())?,
+                replacement_staging: artifact_staging_v3(
+                    operation_id,
+                    step_id,
+                    ArtifactStagingRoleV3::RelinkReplacement,
+                    artifact.destination.as_path(),
+                )?,
+                backup_staging: artifact_staging_v3(
+                    operation_id,
+                    step_id,
+                    ArtifactStagingRoleV3::RelinkBackup,
+                    artifact.destination.as_path(),
+                )?,
                 sensitive: artifact.sensitive,
                 confirm: artifact.confirm,
             })
@@ -880,7 +900,14 @@ fn v3_action_parts(
             ))
         }
         FileArtifactKind::RelinkSymlink => {
-            let descriptor = descriptor_v3(operation_id, step_id, &source_root, artifact, checkout_oid, destination_root)?;
+            let descriptor = descriptor_v3(
+                operation_id,
+                step_id,
+                &source_root,
+                artifact,
+                checkout_oid,
+                destination_root,
+            )?;
             let ManifestDescriptorV3::RelinkSymlinkV3 {
                 source_root,
                 source,
@@ -894,13 +921,37 @@ fn v3_action_parts(
                 backup_staging,
                 sensitive,
                 confirm,
-            } = descriptor else { unreachable!() };
+            } = descriptor
+            else {
+                unreachable!()
+            };
             let manifest_digest = manifest_digest;
             Ok((
-                StepAction::RelinkSymlinkV3 { rule: rule.into(), source_root, source, expected_source, checkout_oid, checkout_relative_path, destination, expected_old: expected_old.clone(), desired_new: desired_new.clone(), replacement_staging: replacement_staging.clone(), backup_staging: backup_staging.clone(), manifest_digest, sensitive, confirm },
+                StepAction::RelinkSymlinkV3 {
+                    rule: rule.into(),
+                    source_root,
+                    source,
+                    expected_source,
+                    checkout_oid,
+                    checkout_relative_path,
+                    destination,
+                    expected_old: expected_old.clone(),
+                    desired_new: desired_new.clone(),
+                    replacement_staging: replacement_staging.clone(),
+                    backup_staging: backup_staging.clone(),
+                    manifest_digest,
+                    sensitive,
+                    confirm,
+                },
                 ArtifactStateV3::Symlink(expected_old.clone()),
                 Some(replacement_staging.clone()),
-                Compensation::RestoreReplacedSymlinkV3(ReplacedSymlinkV3 { path: artifact.destination.clone(), expected_current: desired_new, restore: expected_old, replacement_staging, backup_staging }),
+                Compensation::RestoreReplacedSymlinkV3(ReplacedSymlinkV3 {
+                    path: artifact.destination.clone(),
+                    expected_current: desired_new,
+                    restore: expected_old,
+                    replacement_staging,
+                    backup_staging,
+                }),
             ))
         }
     }
@@ -1290,7 +1341,10 @@ pub fn plan_create(input: CreatePlanInput) -> Result<OperationPlan, String> {
                 destination,
                 expected_old,
                 ..
-            } = &action else { return Err("relink action construction failed".into()); };
+            } = &action
+            else {
+                return Err("relink action construction failed".into());
+            };
             artifact_preconditions.push(Precondition::TreeSymlinkAtV3 {
                 commit_oid: checkout_oid.clone(),
                 checkout_relative_path: checkout_relative_path.clone(),
@@ -1783,18 +1837,20 @@ mod tests {
                 replace_symlink,
                 compensation: if matches!(kind, FileArtifactKind::RelinkSymlink) {
                     None
-                } else { Some(if replace_symlink {
-                    Compensation::RestoreReplacedSymlink(ReplacedSymlink {
-                        path: destination,
-                        expected_current: digest.clone(),
-                        original_target: target,
-                    })
                 } else {
-                    Compensation::RemoveCreatedArtifact(CreatedArtifact {
-                        path: destination,
-                        fingerprint: digest,
+                    Some(if replace_symlink {
+                        Compensation::RestoreReplacedSymlink(ReplacedSymlink {
+                            path: destination,
+                            expected_current: digest.clone(),
+                            original_target: target,
+                        })
+                    } else {
+                        Compensation::RemoveCreatedArtifact(CreatedArtifact {
+                            path: destination,
+                            fingerprint: digest,
+                        })
                     })
-                }) },
+                },
                 relink_facts: if matches!(kind, FileArtifactKind::RelinkSymlink) {
                     Some(RelinkCheckoutFacts {
                         checkout_oid: oid(),
@@ -2949,11 +3005,15 @@ mod tests {
                 );
                 let mut noop = executable_artifact_input(kind, sensitive, replace, task, required);
                 let artifact = &mut noop.manifests[0].artifacts[0];
-                artifact.relink_facts.as_mut().unwrap().expected_old = match &artifact.source_expectation {
-                    ArtifactSourceExpectationV3::Symlink(value) => value.clone(),
-                    _ => unreachable!(),
-                };
-                assert_eq!(plan_create(noop).unwrap_err(), "relink old and desired targets are identical");
+                artifact.relink_facts.as_mut().unwrap().expected_old =
+                    match &artifact.source_expectation {
+                        ArtifactSourceExpectationV3::Symlink(value) => value.clone(),
+                        _ => unreachable!(),
+                    };
+                assert_eq!(
+                    plan_create(noop).unwrap_err(),
+                    "relink old and desired targets are identical"
+                );
                 continue;
             }
             let plan = plan_create(executable_artifact_input(

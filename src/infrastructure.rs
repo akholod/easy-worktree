@@ -774,9 +774,15 @@ fn relink_checkout_facts(
         .strip_prefix(facts.destination.path.as_path())
         .map_err(|_| planning("relink_path", "relink destination is outside checkout"))?;
     if !crate::lifecycle::relative_is_safe_for_planning(checkout_relative_path)
-        || checkout_relative_path.as_os_str().as_encoded_bytes().is_empty()
+        || checkout_relative_path
+            .as_os_str()
+            .as_encoded_bytes()
+            .is_empty()
     {
-        return Err(planning("relink_path", "relink checkout path is not normalized"));
+        return Err(planning(
+            "relink_path",
+            "relink checkout path is not normalized",
+        ));
     }
     let old_target = observe_committed_tree_symlink(
         &facts.repository.primary_root.as_path(),
@@ -805,43 +811,81 @@ fn observe_committed_tree_symlink(
         OsString::from("--"),
         OsString::from(std::ffi::OsString::from_vec(path.to_vec())),
     ];
-    let listing = git(repo, args).map_err(|error| planning("tree_subprocess", &error.to_string()))?;
+    let listing =
+        git(repo, args).map_err(|error| planning("tree_subprocess", &error.to_string()))?;
     let object = parse_tree_listing(&listing.stdout, path)?;
     let blob = git(repo, ["cat-file", "blob", object.as_str()])
         .map_err(|error| planning("tree_object", &error.to_string()))?;
     if blob.stdout.is_empty() || blob.stdout.contains(&0) {
-        return Err(planning("tree_invalid_target", "committed symlink target is empty or contains NUL"));
+        return Err(planning(
+            "tree_invalid_target",
+            "committed symlink target is empty or contains NUL",
+        ));
     }
     let target = StoredPath::from(PathBuf::from(OsString::from_vec(blob.stdout)));
-    Ok(crate::lifecycle::SymlinkStateV3 { target: target.clone(), target_digest: digest_bytes(target.as_path().as_os_str().as_encoded_bytes()) })
+    Ok(crate::lifecycle::SymlinkStateV3 {
+        target: target.clone(),
+        target_digest: digest_bytes(target.as_path().as_os_str().as_encoded_bytes()),
+    })
 }
 
 fn parse_tree_listing(stdout: &[u8], expected_path: &[u8]) -> Result<ObjectId, PlanningError> {
     if stdout.is_empty() {
-        return Err(planning("tree_missing", "committed checkout entry is missing"));
+        return Err(planning(
+            "tree_missing",
+            "committed checkout entry is missing",
+        ));
     }
     if !stdout.ends_with(&[0]) {
-        return Err(planning("tree_malformed", "committed tree output lacks terminal NUL"));
+        return Err(planning(
+            "tree_malformed",
+            "committed tree output lacks terminal NUL",
+        ));
     }
-    let records: Vec<_> = stdout[..stdout.len() - 1].split(|byte| *byte == 0).collect();
+    let records: Vec<_> = stdout[..stdout.len() - 1]
+        .split(|byte| *byte == 0)
+        .collect();
     if records.len() != 1 || records[0].is_empty() {
-        return Err(planning("tree_multiple", "committed tree returned an invalid record count"));
+        return Err(planning(
+            "tree_multiple",
+            "committed tree returned an invalid record count",
+        ));
     }
-    let tab = records[0].iter().position(|byte| *byte == b'\t')
-        .ok_or_else(|| planning("tree_malformed", "committed tree record lacks tab separator"))?;
+    let tab = records[0]
+        .iter()
+        .position(|byte| *byte == b'\t')
+        .ok_or_else(|| {
+            planning(
+                "tree_malformed",
+                "committed tree record lacks tab separator",
+            )
+        })?;
     let (header, stored_path) = (&records[0][..tab], &records[0][tab + 1..]);
     let fields: Vec<_> = header.split(|byte| *byte == b' ').collect();
     if fields.len() != 3 || fields.iter().any(|field| field.is_empty()) {
-        return Err(planning("tree_malformed", "malformed committed tree header"));
+        return Err(planning(
+            "tree_malformed",
+            "malformed committed tree header",
+        ));
     }
     if stored_path != expected_path {
-        return Err(planning("tree_malformed_path", "committed tree path differs from requested path"));
+        return Err(planning(
+            "tree_malformed_path",
+            "committed tree path differs from requested path",
+        ));
     }
     if fields[0] != b"120000" || fields[1] != b"blob" {
-        return Err(planning("tree_wrong_kind", "committed checkout entry is not one symlink"));
+        return Err(planning(
+            "tree_wrong_kind",
+            "committed checkout entry is not one symlink",
+        ));
     }
-    let object = std::str::from_utf8(fields[2])
-        .map_err(|_| planning("tree_malformed_oid", "committed tree object id is not ASCII"))?;
+    let object = std::str::from_utf8(fields[2]).map_err(|_| {
+        planning(
+            "tree_malformed_oid",
+            "committed tree object id is not ASCII",
+        )
+    })?;
     ObjectId::new(object.to_owned())
         .map_err(|_| planning("tree_malformed_oid", "committed tree object id is invalid"))
 }
@@ -927,11 +971,16 @@ fn make_artifact(
                 let ObservedNode::Symlink { target } = observed else {
                     return Err(planning("source_type", "relink source must be a symlink"));
                 };
-                let _facts = relink_facts.as_ref().ok_or_else(|| planning("relink_tree", "relink checkout facts are missing"))?;
+                let _facts = relink_facts
+                    .as_ref()
+                    .ok_or_else(|| planning("relink_tree", "relink checkout facts are missing"))?;
                 if target.as_os_str().as_encoded_bytes().is_empty()
                     || target.as_os_str().as_encoded_bytes().contains(&0)
                 {
-                    return Err(planning("source_type", "relink target is empty or contains NUL"));
+                    return Err(planning(
+                        "source_type",
+                        "relink target is empty or contains NUL",
+                    ));
                 }
                 let digest = digest_bytes(target.as_os_str().as_encoded_bytes());
                 let target_len = target.as_os_str().as_encoded_bytes().len() as u64;
@@ -944,7 +993,10 @@ fn make_artifact(
                     Some(target_path.clone()),
                     None,
                     crate::lifecycle::ArtifactSourceExpectationV3::Symlink(
-                        crate::lifecycle::SymlinkStateV3 { target: target_path, target_digest: digest },
+                        crate::lifecycle::SymlinkStateV3 {
+                            target: target_path,
+                            target_digest: digest,
+                        },
                     ),
                 )
             }
@@ -3130,7 +3182,11 @@ mod tests {
             )
             .unwrap();
         let artifact = &manifests[0].artifacts[0];
-        let crate::lifecycle::ArtifactSourceExpectationV3::Symlink(desired) = &artifact.source_expectation else { panic!("missing persisted desired state") };
+        let crate::lifecycle::ArtifactSourceExpectationV3::Symlink(desired) =
+            &artifact.source_expectation
+        else {
+            panic!("missing persisted desired state")
+        };
         let checkout = artifact.relink_facts.as_ref().unwrap();
         assert_eq!(checkout.checkout_oid, checkout_oid);
         assert_eq!(checkout.checkout_relative_path.as_path(), Path::new("link"));
@@ -3175,10 +3231,22 @@ mod tests {
         let restored: crate::lifecycle::OperationPlan = serde_json::from_value(wire).unwrap();
         restored.validate_executable_plan().unwrap();
         let step = &plan.steps()[1];
-        assert!(matches!(step.action(), crate::lifecycle::StepAction::RelinkSymlinkV3 { .. }));
+        assert!(matches!(
+            step.action(),
+            crate::lifecycle::StepAction::RelinkSymlinkV3 { .. }
+        ));
         assert_eq!(step.preconditions().len(), 5);
-        assert_eq!(step.preconditions().iter().filter(|guard| matches!(guard, crate::lifecycle::Precondition::PathAbsent(_))).count(), 2);
-        assert!(matches!(step.compensation(), Some(crate::lifecycle::Compensation::RestoreReplacedSymlinkV3(_))));
+        assert_eq!(
+            step.preconditions()
+                .iter()
+                .filter(|guard| matches!(guard, crate::lifecycle::Precondition::PathAbsent(_)))
+                .count(),
+            2
+        );
+        assert!(matches!(
+            step.compensation(),
+            Some(crate::lifecycle::Compensation::RestoreReplacedSymlinkV3(_))
+        ));
     }
 
     #[test]
@@ -3191,16 +3259,67 @@ mod tests {
             value.push(0);
             value
         };
-        assert_eq!(parse_tree_listing(b"", b"x").unwrap_err().code, "tree_missing");
-        assert_eq!(parse_tree_listing(&valid(b"x")[..valid(b"x").len() - 1], b"x").unwrap_err().code, "tree_malformed");
-        assert_eq!(parse_tree_listing(b"a\0b\0", b"a").unwrap_err().code, "tree_multiple");
-        assert_eq!(parse_tree_listing(b"120000 blob\tx\0", b"x").unwrap_err().code, "tree_malformed");
-        assert_eq!(parse_tree_listing(b"120000 blob nope\tx\0", b"x").unwrap_err().code, "tree_malformed_oid");
-        assert_eq!(parse_tree_listing(b"100644 blob 0123456789012345678901234567890123456789\tx\0", b"x").unwrap_err().code, "tree_wrong_kind");
-        assert_eq!(parse_tree_listing(b"120000 tree 0123456789012345678901234567890123456789\tx\0", b"x").unwrap_err().code, "tree_wrong_kind");
-        assert_eq!(parse_tree_listing(b"120000 blob 0123456789012345678901234567890123456789\tx\0", b"y").unwrap_err().code, "tree_malformed_path");
-        assert_eq!(parse_tree_listing(&valid(b"a\tb"), b"a\tb").unwrap().as_str(), oid);
-        #[cfg(unix)] {
+        assert_eq!(
+            parse_tree_listing(b"", b"x").unwrap_err().code,
+            "tree_missing"
+        );
+        assert_eq!(
+            parse_tree_listing(&valid(b"x")[..valid(b"x").len() - 1], b"x")
+                .unwrap_err()
+                .code,
+            "tree_malformed"
+        );
+        assert_eq!(
+            parse_tree_listing(b"a\0b\0", b"a").unwrap_err().code,
+            "tree_multiple"
+        );
+        assert_eq!(
+            parse_tree_listing(b"120000 blob\tx\0", b"x")
+                .unwrap_err()
+                .code,
+            "tree_malformed"
+        );
+        assert_eq!(
+            parse_tree_listing(b"120000 blob nope\tx\0", b"x")
+                .unwrap_err()
+                .code,
+            "tree_malformed_oid"
+        );
+        assert_eq!(
+            parse_tree_listing(
+                b"100644 blob 0123456789012345678901234567890123456789\tx\0",
+                b"x"
+            )
+            .unwrap_err()
+            .code,
+            "tree_wrong_kind"
+        );
+        assert_eq!(
+            parse_tree_listing(
+                b"120000 tree 0123456789012345678901234567890123456789\tx\0",
+                b"x"
+            )
+            .unwrap_err()
+            .code,
+            "tree_wrong_kind"
+        );
+        assert_eq!(
+            parse_tree_listing(
+                b"120000 blob 0123456789012345678901234567890123456789\tx\0",
+                b"y"
+            )
+            .unwrap_err()
+            .code,
+            "tree_malformed_path"
+        );
+        assert_eq!(
+            parse_tree_listing(&valid(b"a\tb"), b"a\tb")
+                .unwrap()
+                .as_str(),
+            oid
+        );
+        #[cfg(unix)]
+        {
             let raw = b"raw-\xff";
             assert_eq!(parse_tree_listing(&valid(raw), raw).unwrap().as_str(), oid);
         }

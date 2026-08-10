@@ -1711,7 +1711,9 @@ impl OperationPlan {
                         || tree_guards.len() != 1
                         || destination_guards.len() != 1
                         || step.preconditions().len() != 5
-                        || step.preconditions().iter().any(|p| matches!(p, Precondition::PathAbsent(path) if path == final_path))
+                        || step.preconditions().iter().any(
+                            |p| matches!(p, Precondition::PathAbsent(path) if path == final_path),
+                        )
                         || replacement_absent != 1
                         || backup_absent != 1
                         || !matches!(source_guards[0], Precondition::ArtifactSourceAtV3 { rule: r, source_root: sr, source: s, expectation: ArtifactSourceExpectationV3::Symlink(v), manifest_digest: md } if r == rule && sr == source_root && s == source && v == desired_new && md == manifest_digest)
