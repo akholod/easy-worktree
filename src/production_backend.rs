@@ -259,6 +259,9 @@ impl ProductionBackend {
                 if rule != action_rule || source != action_source || destination != action_destination || digest != action_digest || manifest_digest != action_manifest || !matches!(kind, crate::planner::FileArtifactKind::CopyFile | crate::planner::FileArtifactKind::CreateSymlink | crate::planner::FileArtifactKind::RelinkSymlink) { return Ok(false); }
                 self.artifact_source(source_root.as_path(), source.as_path(), *kind, *bytes, digest)?
             }
+            Precondition::ArtifactSourceAtV3 { .. } | Precondition::TreeSymlinkAtV3 { .. } | Precondition::SymlinkAtV3 { .. } => {
+                return Err(ProductionBackendError::UnsupportedObservation("v3 artifact observation is phase-A unsupported"));
+            }
         })
     }
 }
@@ -312,9 +315,18 @@ impl ExecutionBackend for ProductionBackend {
         &self,
         _plan: &OperationPlan,
         step: Option<&PlanStep>,
+        _phase: crate::execution::ConditionPhase,
         precondition: &Precondition,
     ) -> bool {
         if matches!(precondition, Precondition::SourceManifest { .. }) {
+            return false;
+        }
+        if matches!(
+            precondition,
+            Precondition::ArtifactSourceAtV3 { .. }
+                | Precondition::TreeSymlinkAtV3 { .. }
+                | Precondition::SymlinkAtV3 { .. }
+        ) {
             return false;
         }
         match (precondition, step.map(|value| value.action())) {
@@ -343,22 +355,33 @@ impl ExecutionBackend for ProductionBackend {
             _ => true,
         }
     }
-    fn supports_action(&self, step: &PlanStep) -> bool {
-        match step.action() {
+    fn supports_action(&self, context: &crate::execution::StepExecutionContext<'_>) -> bool {
+        match context.step().action() {
             StepAction::CreateWorktree { .. }
             | StepAction::DeleteLocalBranch { .. }
             | StepAction::DeleteRemoteBranch {
                 expected_oid: Some(_),
                 ..
             } => true,
-            StepAction::RemoveWorktree { path } => step.preconditions().iter().any(|condition| {
-                matches!(condition, Precondition::WorktreeClean { path: guarded } if guarded == path)
+            StepAction::RemoveWorktree { path } => context.step().preconditions().iter().any(|condition| {
+                matches!(condition, Precondition::WorktreeClean { path: guarded } if *guarded == *path)
             }),
             _ => false,
         }
     }
-    fn probe_capability(&self, step: &PlanStep) -> ProbeCapability {
-        if matches!(step.action(), StepAction::RunTask { .. }) {
+    fn probe_capability(
+        &self,
+        context: &crate::execution::StepExecutionContext<'_>,
+    ) -> ProbeCapability {
+        if matches!(
+            context.step().action(),
+            StepAction::CopyFileV3 { .. }
+                | StepAction::CreateSymlinkV3 { .. }
+                | StepAction::RelinkSymlinkV3 { .. }
+        ) {
+            return ProbeCapability::Unsupported;
+        }
+        if matches!(context.step().action(), StepAction::RunTask { .. }) {
             ProbeCapability::UnknownAfterCrash
         } else {
             ProbeCapability::Deterministic
@@ -368,9 +391,10 @@ impl ExecutionBackend for ProductionBackend {
         &mut self,
         plan: &OperationPlan,
         step: Option<&PlanStep>,
+        phase: crate::execution::ConditionPhase,
         precondition: &Precondition,
     ) -> Result<crate::execution::ConditionResult, Self::Error> {
-        if !self.supports_precondition(plan, step, precondition) {
+        if !self.supports_precondition(plan, step, phase, precondition) {
             return Err(ProductionBackendError::UnsupportedObservation(
                 "artifact guard without FileArtifact step",
             ));
@@ -383,7 +407,11 @@ impl ExecutionBackend for ProductionBackend {
             }
         })
     }
-    fn invoke(&mut self, step: &PlanStep) -> Result<(), Self::Error> {
+    fn invoke(
+        &mut self,
+        context: &crate::execution::StepExecutionContext<'_>,
+    ) -> Result<(), Self::Error> {
+        let step = context.step();
         match step.action() {
             StepAction::CreateWorktree {
                 destination,
@@ -442,9 +470,10 @@ impl ExecutionBackend for ProductionBackend {
     }
     fn probe(
         &mut self,
-        step: &PlanStep,
-        _context: ProbeContext,
+        context: &crate::execution::StepExecutionContext<'_>,
+        _probe_context: ProbeContext,
     ) -> Result<ProbeVerdict, Self::Error> {
+        let step = context.step();
         if matches!(step.action(), StepAction::RunTask { .. }) {
             return Ok(ProbeVerdict::Unknown);
         }
@@ -639,6 +668,24 @@ mod tests {
         temp
     }
 
+    fn context_plan(
+        base: &crate::lifecycle::OperationPlan,
+        step: PlanStep,
+    ) -> crate::lifecycle::OperationPlan {
+        crate::lifecycle::OperationPlan::new(crate::lifecycle::OperationPlanDraft {
+            operation_id: *base.operation_id(),
+            kind: base.kind(),
+            repository: base.repository().clone(),
+            intent: base.intent().clone(),
+            preconditions: step.preconditions().to_vec(),
+            steps: vec![step],
+            risks: base.risks().to_vec(),
+            required_consents: base.required_consents().to_vec(),
+            granted_consents: base.granted_consents().clone(),
+        })
+        .unwrap()
+    }
+
     #[test]
     fn primary_and_linked_discovery_share_identity() {
         let temp = repository();
@@ -726,9 +773,10 @@ mod tests {
         let plan = crate::lifecycle::test_plan(1);
         let backend = ProductionBackend::new(temp.path().to_owned());
         for step in plan.steps() {
-            if !backend.supports_action(step) {
+            let context = crate::execution::StepExecutionContext::new(&plan, step);
+            if !backend.supports_action(&context) {
                 assert!(matches!(
-                    ProductionBackend::new(temp.path().to_owned()).invoke(step),
+                    ProductionBackend::new(temp.path().to_owned()).invoke(&context),
                     Err(ProductionBackendError::MutationUnavailable)
                 ));
             }
@@ -836,7 +884,12 @@ mod tests {
         condition: Precondition,
         expected: bool,
     ) {
-        let result = backend.check_precondition(plan, None, &condition);
+        let result = backend.check_precondition(
+            plan,
+            None,
+            crate::execution::ConditionPhase::InitialPreflight,
+            &condition,
+        );
         assert_eq!(
             result.unwrap(),
             if expected {
@@ -1059,7 +1112,7 @@ mod tests {
         let before_refs = output(root, &["show-ref"]);
         let before_dirty = fs::read(destination.join("dirty")).unwrap();
         assert!(matches!(
-            ExecutionEngine::new(ProductionBackend::new(root.to_owned())).execute(plan),
+            ExecutionEngine::new(ProductionBackend::new(root.to_owned())).execute(plan.clone()),
             Err(crate::execution::ExecutionError::UnsupportedPlan(_))
         ));
         assert!(
@@ -1096,23 +1149,38 @@ mod tests {
         )
         .unwrap();
         let backend = ProductionBackend::new(root.to_owned());
-        assert!(backend.supports_action(&clean));
+        let clean_plan = context_plan(&plan, clean.clone());
+        let context =
+            crate::execution::StepExecutionContext::new(&clean_plan, &clean_plan.steps()[0]);
+        assert!(backend.supports_action(&context));
         let mut extra = clean.clone();
         extra
             .preconditions_mut()
             .push(Precondition::BareRepositoryFalse);
+        let extra_plan = context_plan(&plan, extra);
         assert!(
-            ProductionBackend::new(root.to_owned()).supports_action(&extra),
+            ProductionBackend::new(root.to_owned()).supports_action(
+                &crate::execution::StepExecutionContext::new(&extra_plan, &extra_plan.steps()[0])
+            ),
             "dirty-removal consent does not replace exact clean guard"
         );
         let mut missing = clean.clone();
         missing.preconditions_mut().clear();
-        assert!(!ProductionBackend::new(root.to_owned()).supports_action(&missing));
+        let missing_plan = context_plan(&plan, missing);
+        assert!(!ProductionBackend::new(root.to_owned()).supports_action(
+            &crate::execution::StepExecutionContext::new(&missing_plan, &missing_plan.steps()[0]),
+        ));
         let mut mismatched = clean;
         mismatched.preconditions_mut()[0] = Precondition::WorktreeClean {
             path: stored(root.join("other")),
         };
-        assert!(!ProductionBackend::new(root.to_owned()).supports_action(&mismatched));
+        let mismatched_plan = context_plan(&plan, mismatched);
+        assert!(!ProductionBackend::new(root.to_owned()).supports_action(
+            &crate::execution::StepExecutionContext::new(
+                &mismatched_plan,
+                &mismatched_plan.steps()[0]
+            ),
+        ));
     }
 
     #[test]
@@ -1317,10 +1385,20 @@ mod tests {
                 .unwrap_or_else(|_| RefName::new("refs/heads/main").unwrap()),
             oid: head,
         };
-        assert!(backend.check_precondition(&plan, None, &fatal).is_ok());
+        assert!(
+            backend
+                .check_precondition(
+                    &plan,
+                    None,
+                    crate::execution::ConditionPhase::InitialPreflight,
+                    &fatal,
+                )
+                .is_ok()
+        );
         assert!(!backend.supports_precondition(
             &plan,
             None,
+            crate::execution::ConditionPhase::InitialPreflight,
             &Precondition::SourceManifest {
                 rule: "r".into(),
                 source: stored(root.join("s")),
@@ -1458,6 +1536,7 @@ mod tests {
     fn d2_clean_remove_and_local_branch_cas_are_typed_mutations() {
         let temp = repository();
         let root = temp.path();
+        let base_plan = crate::lifecycle::test_plan(1);
         git(root, &["branch", "feature"]);
         let expected = oid(root, "refs/heads/feature");
         let delete = PlanStep::new(
@@ -1475,8 +1554,12 @@ mod tests {
             false,
         )
         .unwrap();
+        let delete_plan = context_plan(&base_plan, delete.clone());
         ProductionBackend::new(root.to_owned())
-            .invoke(&delete)
+            .invoke(&crate::execution::StepExecutionContext::new(
+                &delete_plan,
+                &delete_plan.steps()[0],
+            ))
             .unwrap();
         assert!(
             infrastructure::readonly_ref_oid(root, "refs/heads/feature")
@@ -1502,9 +1585,13 @@ mod tests {
             false,
         )
         .unwrap();
+        let stale_plan = context_plan(&base_plan, stale.clone());
         assert!(
             ProductionBackend::new(root.to_owned())
-                .invoke(&stale)
+                .invoke(&crate::execution::StepExecutionContext::new(
+                    &stale_plan,
+                    &stale_plan.steps()[0]
+                ))
                 .is_err()
         );
         assert_eq!(oid(root, "refs/heads/feature"), expected);
@@ -1526,9 +1613,13 @@ mod tests {
             false,
         )
         .unwrap();
+        let symbolic_plan = context_plan(&base_plan, symbolic.clone());
         assert!(
             ProductionBackend::new(root.to_owned())
-                .invoke(&symbolic)
+                .invoke(&crate::execution::StepExecutionContext::new(
+                    &symbolic_plan,
+                    &symbolic_plan.steps()[0]
+                ))
                 .is_err()
         );
         assert_eq!(oid(root, "refs/heads/main"), referent);
@@ -1547,8 +1638,12 @@ mod tests {
             false,
         )
         .unwrap();
+        let remove_plan = context_plan(&base_plan, remove.clone());
         ProductionBackend::new(root.to_owned())
-            .invoke(&remove)
+            .invoke(&crate::execution::StepExecutionContext::new(
+                &remove_plan,
+                &remove_plan.steps()[0],
+            ))
             .unwrap();
         assert!(!linked.exists());
     }
@@ -1643,6 +1738,7 @@ mod tests {
     fn probe_covers_postconditions_and_file_artifact_modes_without_mutation() {
         let temp = repository();
         let root = temp.path();
+        let base_plan = crate::lifecycle::test_plan(1);
         let branch = BranchName::new("probe-branch").unwrap();
         let destination = root.join("probe-worktree");
         git(
@@ -1675,9 +1771,13 @@ mod tests {
             false,
         )
         .unwrap();
+        let step_plan = context_plan(&base_plan, step.clone());
         assert_eq!(
             ProductionBackend::new(root.to_owned())
-                .probe(&step, ProbeContext::StartupReconciliation)
+                .probe(
+                    &crate::execution::StepExecutionContext::new(&step_plan, &step_plan.steps()[0]),
+                    ProbeContext::StartupReconciliation
+                )
                 .unwrap(),
             ProbeVerdict::Applied
         );
@@ -1694,9 +1794,16 @@ mod tests {
             false,
         )
         .unwrap();
+        let mismatch_plan = context_plan(&base_plan, mismatch.clone());
         assert_eq!(
             ProductionBackend::new(root.to_owned())
-                .probe(&mismatch, ProbeContext::StartupReconciliation)
+                .probe(
+                    &crate::execution::StepExecutionContext::new(
+                        &mismatch_plan,
+                        &mismatch_plan.steps()[0]
+                    ),
+                    ProbeContext::StartupReconciliation
+                )
                 .unwrap(),
             ProbeVerdict::NotApplied
         );
@@ -1717,9 +1824,16 @@ mod tests {
             false,
         )
         .unwrap();
+        let removed_plan = context_plan(&base_plan, removed.clone());
         assert_eq!(
             ProductionBackend::new(root.to_owned())
-                .probe(&removed, ProbeContext::StartupReconciliation)
+                .probe(
+                    &crate::execution::StepExecutionContext::new(
+                        &removed_plan,
+                        &removed_plan.steps()[0]
+                    ),
+                    ProbeContext::StartupReconciliation
+                )
                 .unwrap(),
             ProbeVerdict::Applied
         );
@@ -1754,10 +1868,14 @@ mod tests {
             false,
         )
         .unwrap();
+        let artifact_plan = context_plan(&base_plan, artifact.clone());
         assert_eq!(
             ProductionBackend::new(root.to_owned())
                 .probe(
-                    &artifact,
+                    &crate::execution::StepExecutionContext::new(
+                        &artifact_plan,
+                        &artifact_plan.steps()[0]
+                    ),
                     ProbeContext::AfterAttempt {
                         executor_succeeded: true
                     }
@@ -1769,7 +1887,10 @@ mod tests {
         assert_eq!(
             ProductionBackend::new(root.to_owned())
                 .probe(
-                    &artifact,
+                    &crate::execution::StepExecutionContext::new(
+                        &artifact_plan,
+                        &artifact_plan.steps()[0]
+                    ),
                     ProbeContext::AfterAttempt {
                         executor_succeeded: false
                     }
@@ -1793,13 +1914,19 @@ mod tests {
             false,
         )
         .unwrap();
+        let run_plan = context_plan(&base_plan, run.clone());
         assert_eq!(
-            ProductionBackend::new(temp.path().to_owned()).probe_capability(&run),
+            ProductionBackend::new(temp.path().to_owned()).probe_capability(
+                &crate::execution::StepExecutionContext::new(&run_plan, &run_plan.steps()[0]),
+            ),
             ProbeCapability::UnknownAfterCrash
         );
         assert_eq!(
             ProductionBackend::new(temp.path().to_owned())
-                .probe(&run, ProbeContext::StartupReconciliation)
+                .probe(
+                    &crate::execution::StepExecutionContext::new(&run_plan, &run_plan.steps()[0]),
+                    ProbeContext::StartupReconciliation,
+                )
                 .unwrap(),
             ProbeVerdict::Unknown
         );

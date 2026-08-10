@@ -285,6 +285,10 @@ pub enum Precondition {
         path: StoredPath,
         target_digest: ObjectId,
     },
+    SymlinkAtV3 {
+        path: StoredPath,
+        expected: SymlinkStateV3,
+    },
     RemoteRefAt {
         remote: RemoteName,
         branch: BranchName,
@@ -327,6 +331,18 @@ pub enum Precondition {
         bytes: u64,
         digest: ObjectId,
         manifest_digest: ObjectId,
+    },
+    ArtifactSourceAtV3 {
+        rule: String,
+        source_root: StoredPath,
+        source: StoredPath,
+        expectation: ArtifactSourceExpectationV3,
+        manifest_digest: ObjectId,
+    },
+    TreeSymlinkAtV3 {
+        commit_oid: ObjectId,
+        checkout_relative_path: StoredPath,
+        expected: SymlinkStateV3,
     },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -387,6 +403,70 @@ pub struct ReplacedSymlink {
     pub expected_current: ObjectId,
     pub original_target: StoredPath,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegularFileStateV3 {
+    pub bytes: u64,
+    pub digest: ObjectId,
+    pub mode: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymlinkStateV3 {
+    pub target: StoredPath,
+    pub target_digest: ObjectId,
+}
+impl PartialEq<&SymlinkStateV3> for SymlinkStateV3 {
+    fn eq(&self, other: &&SymlinkStateV3) -> bool {
+        self == *other
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArtifactSourceKindV3 {
+    RegularFile,
+    Directory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnedStagingV3 {
+    pub path: StoredPath,
+    pub ownership_token: ObjectId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PublicationStrategyV3 {
+    AtomicNoReplaceV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArtifactStateV3 {
+    Regular(RegularFileStateV3),
+    Symlink(SymlinkStateV3),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArtifactSourceExpectationV3 {
+    Regular(RegularFileStateV3),
+    Directory,
+    Symlink(SymlinkStateV3),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatedArtifactV3 {
+    pub path: StoredPath,
+    pub expected: ArtifactStateV3,
+    pub staging: Option<OwnedStagingV3>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplacedSymlinkV3 {
+    pub path: StoredPath,
+    pub expected_current: SymlinkStateV3,
+    pub restore: SymlinkStateV3,
+    pub replacement_staging: OwnedStagingV3,
+    pub backup_staging: OwnedStagingV3,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreatedWorktree {
     pub path: StoredPath,
@@ -405,6 +485,8 @@ pub enum Compensation {
     RestoreReplacedSymlink(ReplacedSymlink),
     RemoveCreatedWorktree(CreatedWorktree),
     DeleteCreatedLocalBranch(CreatedLocalBranch),
+    RemoveCreatedArtifactV3(CreatedArtifactV3),
+    RestoreReplacedSymlinkV3(ReplacedSymlinkV3),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,6 +511,46 @@ pub enum StepAction {
         confirm: bool,
         #[serde(default = "legacy_mode_policy")]
         mode_policy: crate::planner::FileModePolicy,
+    },
+    CopyFileV3 {
+        rule: String,
+        source_root: StoredPath,
+        source: StoredPath,
+        expected_source: RegularFileStateV3,
+        destination: StoredPath,
+        desired_output: RegularFileStateV3,
+        staging: OwnedStagingV3,
+        publication: PublicationStrategyV3,
+        manifest_digest: ObjectId,
+        sensitive: bool,
+        confirm: bool,
+    },
+    CreateSymlinkV3 {
+        rule: String,
+        source_root: StoredPath,
+        source: StoredPath,
+        expected_source: ArtifactSourceExpectationV3,
+        destination: StoredPath,
+        desired: SymlinkStateV3,
+        manifest_digest: ObjectId,
+        sensitive: bool,
+        confirm: bool,
+    },
+    RelinkSymlinkV3 {
+        rule: String,
+        source_root: StoredPath,
+        source: StoredPath,
+        expected_source: SymlinkStateV3,
+        checkout_oid: ObjectId,
+        checkout_relative_path: StoredPath,
+        destination: StoredPath,
+        expected_old: SymlinkStateV3,
+        desired_new: SymlinkStateV3,
+        replacement_staging: OwnedStagingV3,
+        backup_staging: OwnedStagingV3,
+        manifest_digest: ObjectId,
+        sensitive: bool,
+        confirm: bool,
     },
     RunTask {
         name: String,
@@ -612,7 +734,7 @@ impl OperationPlan {
             return Err("plan repository and intent repository mismatch".into());
         }
         Ok(Self {
-            plan_schema_version: 2,
+            plan_schema_version: 3,
             operation_id,
             kind,
             repository,
@@ -659,12 +781,12 @@ impl OperationPlan {
         &self.granted_consents
     }
     pub fn validate_persisted(&self) -> Result<(), String> {
-        if !matches!(self.plan_schema_version, 1 | 2) {
+        if !(1..=3).contains(&self.plan_schema_version) {
             return Err("unsupported operation plan schema".into());
         }
         self.validate_shape()?;
-        if self.plan_schema_version == 2 && self.grants_match_intent() {
-            let restored = Self::new(OperationPlanDraft {
+        if matches!(self.plan_schema_version, 2 | 3) && self.grants_match_intent() {
+            let mut restored = Self::new(OperationPlanDraft {
                 operation_id: self.operation_id,
                 kind: self.kind,
                 repository: self.repository.clone(),
@@ -675,6 +797,7 @@ impl OperationPlan {
                 required_consents: self.required_consents.clone(),
                 granted_consents: self.granted_consents.clone(),
             })?;
+            restored.plan_schema_version = self.plan_schema_version;
             if restored != *self {
                 return Err("persisted operation plan is not canonical".into());
             }
@@ -696,6 +819,7 @@ impl OperationPlan {
             if step.irreversible && step.compensation.is_some() {
                 return Err("persisted irreversible step has compensation".into());
             }
+            validate_v3_modes(step)?;
         }
         let consent_ids: BTreeSet<_> = self
             .required_consents
@@ -730,8 +854,16 @@ impl OperationPlan {
 
     pub fn validate_executable_plan(&self) -> Result<(), String> {
         self.validate_persisted()?;
-        if self.plan_schema_version != 2 {
+        if self.plan_schema_version == 1 {
             return Err("schema-1 plans are read-only and not executable".into());
+        }
+        if self.plan_schema_version == 2
+            && (self.contains_v3_artifact() || self.contains_legacy_artifact())
+        {
+            return Err("schema-2 plans containing artifact semantics are not executable".into());
+        }
+        if self.plan_schema_version == 3 && self.contains_legacy_artifact() {
+            return Err("schema-3 plans containing legacy artifacts are not executable".into());
         }
         let intent_repository = match &self.intent {
             OperationIntent::Create(value) => &value.repository,
@@ -752,6 +884,56 @@ impl OperationPlan {
             }
             _ => Err("executable plan kind and intent mismatch".into()),
         }
+    }
+    fn contains_legacy_artifact(&self) -> bool {
+        self.preconditions.iter().any(|condition| {
+            matches!(
+                condition,
+                Precondition::SourceManifest { .. }
+                    | Precondition::ArtifactSourceAt { .. }
+                    | Precondition::SymlinkAt { .. }
+            )
+        }) || self.steps.iter().any(|step| {
+            matches!(step.action, StepAction::FileArtifact { .. })
+                || step.compensation.as_ref().is_some_and(|value| {
+                    matches!(
+                        value,
+                        Compensation::RemoveCreatedArtifact(_)
+                            | Compensation::RestoreReplacedSymlink(_)
+                    )
+                })
+                || step.preconditions.iter().any(|condition| {
+                    matches!(
+                        condition,
+                        Precondition::SourceManifest { .. }
+                            | Precondition::ArtifactSourceAt { .. }
+                            | Precondition::SymlinkAt { .. }
+                    )
+                })
+        })
+    }
+    fn contains_v3_artifact(&self) -> bool {
+        self.steps.iter().any(|step| {
+            matches!(
+                step.action,
+                StepAction::CopyFileV3 { .. }
+                    | StepAction::CreateSymlinkV3 { .. }
+                    | StepAction::RelinkSymlinkV3 { .. }
+            ) || step.compensation.as_ref().is_some_and(|value| {
+                matches!(
+                    value,
+                    Compensation::RemoveCreatedArtifactV3(_)
+                        | Compensation::RestoreReplacedSymlinkV3(_)
+                )
+            }) || step.preconditions.iter().any(|condition| {
+                matches!(
+                    condition,
+                    Precondition::ArtifactSourceAtV3 { .. }
+                        | Precondition::TreeSymlinkAtV3 { .. }
+                        | Precondition::SymlinkAtV3 { .. }
+                )
+            })
+        })
     }
     fn grants_match_intent(&self) -> bool {
         match &self.intent {
@@ -951,6 +1133,9 @@ impl OperationPlan {
             })
         {
             return Err("create branch postcondition is not exact".into());
+        }
+        if self.plan_schema_version == 3 && self.contains_v3_artifact() {
+            return self.validate_executable_create_v3(intent, destination);
         }
         let mut task_names = BTreeSet::new();
         let mut rule_manifests = BTreeMap::<String, ObjectId>::new();
@@ -1234,6 +1419,419 @@ impl OperationPlan {
         validate_create_consents(self, task_names)
     }
 
+    fn validate_executable_create_v3(
+        &self,
+        intent: &CreateIntent,
+        destination: &StoredPath,
+    ) -> Result<(), String> {
+        let create_step = self
+            .steps
+            .first()
+            .ok_or("create plan has no worktree step")?;
+        let worktree_destination = match create_step.action() {
+            StepAction::CreateWorktree { destination, .. } => destination,
+            _ => return Err("create plan does not start with a worktree".into()),
+        };
+        let worktree_posts: Vec<_> = create_step
+            .postconditions()
+            .iter()
+            .filter_map(|post| match post {
+                Postcondition::WorktreeCreated { path, oid } => Some((path, oid)),
+                _ => None,
+            })
+            .collect();
+        if worktree_posts.len() != 1 || worktree_posts[0].0 != worktree_destination {
+            return Err("create worktree postcondition is not exact".into());
+        }
+        let create_checkout_oid = worktree_posts[0].1;
+        let mut descriptors = BTreeMap::<String, Vec<crate::planner::ManifestDescriptorV3>>::new();
+        let mut rules = BTreeSet::new();
+        let mut paths = Vec::new();
+        let mut source_paths = Vec::new();
+        let mut tasks = BTreeSet::new();
+        let mut saw_task = false;
+        for step in self.steps.iter().skip(1) {
+            match step.action() {
+                StepAction::CopyFileV3 {
+                    rule,
+                    source_root,
+                    source,
+                    expected_source,
+                    destination: final_path,
+                    desired_output,
+                    staging,
+                    publication,
+                    manifest_digest,
+                    sensitive,
+                    confirm,
+                } => {
+                    if saw_task
+                        || step.irreversible()
+                        || !step.postconditions().is_empty()
+                        || !absolute_normalized(source_root.as_path())
+                        || !contained_strict(source.as_path(), source_root.as_path())
+                        || !contained_strict(final_path.as_path(), destination.as_path())
+                        || !matches!(publication, PublicationStrategyV3::AtomicNoReplaceV1)
+                    {
+                        return Err("invalid v3 copy placement or lifecycle".into());
+                    }
+                    if expected_source.bytes != desired_output.bytes
+                        || expected_source.digest != desired_output.digest
+                        || desired_output.mode
+                            != crate::planner::exact_output_mode(
+                                if *sensitive {
+                                    crate::planner::FileModePolicy::Private
+                                } else {
+                                    crate::planner::FileModePolicy::PreserveSafe
+                                },
+                                expected_source.mode,
+                            )
+                    {
+                        return Err("invalid v3 copy output contract".into());
+                    }
+                    let expected_stage = crate::planner::artifact_staging_v3(
+                        self.operation_id(),
+                        step.id(),
+                        crate::planner::ArtifactStagingRoleV3::Copy,
+                        final_path.as_path(),
+                    )
+                    .map_err(|_| "invalid v3 copy staging")?;
+                    if staging != &expected_stage {
+                        return Err("invalid v3 copy staging".into());
+                    }
+                    let source_guards: Vec<_> = step
+                        .preconditions()
+                        .iter()
+                        .filter(|p| matches!(p, Precondition::ArtifactSourceAtV3 { .. }))
+                        .collect();
+                    if source_guards.len() != 1 || step.preconditions().iter().any(|p| matches!(p, Precondition::ArtifactSourceAt { .. }))
+                        || step.preconditions().iter().filter(|p| matches!(p, Precondition::PathAbsent(path) if path == final_path || path == &staging.path)).count() != 2
+                        || !step.preconditions().iter().any(|p| matches!(p, Precondition::PathAbsent(path) if path == final_path))
+                        || !step.preconditions().iter().any(|p| matches!(p, Precondition::PathAbsent(path) if path == &staging.path))
+                    { return Err("invalid v3 copy guards".into()); }
+                    let matches_guard = matches!(source_guards[0], Precondition::ArtifactSourceAtV3 { rule: r, source_root: sr, source: s, expectation: ArtifactSourceExpectationV3::Regular(v), manifest_digest: md } if r == rule && sr == source_root && s == source && v == expected_source && md == manifest_digest);
+                    if !matches_guard {
+                        return Err("v3 copy source guard does not match action".into());
+                    }
+                    match step.compensation() {
+                        Some(Compensation::RemoveCreatedArtifactV3(c))
+                            if c.path == *final_path
+                                && c.expected
+                                    == ArtifactStateV3::Regular(desired_output.clone())
+                                && c.staging.as_ref() == Some(staging) => {}
+                        _ => return Err("invalid v3 copy compensation".into()),
+                    }
+                    paths.extend([final_path.clone(), staging.path.clone()]);
+                    source_paths.push(source.clone());
+                    rules.insert(rule.clone());
+                    descriptors.entry(rule.clone()).or_default().push(
+                        crate::planner::ManifestDescriptorV3::CopyFileV3 {
+                            source_root: source_root.clone(),
+                            source: source.clone(),
+                            expected_source: expected_source.clone(),
+                            destination: final_path.clone(),
+                            desired_output: desired_output.clone(),
+                            staging: staging.clone(),
+                            publication: *publication,
+                            sensitive: *sensitive,
+                            confirm: *confirm,
+                        },
+                    );
+                    if !self.artifact_contract_matches(intent, rule, source_root, manifest_digest) {
+                        return Err("v3 artifact rule contract mismatch".into());
+                    }
+                }
+                StepAction::CreateSymlinkV3 {
+                    rule,
+                    source_root,
+                    source,
+                    expected_source,
+                    destination: final_path,
+                    desired,
+                    manifest_digest,
+                    sensitive,
+                    confirm,
+                } => {
+                    if matches!(expected_source, ArtifactSourceExpectationV3::Symlink(_))
+                        || matches!(expected_source, ArtifactSourceExpectationV3::Regular(state) if state.mode > 0o7777)
+                    {
+                        return Err("create symlink source expectation is invalid".into());
+                    }
+                    if saw_task
+                        || step.irreversible()
+                        || !step.postconditions().is_empty()
+                        || !absolute_normalized(source_root.as_path())
+                        || !contained_strict(source.as_path(), source_root.as_path())
+                        || !contained_strict(final_path.as_path(), destination.as_path())
+                        || desired.target != *source
+                        || crate::planner::artifact_digest(
+                            desired.target.as_path().as_os_str().as_encoded_bytes(),
+                        ) != desired.target_digest
+                    {
+                        return Err("invalid v3 symlink placement or target".into());
+                    }
+                    if !step
+                        .preconditions()
+                        .iter()
+                        .any(|p| matches!(p, Precondition::PathAbsent(path) if path == final_path))
+                        || step.preconditions().iter().any(|p| {
+                            matches!(
+                                p,
+                                Precondition::ArtifactSourceAt { .. }
+                                    | Precondition::TreeSymlinkAtV3 { .. }
+                            )
+                        })
+                    {
+                        return Err("invalid v3 symlink guards".into());
+                    }
+                    let source_guards: Vec<_> = step
+                        .preconditions()
+                        .iter()
+                        .filter(|p| matches!(p, Precondition::ArtifactSourceAtV3 { .. }))
+                        .collect();
+                    if source_guards.len() != 1
+                        || !matches!(source_guards[0], Precondition::ArtifactSourceAtV3 { rule: r, source_root: sr, source: s, expectation: e, manifest_digest: md } if r == rule && sr == source_root && s == source && e == expected_source && md == manifest_digest)
+                    {
+                        return Err("v3 symlink source guard does not match action".into());
+                    }
+                    if !matches!(step.compensation(), Some(Compensation::RemoveCreatedArtifactV3(c)) if c.path == *final_path && c.expected == ArtifactStateV3::Symlink(desired.clone()) && c.staging.is_none())
+                    {
+                        return Err("invalid v3 symlink compensation".into());
+                    }
+                    paths.push(final_path.clone());
+                    source_paths.push(source.clone());
+                    rules.insert(rule.clone());
+                    descriptors.entry(rule.clone()).or_default().push(
+                        crate::planner::ManifestDescriptorV3::CreateSymlinkV3 {
+                            source_root: source_root.clone(),
+                            source: source.clone(),
+                            expected_source: expected_source.clone(),
+                            destination: final_path.clone(),
+                            desired: desired.clone(),
+                            sensitive: *sensitive,
+                            confirm: *confirm,
+                        },
+                    );
+                    if !self.artifact_contract_matches(intent, rule, source_root, manifest_digest) {
+                        return Err("v3 artifact rule contract mismatch".into());
+                    }
+                }
+                StepAction::RelinkSymlinkV3 {
+                    rule,
+                    source_root,
+                    source,
+                    expected_source,
+                    checkout_oid,
+                    checkout_relative_path,
+                    destination: final_path,
+                    expected_old,
+                    desired_new,
+                    replacement_staging,
+                    backup_staging,
+                    manifest_digest,
+                    sensitive,
+                    confirm,
+                } => {
+                    if saw_task
+                        || step.irreversible()
+                        || !step.postconditions().is_empty()
+                        || expected_old == desired_new
+                        || expected_source != desired_new
+                        || !absolute_normalized(source_root.as_path())
+                        || !contained_strict(source.as_path(), source_root.as_path())
+                        || !contained_strict(final_path.as_path(), destination.as_path())
+                        || !relative_is_safe(checkout_relative_path.as_path())
+                        || crate::planner::artifact_digest(
+                            expected_source
+                                .target
+                                .as_path()
+                                .as_os_str()
+                                .as_encoded_bytes(),
+                        ) != expected_source.target_digest
+                        || crate::planner::artifact_digest(
+                            expected_old.target.as_path().as_os_str().as_encoded_bytes(),
+                        ) != expected_old.target_digest
+                        || crate::planner::artifact_digest(
+                            desired_new.target.as_path().as_os_str().as_encoded_bytes(),
+                        ) != desired_new.target_digest
+                    {
+                        return Err("invalid v3 relink contract".into());
+                    }
+                    let expected_relative = final_path
+                        .as_path()
+                        .strip_prefix(worktree_destination.as_path())
+                        .map_err(|_| "relink destination is outside checkout")?;
+                    if checkout_oid != create_checkout_oid
+                        || checkout_relative_path.as_path() != expected_relative
+                    {
+                        return Err("relink checkout identity is not exact".into());
+                    }
+                    let replacement = crate::planner::artifact_staging_v3(
+                        self.operation_id(),
+                        step.id(),
+                        crate::planner::ArtifactStagingRoleV3::RelinkReplacement,
+                        final_path.as_path(),
+                    )
+                    .map_err(|_| "invalid relink staging")?;
+                    let backup = crate::planner::artifact_staging_v3(
+                        self.operation_id(),
+                        step.id(),
+                        crate::planner::ArtifactStagingRoleV3::RelinkBackup,
+                        final_path.as_path(),
+                    )
+                    .map_err(|_| "invalid relink staging")?;
+                    if replacement_staging != &replacement
+                        || backup_staging != &backup
+                        || replacement_staging.path == backup_staging.path
+                    {
+                        return Err("invalid v3 relink staging".into());
+                    }
+                    let source_guards: Vec<_> = step
+                        .preconditions()
+                        .iter()
+                        .filter(|p| matches!(p, Precondition::ArtifactSourceAtV3 { .. }))
+                        .collect();
+                    let tree_guards: Vec<_> = step
+                        .preconditions()
+                        .iter()
+                        .filter(|p| matches!(p, Precondition::TreeSymlinkAtV3 { .. }))
+                        .collect();
+                    let destination_guards: Vec<_> = step
+                        .preconditions()
+                        .iter()
+                        .filter(|p| matches!(p, Precondition::SymlinkAtV3 { .. }))
+                        .collect();
+                    let replacement_absent = step.preconditions().iter().filter(|p| matches!(p, Precondition::PathAbsent(path) if path == &replacement_staging.path)).count();
+                    let backup_absent = step.preconditions().iter().filter(|p| matches!(p, Precondition::PathAbsent(path) if path == &backup_staging.path)).count();
+                    if source_guards.len() != 1
+                        || tree_guards.len() != 1
+                        || destination_guards.len() != 1
+                        || replacement_absent != 1
+                        || backup_absent != 1
+                        || !matches!(source_guards[0], Precondition::ArtifactSourceAtV3 { rule: r, source_root: sr, source: s, expectation: ArtifactSourceExpectationV3::Symlink(v), manifest_digest: md } if r == rule && sr == source_root && s == source && v == desired_new && md == manifest_digest)
+                        || !matches!(tree_guards[0], Precondition::TreeSymlinkAtV3 { commit_oid: oid, checkout_relative_path: p, expected: v } if oid == create_checkout_oid && p.as_path() == expected_relative && v == expected_old)
+                        || !matches!(destination_guards[0], Precondition::SymlinkAtV3 { path, expected } if path == final_path && expected == expected_old)
+                    {
+                        return Err("invalid v3 relink guards".into());
+                    }
+                    if !matches!(step.compensation(), Some(Compensation::RestoreReplacedSymlinkV3(c)) if c.path == *final_path && c.expected_current == *desired_new && c.restore == *expected_old && c.replacement_staging == *replacement_staging && c.backup_staging == *backup_staging)
+                    {
+                        return Err("invalid v3 relink compensation".into());
+                    }
+                    paths.extend([
+                        final_path.clone(),
+                        replacement_staging.path.clone(),
+                        backup_staging.path.clone(),
+                    ]);
+                    source_paths.push(source.clone());
+                    rules.insert(rule.clone());
+                    descriptors.entry(rule.clone()).or_default().push(
+                        crate::planner::ManifestDescriptorV3::RelinkSymlinkV3 {
+                            source_root: source_root.clone(),
+                            source: source.clone(),
+                            expected_source: expected_source.clone(),
+                            checkout_oid: checkout_oid.clone(),
+                            checkout_relative_path: checkout_relative_path.clone(),
+                            destination: final_path.clone(),
+                            expected_old: expected_old.clone(),
+                            desired_new: desired_new.clone(),
+                            replacement_staging: replacement_staging.clone(),
+                            backup_staging: backup_staging.clone(),
+                            sensitive: *sensitive,
+                            confirm: *confirm,
+                        },
+                    );
+                    if !self.artifact_contract_matches(intent, rule, source_root, manifest_digest) {
+                        return Err("v3 artifact rule contract mismatch".into());
+                    }
+                }
+                StepAction::RunTask {
+                    name,
+                    argv,
+                    cwd,
+                    required,
+                    environment_allowlist,
+                } => {
+                    saw_task = true;
+                    let Some(contract) = intent.task_contracts.get(name) else {
+                        return Err("task action has no intent contract".into());
+                    };
+                    if contract.argv != *argv
+                        || contract.cwd != *cwd
+                        || contract.required != *required
+                        || contract.environment_allowlist != *environment_allowlist
+                        || !contained_or_equal(cwd.as_path(), destination.as_path())
+                        || !tasks.insert(name.clone())
+                        || !step.irreversible()
+                        || step.compensation().is_some()
+                    {
+                        return Err("invalid task suffix".into());
+                    }
+                }
+                _ => return Err("schema-3 create contains an invalid action".into()),
+            }
+        }
+        if tasks != intent.selected_tasks
+            || intent
+                .task_contracts
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                != intent.selected_tasks
+            || rules != intent.artifact_rule_contracts.keys().cloned().collect()
+        {
+            return Err("schema-3 task or artifact rules do not match intent".into());
+        }
+        if destination_paths_overlap(&paths) {
+            return Err("schema-3 artifact paths overlap".into());
+        }
+        if paths.iter().any(|mutable| {
+            source_paths.iter().any(|source| {
+                mutable.as_path() == source.as_path()
+                    || mutable.as_path().starts_with(source.as_path())
+                    || source.as_path().starts_with(mutable.as_path())
+            })
+        }) {
+            return Err("schema-3 mutable and source paths overlap".into());
+        }
+        for (rule, items) in descriptors {
+            let digest =
+                crate::planner::canonical_manifest_digest_v3(&items, destination.as_path());
+            if intent
+                .artifact_rule_contracts
+                .get(&rule)
+                .map(|c| &c.manifest_digest)
+                != Some(&digest)
+            {
+                return Err("schema-3 manifest digest is not canonical".into());
+            }
+        }
+        validate_create_consents(self, tasks)
+    }
+
+    fn artifact_contract_matches(
+        &self,
+        intent: &CreateIntent,
+        rule: &str,
+        root: &StoredPath,
+        digest: &ObjectId,
+    ) -> bool {
+        intent
+            .artifact_rule_contracts
+            .get(rule)
+            .is_some_and(|contract| {
+                contract.source_root == *root
+                    && contract.manifest_digest == *digest
+                    && match contract.provenance {
+                        ArtifactSourceProvenance::Primary => *root == self.repository.primary_root,
+                        ArtifactSourceProvenance::CurrentWorktree => {
+                            intent.current_worktree_root.as_ref() == Some(root)
+                        }
+                        ArtifactSourceProvenance::LegacyUnspecified => false,
+                    }
+            })
+    }
+
     fn validate_executable_remove(&self, intent: &RemoveIntent) -> Result<(), String> {
         if self.steps.is_empty() || self.steps.len() > 3 {
             return Err("remove plan has an invalid action count".into());
@@ -1473,6 +2071,41 @@ impl OperationPlan {
 fn has_pre<F: Fn(&Precondition) -> bool>(conditions: &[Precondition], predicate: F) -> bool {
     conditions.iter().any(predicate)
 }
+fn validate_v3_modes(step: &PlanStep) -> Result<(), String> {
+    let valid = |state: &RegularFileStateV3| state.mode <= 0o7777;
+    let valid_state = |state: &ArtifactStateV3| match state {
+        ArtifactStateV3::Regular(value) => valid(value),
+        ArtifactStateV3::Symlink(_) => true,
+    };
+    let valid_expectation = |value: &ArtifactSourceExpectationV3| match value {
+        ArtifactSourceExpectationV3::Regular(state) => valid(state),
+        ArtifactSourceExpectationV3::Directory | ArtifactSourceExpectationV3::Symlink(_) => true,
+    };
+    match step.action() {
+        StepAction::CopyFileV3 {
+            expected_source,
+            desired_output,
+            ..
+        } if !valid(expected_source) || !valid(desired_output) => {
+            return Err("v3 regular file mode is out of range".into());
+        }
+        StepAction::CreateSymlinkV3 {
+            expected_source, ..
+        } if !valid_expectation(expected_source) => {
+            return Err("v3 regular file mode is out of range".into());
+        }
+        StepAction::RelinkSymlinkV3 { .. }
+        | StepAction::CreateWorktree { .. }
+        | StepAction::FileArtifact { .. }
+        | StepAction::RunTask { .. }
+        | StepAction::RemoveWorktree { .. }
+        | StepAction::DeleteLocalBranch { .. }
+        | StepAction::DeleteRemoteBranch { .. } => {}
+        _ => {}
+    }
+    if step.preconditions().iter().any(|p| matches!(p, Precondition::ArtifactSourceAtV3 { expectation, .. } if !valid_expectation(expectation))) || step.compensation().is_some_and(|c| match c { Compensation::RemoveCreatedArtifactV3(v) => !valid_state(&v.expected), Compensation::RestoreReplacedSymlinkV3(_) | Compensation::RemoveCreatedArtifact(_) | Compensation::RestoreReplacedSymlink(_) | Compensation::RemoveCreatedWorktree(_) | Compensation::DeleteCreatedLocalBranch(_) => false }) { return Err("v3 regular file mode is out of range".into()); }
+    Ok(())
+}
 fn has_worktree_at_oid(conditions: &[Precondition], oid: &ObjectId) -> bool {
     conditions.iter().any(|condition| {
         matches!(condition, Precondition::WorktreeAt { oid: value, .. } if value == oid)
@@ -1573,6 +2206,38 @@ fn validate_create_consents(plan: &OperationPlan, tasks: BTreeSet<String>) -> Re
                         .push(RiskKind::SensitiveMaterialization);
                 }
                 if matches!(kind, crate::planner::FileArtifactKind::RelinkSymlink) {
+                    expected
+                        .entry(id)
+                        .or_default()
+                        .push(RiskKind::ReplaceExistingSymlink);
+                }
+            }
+            StepAction::CopyFileV3 {
+                rule,
+                sensitive,
+                confirm,
+                ..
+            }
+            | StepAction::CreateSymlinkV3 {
+                rule,
+                sensitive,
+                confirm,
+                ..
+            }
+            | StepAction::RelinkSymlinkV3 {
+                rule,
+                sensitive,
+                confirm,
+                ..
+            } => {
+                let id = format!("file-rule:{rule}");
+                if *sensitive || *confirm {
+                    expected
+                        .entry(id.clone())
+                        .or_default()
+                        .push(RiskKind::SensitiveMaterialization);
+                }
+                if matches!(step.action(), StepAction::RelinkSymlinkV3 { .. }) {
                     expected
                         .entry(id)
                         .or_default()
@@ -1685,7 +2350,7 @@ fn validate_remove_consents(plan: &OperationPlan, intent: &RemoveIntent) -> Resu
 }
 
 #[cfg(test)]
-pub(crate) fn test_plan(step_count: usize) -> OperationPlan {
+pub(crate) fn v3_test_plan(step_count: usize) -> OperationPlan {
     let repository = RepositoryIdentity {
         common_dir: StoredPath::from(std::path::PathBuf::from("/r/.git")),
         primary_root: StoredPath::from(std::path::PathBuf::from("/r")),
@@ -1752,19 +2417,27 @@ pub(crate) fn test_plan(step_count: usize) -> OperationPlan {
     ];
     for index in 1..step_count {
         let path = StoredPath::from(std::path::PathBuf::from(format!("/r/w/{index}")));
-        let manifest_digest = crate::planner::canonical_manifest_digest(
-            &[crate::planner::ManifestDigestArtifact {
+        let source = StoredPath::from(std::path::PathBuf::from(format!("/r/source/{index}")));
+        let desired = SymlinkStateV3 {
+            target: source.clone(),
+            target_digest: crate::planner::artifact_digest(
+                source.as_path().as_os_str().as_encoded_bytes(),
+            ),
+        };
+        let expected = ArtifactSourceExpectationV3::Regular(RegularFileStateV3 {
+            bytes: 1,
+            digest: zero.clone(),
+            mode: 0o644,
+        });
+        let manifest_digest = crate::planner::canonical_manifest_digest_v3(
+            &[crate::planner::ManifestDescriptorV3::CreateSymlinkV3 {
                 source_root: repository.primary_root.clone(),
-                source: StoredPath::from(std::path::PathBuf::from(format!("/r/source/{index}"))),
+                source: source.clone(),
+                expected_source: expected.clone(),
                 destination: path.clone(),
-                kind: crate::planner::FileArtifactKind::CopyFile,
-                bytes: 1,
-                digest: zero.clone(),
-                fingerprint: zero.clone(),
-                link_target: None,
+                desired: desired.clone(),
                 sensitive: false,
                 confirm: false,
-                mode_policy: crate::planner::FileModePolicy::PreserveSafe,
             }],
             std::path::Path::new("/r/w"),
         );
@@ -1772,40 +2445,32 @@ pub(crate) fn test_plan(step_count: usize) -> OperationPlan {
             PlanStep::new(
                 StepId::new(format!("step-{index}")).unwrap(),
                 format!("step-{index}"),
-                StepAction::FileArtifact {
+                StepAction::CreateSymlinkV3 {
                     rule: format!("rule-{index}"),
-                    kind: crate::planner::FileArtifactKind::CopyFile,
-                    source: StoredPath::from(std::path::PathBuf::from(format!(
-                        "/r/source/{index}"
-                    ))),
+                    source_root: repository.primary_root.clone(),
+                    source: source.clone(),
+                    expected_source: expected.clone(),
                     destination: path.clone(),
-                    bytes: 1,
-                    digest: zero.clone(),
-                    fingerprint: zero.clone(),
-                    link_target: None,
+                    desired: desired.clone(),
                     manifest_digest: manifest_digest.clone(),
                     sensitive: false,
                     confirm: false,
-                    mode_policy: crate::planner::FileModePolicy::PreserveSafe,
                 },
                 vec![
-                    Precondition::ArtifactSourceAt {
+                    Precondition::ArtifactSourceAtV3 {
                         rule: format!("rule-{index}"),
                         source_root: repository.primary_root.clone(),
-                        source: StoredPath::from(std::path::PathBuf::from(format!(
-                            "/r/source/{index}"
-                        ))),
-                        destination: path.clone(),
-                        bytes: 1,
-                        digest: zero.clone(),
+                        source: source.clone(),
+                        expectation: expected.clone(),
                         manifest_digest: manifest_digest.clone(),
                     },
                     Precondition::PathAbsent(path.clone()),
                 ],
                 vec![],
-                Some(Compensation::RemoveCreatedArtifact(CreatedArtifact {
+                Some(Compensation::RemoveCreatedArtifactV3(CreatedArtifactV3 {
                     path,
-                    fingerprint: zero.clone(),
+                    expected: ArtifactStateV3::Symlink(desired),
+                    staging: None,
                 })),
                 false,
             )
@@ -1815,14 +2480,16 @@ pub(crate) fn test_plan(step_count: usize) -> OperationPlan {
     if let OperationIntent::Create(value) = &mut intent {
         value.current_worktree_root = Some(repository.primary_root.clone());
         for step in &steps {
-            if let StepAction::FileArtifact {
+            if let StepAction::CreateSymlinkV3 {
                 rule,
                 manifest_digest,
                 ..
             } = step.action()
             {
                 let source_root = step.preconditions().iter().find_map(|guard| match guard {
-                    Precondition::ArtifactSourceAt { source_root, .. } => Some(source_root.clone()),
+                    Precondition::ArtifactSourceAtV3 { source_root, .. } => {
+                        Some(source_root.clone())
+                    }
                     _ => None,
                 });
                 if let Some(source_root) = source_root {
@@ -1850,6 +2517,57 @@ pub(crate) fn test_plan(step_count: usize) -> OperationPlan {
         granted_consents: BTreeSet::new(),
     })
     .unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn test_plan(step_count: usize) -> OperationPlan {
+    let mut plan = v3_test_plan(step_count);
+    for step in plan.steps.iter_mut().skip(1) {
+        let StepAction::CreateSymlinkV3 {
+            rule,
+            source,
+            destination,
+            manifest_digest,
+            ..
+        } = step.action.clone()
+        else {
+            continue;
+        };
+        step.action = StepAction::FileArtifact {
+            rule: rule.clone(),
+            kind: crate::planner::FileArtifactKind::CopyFile,
+            source: source.clone(),
+            destination: destination.clone(),
+            bytes: 1,
+            digest: ObjectId::new("0000000000000000000000000000000000000000").unwrap(),
+            fingerprint: ObjectId::new("0000000000000000000000000000000000000000").unwrap(),
+            link_target: None,
+            manifest_digest,
+            sensitive: false,
+            confirm: false,
+            mode_policy: crate::planner::FileModePolicy::PreserveSafe,
+        };
+        step.preconditions = vec![
+            Precondition::ArtifactSourceAt {
+                rule: rule.clone(),
+                source_root: StoredPath::from(std::path::PathBuf::from("/r")),
+                source: source.clone(),
+                destination: destination.clone(),
+                bytes: 1,
+                digest: ObjectId::new("0000000000000000000000000000000000000000").unwrap(),
+                manifest_digest: ObjectId::new("0000000000000000000000000000000000000000").unwrap(),
+            },
+            Precondition::PathAbsent(destination.clone()),
+        ];
+        step.compensation = Some(Compensation::RemoveCreatedArtifact(CreatedArtifact {
+            path: destination,
+            fingerprint: ObjectId::new("0000000000000000000000000000000000000000").unwrap(),
+        }));
+    }
+    if let OperationIntent::Create(intent) = &mut plan.intent {
+        intent.artifact_rule_contracts.clear();
+    }
+    plan
 }
 
 #[cfg(test)]
@@ -1928,7 +2646,7 @@ mod tests {
         })
         .unwrap();
         let value = serde_json::to_value(&plan).unwrap();
-        assert_eq!(value["plan_schema_version"], 2);
+        assert_eq!(value["plan_schema_version"], 3);
         assert!(value.get("status").is_none());
         assert_eq!(plan, serde_json::from_value(value).unwrap());
     }
@@ -1937,14 +2655,52 @@ mod tests {
     fn archived_schema_one_file_artifact_is_readable_but_not_executable() {
         let mut wire = serde_json::to_value(test_plan(2)).unwrap();
         wire["plan_schema_version"] = serde_json::json!(1);
-        let action = &mut wire["steps"][1]["action"]["FileArtifact"];
-        action.as_object_mut().unwrap().remove("sensitive");
-        action.as_object_mut().unwrap().remove("confirm");
-        action.as_object_mut().unwrap().remove("mode_policy");
+        wire["steps"][1]["action"] = serde_json::json!({"FileArtifact": {
+            "rule":"legacy", "kind":"copy_file", "source":"/r/source/1",
+            "destination":"/r/w/1", "bytes":1,
+            "digest":"0000000000000000000000000000000000000000",
+            "fingerprint":"0000000000000000000000000000000000000000",
+            "link_target":null, "manifest_digest":"0000000000000000000000000000000000000000"
+        }});
+        wire["steps"][1]["preconditions"] = serde_json::json!([
+            {"ArtifactSourceAt":{"rule":"legacy","source_root":"/r","source":"/r/source/1","destination":"/r/w/1","bytes":1,"digest":"0000000000000000000000000000000000000000","manifest_digest":"0000000000000000000000000000000000000000"}},
+            {"PathAbsent":"/r/w/1"}
+        ]);
+        wire["steps"][1]["compensation"] = serde_json::json!({"RemoveCreatedArtifact":{"path":"/r/w/1","fingerprint":"0000000000000000000000000000000000000000"}});
         let restored: OperationPlan = serde_json::from_value(wire).unwrap();
         assert_eq!(restored.plan_schema_version(), 1);
         assert!(restored.validate_persisted().is_ok());
         assert!(restored.validate_executable_plan().is_err());
+    }
+
+    #[test]
+    fn schema_three_legacy_file_artifact_is_readable_but_not_executable() {
+        let mut wire = serde_json::to_value(test_plan(2)).unwrap();
+        wire["plan_schema_version"] = serde_json::json!(3);
+        wire["steps"][1]["action"] = serde_json::json!({"FileArtifact": {
+            "rule":"legacy", "kind":"copy_file", "source":"/r/source/1",
+            "destination":"/r/w/1", "bytes":1,
+            "digest":"0000000000000000000000000000000000000000",
+            "fingerprint":"0000000000000000000000000000000000000000",
+            "link_target":null, "manifest_digest":"0000000000000000000000000000000000000000"
+        }});
+        wire["steps"][1]["preconditions"] = serde_json::json!([
+            {"ArtifactSourceAt":{"rule":"legacy","source_root":"/r","source":"/r/source/1","destination":"/r/w/1","bytes":1,"digest":"0000000000000000000000000000000000000000","manifest_digest":"0000000000000000000000000000000000000000"}},
+            {"PathAbsent":"/r/w/1"}
+        ]);
+        wire["steps"][1]["compensation"] = serde_json::json!({"RemoveCreatedArtifact":{"path":"/r/w/1","fingerprint":"0000000000000000000000000000000000000000"}});
+        let restored: OperationPlan = serde_json::from_value(wire).unwrap();
+        assert!(restored.validate_persisted().is_ok());
+        assert!(restored.validate_executable_plan().is_err());
+    }
+
+    #[test]
+    fn schema_two_git_only_plan_remains_executable() {
+        let mut wire = serde_json::to_value(v3_test_plan(1)).unwrap();
+        wire["plan_schema_version"] = serde_json::json!(2);
+        let restored: OperationPlan = serde_json::from_value(wire).unwrap();
+        assert!(restored.validate_persisted().is_ok());
+        assert!(restored.validate_executable_plan().is_ok());
     }
 
     #[test]
@@ -2354,7 +3110,7 @@ mod tests {
         let component = OsString::from_vec(vec![b'n', 0xff]);
         let worktree = StoredPath::from(PathBuf::from("/r/w").join(&component));
         let artifact = StoredPath::from(PathBuf::from("/r/source").join(&component));
-        let mut plan = test_plan(2);
+        let mut plan = v3_test_plan(2);
         if let OperationIntent::Create(i) = &mut plan.intent {
             i.destination = Some(worktree.clone());
         }
@@ -2380,83 +3136,67 @@ mod tests {
             x.path = worktree.clone();
         }
         let artifact_destination = worktree.as_path().join("1");
-        if let StepAction::FileArtifact {
-            source,
-            destination,
-            ..
-        } = &mut plan.steps[1].action
-        {
-            *source = artifact.clone();
-            *destination = artifact_destination.clone().into();
-        }
+        let target_digest =
+            crate::planner::artifact_digest(artifact.as_path().as_os_str().as_encoded_bytes());
+        let desired = SymlinkStateV3 {
+            target: artifact.clone(),
+            target_digest,
+        };
+        let manifest_digest = crate::planner::canonical_manifest_digest_v3(
+            &[crate::planner::ManifestDescriptorV3::CreateSymlinkV3 {
+                source_root: StoredPath::from(PathBuf::from("/r")),
+                source: artifact.clone(),
+                expected_source: ArtifactSourceExpectationV3::Regular(RegularFileStateV3 {
+                    bytes: 1,
+                    digest: ObjectId::new("0000000000000000000000000000000000000000").unwrap(),
+                    mode: 0o644,
+                }),
+                destination: artifact_destination.clone().into(),
+                desired: desired.clone(),
+                sensitive: false,
+                confirm: false,
+            }],
+            worktree.as_path(),
+        );
+        plan.steps[1].action = StepAction::CreateSymlinkV3 {
+            rule: "rule-1".into(),
+            source_root: StoredPath::from(PathBuf::from("/r")),
+            source: artifact.clone(),
+            expected_source: ArtifactSourceExpectationV3::Regular(RegularFileStateV3 {
+                bytes: 1,
+                digest: ObjectId::new("0000000000000000000000000000000000000000").unwrap(),
+                mode: 0o644,
+            }),
+            destination: artifact_destination.clone().into(),
+            desired: desired.clone(),
+            manifest_digest: manifest_digest.clone(),
+            sensitive: false,
+            confirm: false,
+        };
         for guard in &mut plan.steps[1].preconditions {
-            if let Precondition::ArtifactSourceAt {
+            if let Precondition::ArtifactSourceAtV3 {
                 source,
-                destination,
+                manifest_digest: guard_digest,
                 ..
             } = guard
             {
                 *source = artifact.clone();
-                *destination = artifact_destination.clone().into();
+                *guard_digest = manifest_digest.clone();
             }
             if let Precondition::PathAbsent(path) = guard {
                 *path = artifact_destination.clone().into();
             }
         }
-        if let Some(Compensation::RemoveCreatedArtifact(x)) = &mut plan.steps[1].compensation {
-            x.path = artifact_destination.into();
-        }
-        let digest = if let StepAction::FileArtifact {
-            source,
-            destination,
-            kind,
-            bytes,
-            digest,
-            fingerprint,
-            link_target,
-            sensitive,
-            confirm,
-            mode_policy,
-            ..
-        } = plan.steps[1].action()
-        {
-            crate::planner::canonical_manifest_digest(
-                &[crate::planner::ManifestDigestArtifact {
-                    source_root: StoredPath::from(PathBuf::from("/r")),
-                    source: source.clone(),
-                    destination: destination.clone(),
-                    kind: *kind,
-                    bytes: *bytes,
-                    digest: digest.clone(),
-                    fingerprint: fingerprint.clone(),
-                    link_target: link_target.clone(),
-                    sensitive: *sensitive,
-                    confirm: *confirm,
-                    mode_policy: *mode_policy,
-                }],
-                worktree.as_path(),
-            )
-        } else {
-            unreachable!()
-        };
-        if let StepAction::FileArtifact {
-            manifest_digest, ..
-        } = &mut plan.steps[1].action
-        {
-            *manifest_digest = digest.clone();
-        }
-        for guard in &mut plan.steps[1].preconditions {
-            if let Precondition::ArtifactSourceAt {
-                manifest_digest, ..
-            } = guard
-            {
-                *manifest_digest = digest.clone();
-            }
-        }
+        plan.steps[1].compensation =
+            Some(Compensation::RemoveCreatedArtifactV3(CreatedArtifactV3 {
+                path: artifact_destination.clone().into(),
+                expected: ArtifactStateV3::Symlink(desired),
+                staging: None,
+            }));
         if let OperationIntent::Create(intent) = &mut plan.intent
             && let Some(contract) = intent.artifact_rule_contracts.get_mut("rule-1")
         {
-            contract.manifest_digest = digest.clone();
+            contract.manifest_digest = manifest_digest.clone();
         }
         let restored: OperationPlan =
             serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
@@ -2465,13 +3205,531 @@ mod tests {
             .validate_executable_plan()
             .unwrap_or_else(|error| panic!("non-UTF-8 plan: {error}"));
         let mut escaped = plan.clone();
-        if let StepAction::FileArtifact { destination, .. } = &mut escaped.steps[1].action {
+        if let StepAction::CreateSymlinkV3 { destination, .. } = &mut escaped.steps[1].action {
             *destination = StoredPath::from(PathBuf::from("/r/w/../x"));
         }
         assert!(escaped.validate_executable_plan().is_err());
-        if let StepAction::FileArtifact { destination, .. } = &mut escaped.steps[1].action {
+        if let StepAction::CreateSymlinkV3 { destination, .. } = &mut escaped.steps[1].action {
             *destination = StoredPath::from(PathBuf::from("/r/w/.git"));
         }
         assert!(escaped.validate_executable_plan().is_err());
+    }
+
+    fn relink_evidence_plan() -> OperationPlan {
+        let mut plan = v3_test_plan(2);
+        if let Some(Postcondition::WorktreeCreated { oid: value, .. }) = plan.steps[0]
+            .postconditions
+            .iter_mut()
+            .find(|post| matches!(post, Postcondition::WorktreeCreated { .. }))
+        {
+            *value = oid();
+        }
+        for guard in &mut plan.steps[0].preconditions {
+            if let Precondition::RefAt { oid: value, .. } = guard {
+                *value = oid();
+            }
+        }
+        for post in &mut plan.steps[0].postconditions {
+            if let Postcondition::BranchCreated { oid: value, .. } = post {
+                *value = oid();
+            }
+        }
+        if let Some(Compensation::RemoveCreatedWorktree(value)) = &mut plan.steps[0].compensation {
+            value.expected_oid = oid();
+        }
+        plan.preconditions = plan.steps[0].preconditions.clone();
+        let checkout = StoredPath::from(PathBuf::from("/r/w"));
+        let source_root = StoredPath::from(PathBuf::from("/r"));
+        let source = StoredPath::from(PathBuf::from("/r/source/new"));
+        let destination = StoredPath::from(PathBuf::from("/r/w/link"));
+        let desired_new = SymlinkStateV3 {
+            target: source.clone(),
+            target_digest: crate::planner::artifact_digest(
+                source.as_path().as_os_str().as_encoded_bytes(),
+            ),
+        };
+        let old_target = StoredPath::from(PathBuf::from("/r/source/old"));
+        let expected_old = SymlinkStateV3 {
+            target: old_target.clone(),
+            target_digest: crate::planner::artifact_digest(
+                old_target.as_path().as_os_str().as_encoded_bytes(),
+            ),
+        };
+        let replacement = crate::planner::artifact_staging_v3(
+            plan.operation_id(),
+            plan.steps[1].id(),
+            crate::planner::ArtifactStagingRoleV3::RelinkReplacement,
+            destination.as_path(),
+        )
+        .unwrap();
+        let backup = crate::planner::artifact_staging_v3(
+            plan.operation_id(),
+            plan.steps[1].id(),
+            crate::planner::ArtifactStagingRoleV3::RelinkBackup,
+            destination.as_path(),
+        )
+        .unwrap();
+        let descriptor = crate::planner::ManifestDescriptorV3::RelinkSymlinkV3 {
+            source_root: source_root.clone(),
+            source: source.clone(),
+            expected_source: desired_new.clone(),
+            checkout_oid: oid(),
+            checkout_relative_path: StoredPath::from(PathBuf::from("link")),
+            destination: destination.clone(),
+            expected_old: expected_old.clone(),
+            desired_new: desired_new.clone(),
+            replacement_staging: replacement.clone(),
+            backup_staging: backup.clone(),
+            sensitive: false,
+            confirm: false,
+        };
+        let digest =
+            crate::planner::canonical_manifest_digest_v3(&[descriptor], checkout.as_path());
+        plan.steps[1] = PlanStep::new(
+            StepId::new("step-1").unwrap(),
+            "step-1".into(),
+            StepAction::RelinkSymlinkV3 {
+                rule: "rule-1".into(),
+                source_root: source_root.clone(),
+                source: source.clone(),
+                expected_source: desired_new.clone(),
+                checkout_oid: oid(),
+                checkout_relative_path: StoredPath::from(PathBuf::from("link")),
+                destination: destination.clone(),
+                expected_old: expected_old.clone(),
+                desired_new: desired_new.clone(),
+                replacement_staging: replacement.clone(),
+                backup_staging: backup.clone(),
+                manifest_digest: digest.clone(),
+                sensitive: false,
+                confirm: false,
+            },
+            vec![
+                Precondition::ArtifactSourceAtV3 {
+                    rule: "rule-1".into(),
+                    source_root: source_root.clone(),
+                    source: source.clone(),
+                    expectation: ArtifactSourceExpectationV3::Symlink(desired_new.clone()),
+                    manifest_digest: digest.clone(),
+                },
+                Precondition::TreeSymlinkAtV3 {
+                    commit_oid: oid(),
+                    checkout_relative_path: StoredPath::from(PathBuf::from("link")),
+                    expected: expected_old.clone(),
+                },
+                Precondition::SymlinkAtV3 {
+                    path: destination.clone(),
+                    expected: expected_old.clone(),
+                },
+                Precondition::PathAbsent(replacement.path.clone()),
+                Precondition::PathAbsent(backup.path.clone()),
+            ],
+            vec![],
+            Some(Compensation::RestoreReplacedSymlinkV3(ReplacedSymlinkV3 {
+                path: destination,
+                expected_current: desired_new.clone(),
+                restore: expected_old,
+                replacement_staging: replacement,
+                backup_staging: backup,
+            })),
+            false,
+        )
+        .unwrap();
+        if let OperationIntent::Create(intent) = &mut plan.intent {
+            intent.destination = Some(checkout);
+            intent.artifact_rule_contracts.insert(
+                "rule-1".into(),
+                ArtifactRuleContract {
+                    provenance: ArtifactSourceProvenance::Primary,
+                    source_root,
+                    manifest_digest: digest,
+                },
+            );
+        }
+        let risk = Risk {
+            kind: RiskKind::ReplaceExistingSymlink,
+            message: "replace existing symlink".into(),
+        };
+        plan.risks = vec![risk.clone()];
+        plan.required_consents = vec![ConsentRequirement {
+            id: ConsentId::new("file-rule:rule-1").unwrap(),
+            risks: vec![risk],
+        }];
+        let consent = ConsentId::new("file-rule:rule-1").unwrap();
+        plan.granted_consents.insert(consent.clone());
+        if let OperationIntent::Create(intent) = &mut plan.intent {
+            intent.granted_consents.insert(consent);
+        }
+        plan
+    }
+
+    fn refresh_relink_manifest(plan: &mut OperationPlan) {
+        let (rule, digest) = {
+            let StepAction::RelinkSymlinkV3 {
+                rule,
+                source_root,
+                source,
+                expected_source,
+                checkout_oid,
+                checkout_relative_path,
+                destination,
+                expected_old,
+                desired_new,
+                replacement_staging,
+                backup_staging,
+                sensitive,
+                confirm,
+                manifest_digest,
+            } = plan.steps[1].action_mut()
+            else {
+                panic!("relink fixture")
+            };
+            let digest = crate::planner::canonical_manifest_digest_v3(
+                &[crate::planner::ManifestDescriptorV3::RelinkSymlinkV3 {
+                    source_root: source_root.clone(),
+                    source: source.clone(),
+                    expected_source: expected_source.clone(),
+                    checkout_oid: checkout_oid.clone(),
+                    checkout_relative_path: checkout_relative_path.clone(),
+                    destination: destination.clone(),
+                    expected_old: expected_old.clone(),
+                    desired_new: desired_new.clone(),
+                    replacement_staging: replacement_staging.clone(),
+                    backup_staging: backup_staging.clone(),
+                    sensitive: *sensitive,
+                    confirm: *confirm,
+                }],
+                PathBuf::from("/r/w").as_path(),
+            );
+            *manifest_digest = digest.clone();
+            (rule.clone(), digest)
+        };
+        for guard in plan.steps[1].preconditions_mut() {
+            if let Precondition::ArtifactSourceAtV3 {
+                manifest_digest: value,
+                ..
+            } = guard
+            {
+                *value = digest.clone();
+            }
+        }
+        if let OperationIntent::Create(intent) = &mut plan.intent {
+            intent
+                .artifact_rule_contracts
+                .get_mut(&rule)
+                .unwrap()
+                .manifest_digest = digest;
+        }
+    }
+
+    #[test]
+    fn relink_schema3_evidence_is_persisted_and_contract_executable() {
+        let plan = relink_evidence_plan();
+        assert!(plan.validate_persisted().is_ok());
+        plan.validate_executable_plan()
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[test]
+    fn relink_schema3_executable_mutation_matrix() {
+        type PlanMutation = Box<dyn Fn(&mut OperationPlan)>;
+        let cases: Vec<(&str, PlanMutation)> = vec![
+            (
+                "expected_source != desired_new",
+                Box::new(|p| {
+                    if let StepAction::RelinkSymlinkV3 {
+                        expected_source, ..
+                    } = p.steps[1].action_mut()
+                    {
+                        expected_source.target = StoredPath::from(PathBuf::from("/r/source/other"));
+                    }
+                }),
+            ),
+            (
+                "checkout_oid differs from create WorktreeCreated OID",
+                Box::new(|p| {
+                    if let StepAction::RelinkSymlinkV3 { checkout_oid, .. } =
+                        p.steps[1].action_mut()
+                    {
+                        *checkout_oid = other_oid();
+                    }
+                }),
+            ),
+            (
+                "checkout_relative_path differs",
+                Box::new(|p| {
+                    if let StepAction::RelinkSymlinkV3 {
+                        checkout_relative_path,
+                        ..
+                    } = p.steps[1].action_mut()
+                    {
+                        *checkout_relative_path = StoredPath::from(PathBuf::from("wrong"));
+                    }
+                }),
+            ),
+            (
+                "missing source guard",
+                Box::new(|p| {
+                    p.steps[1]
+                        .preconditions
+                        .retain(|x| !matches!(x, Precondition::ArtifactSourceAtV3 { .. }))
+                }),
+            ),
+            (
+                "duplicate source guard",
+                Box::new(|p| {
+                    let x = p.steps[1]
+                        .preconditions
+                        .iter()
+                        .find(|x| matches!(x, Precondition::ArtifactSourceAtV3 { .. }))
+                        .unwrap()
+                        .clone();
+                    p.steps[1].preconditions.push(x);
+                }),
+            ),
+            (
+                "missing tree guard",
+                Box::new(|p| {
+                    p.steps[1]
+                        .preconditions
+                        .retain(|x| !matches!(x, Precondition::TreeSymlinkAtV3 { .. }))
+                }),
+            ),
+            (
+                "duplicate tree guard",
+                Box::new(|p| {
+                    let x = p.steps[1]
+                        .preconditions
+                        .iter()
+                        .find(|x| matches!(x, Precondition::TreeSymlinkAtV3 { .. }))
+                        .unwrap()
+                        .clone();
+                    p.steps[1].preconditions.push(x);
+                }),
+            ),
+            (
+                "missing SymlinkAtV3 raw destination guard",
+                Box::new(|p| {
+                    p.steps[1]
+                        .preconditions
+                        .retain(|x| !matches!(x, Precondition::SymlinkAtV3 { .. }))
+                }),
+            ),
+            (
+                "duplicate SymlinkAtV3 raw destination guard",
+                Box::new(|p| {
+                    let x = p.steps[1]
+                        .preconditions
+                        .iter()
+                        .find(|x| matches!(x, Precondition::SymlinkAtV3 { .. }))
+                        .unwrap()
+                        .clone();
+                    p.steps[1].preconditions.push(x);
+                }),
+            ),
+            (
+                "missing replacement staging PathAbsent",
+                Box::new(|p| {
+                    p.steps[1].preconditions.retain(|x| !matches!(x, Precondition::PathAbsent(path) if path.as_path().to_string_lossy().contains("relink-replacement")))
+                }),
+            ),
+            (
+                "duplicate replacement staging PathAbsent",
+                Box::new(|p| {
+                    let x = p.steps[1].preconditions.iter().find(|x| matches!(x, Precondition::PathAbsent(path) if path.as_path().to_string_lossy().contains("relink-replacement"))).unwrap().clone();
+                    p.steps[1].preconditions.push(x);
+                }),
+            ),
+            (
+                "missing backup staging PathAbsent",
+                Box::new(|p| {
+                    p.steps[1].preconditions.retain(|x| !matches!(x, Precondition::PathAbsent(path) if path.as_path().to_string_lossy().contains("relink-backup")))
+                }),
+            ),
+            (
+                "duplicate backup staging PathAbsent",
+                Box::new(|p| {
+                    let x = p.steps[1].preconditions.iter().find(|x| matches!(x, Precondition::PathAbsent(path) if path.as_path().to_string_lossy().contains("relink-backup"))).unwrap().clone();
+                    p.steps[1].preconditions.push(x);
+                }),
+            ),
+            (
+                "old raw target changed while digest is stale",
+                Box::new(|p| {
+                    if let StepAction::RelinkSymlinkV3 { expected_old, .. } =
+                        p.steps[1].action_mut()
+                    {
+                        expected_old.target = StoredPath::from(PathBuf::from("/r/source/stale"));
+                    }
+                }),
+            ),
+            (
+                "compensation current/restore/staging mismatch",
+                Box::new(|p| {
+                    if let Some(Compensation::RestoreReplacedSymlinkV3(c)) =
+                        &mut p.steps[1].compensation
+                    {
+                        c.backup_staging.path = StoredPath::from(PathBuf::from("/r/bad"));
+                    }
+                }),
+            ),
+            (
+                "create WorktreeCreated missing",
+                Box::new(|p| {
+                    p.steps[0]
+                        .postconditions
+                        .retain(|x| !matches!(x, Postcondition::WorktreeCreated { .. }))
+                }),
+            ),
+            (
+                "create WorktreeCreated duplicate",
+                Box::new(|p| {
+                    let x = p.steps[0]
+                        .postconditions
+                        .iter()
+                        .find(|x| matches!(x, Postcondition::WorktreeCreated { .. }))
+                        .unwrap()
+                        .clone();
+                    p.steps[0].postconditions.push(x);
+                }),
+            ),
+            (
+                "create WorktreeCreated wrong path",
+                Box::new(|p| {
+                    if let Some(Postcondition::WorktreeCreated { path, .. }) = p.steps[0]
+                        .postconditions
+                        .iter_mut()
+                        .find(|x| matches!(x, Postcondition::WorktreeCreated { .. }))
+                    {
+                        *path = StoredPath::from(PathBuf::from("/r/other"));
+                    }
+                }),
+            ),
+            (
+                "create WorktreeCreated wrong OID",
+                Box::new(|p| {
+                    if let Some(Postcondition::WorktreeCreated { oid, .. }) = p.steps[0]
+                        .postconditions
+                        .iter_mut()
+                        .find(|x| matches!(x, Postcondition::WorktreeCreated { .. }))
+                    {
+                        *oid = other_oid();
+                    }
+                }),
+            ),
+            (
+                "coordinated action/tree fields changed",
+                Box::new(|p| {
+                    if let StepAction::RelinkSymlinkV3 { checkout_oid, .. } =
+                        p.steps[1].action_mut()
+                    {
+                        *checkout_oid = other_oid();
+                    }
+                    for x in p.steps[1].preconditions_mut() {
+                        if let Precondition::TreeSymlinkAtV3 { commit_oid, .. } = x {
+                            *commit_oid = other_oid();
+                        }
+                    }
+                    refresh_relink_manifest(p);
+                }),
+            ),
+        ];
+        for (name, mutate) in cases {
+            let mut plan = relink_evidence_plan();
+            mutate(&mut plan);
+            let wire = serde_json::to_value(plan).unwrap();
+            let restored: OperationPlan = serde_json::from_value(wire).unwrap();
+            assert!(restored.validate_persisted().is_ok(), "{name}: persisted");
+            assert!(
+                restored.validate_executable_plan().is_err(),
+                "{name}: executable"
+            );
+        }
+    }
+
+    #[test]
+    fn source_manifest_is_readable_but_not_executable_in_schema2_or_schema3() {
+        for version in [2, 3] {
+            let mut plan = v3_test_plan(1);
+            plan.plan_schema_version = version;
+            assert!(plan.validate_executable_plan().is_ok(), "schema {version}");
+            let guard = Precondition::SourceManifest {
+                rule: "legacy".into(),
+                source: StoredPath::from(PathBuf::from("/r/source")),
+                destination: StoredPath::from(PathBuf::from("/r/w/link")),
+                digest: oid(),
+            };
+            plan.preconditions.push(guard.clone());
+            plan.steps[0].preconditions.push(guard);
+            let restored: OperationPlan =
+                serde_json::from_value(serde_json::to_value(plan).unwrap()).unwrap();
+            assert!(restored.validate_persisted().is_ok(), "schema {version}");
+            assert!(
+                restored.validate_executable_plan().is_err(),
+                "schema {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_symlink_rejects_coherent_symlink_source_expectation() {
+        let mut plan = v3_test_plan(2);
+        let desired = match &plan.steps[1].action {
+            StepAction::CreateSymlinkV3 { desired, .. } => desired.clone(),
+            _ => panic!("fixture"),
+        };
+        let expectation = ArtifactSourceExpectationV3::Symlink(desired.clone());
+        if let StepAction::CreateSymlinkV3 {
+            expected_source,
+            manifest_digest,
+            source_root,
+            source,
+            destination,
+            sensitive,
+            confirm,
+            ..
+        } = plan.steps[1].action_mut()
+        {
+            *expected_source = expectation.clone();
+            *manifest_digest = crate::planner::canonical_manifest_digest_v3(
+                &[crate::planner::ManifestDescriptorV3::CreateSymlinkV3 {
+                    source_root: source_root.clone(),
+                    source: source.clone(),
+                    expected_source: expectation.clone(),
+                    destination: destination.clone(),
+                    desired,
+                    sensitive: *sensitive,
+                    confirm: *confirm,
+                }],
+                PathBuf::from("/r/w").as_path(),
+            );
+        }
+        let digest = match &plan.steps[1].action {
+            StepAction::CreateSymlinkV3 {
+                manifest_digest, ..
+            } => manifest_digest.clone(),
+            _ => unreachable!(),
+        };
+        for guard in &mut plan.steps[1].preconditions {
+            if let Precondition::ArtifactSourceAtV3 {
+                expectation: value,
+                manifest_digest: md,
+                ..
+            } = guard
+            {
+                *value = expectation.clone();
+                *md = digest.clone();
+            }
+        }
+        if let OperationIntent::Create(intent) = &mut plan.intent {
+            intent
+                .artifact_rule_contracts
+                .get_mut("rule-1")
+                .unwrap()
+                .manifest_digest = digest;
+        }
+        assert!(plan.validate_persisted().is_ok());
+        let error = plan.validate_executable_plan().unwrap_err();
+        assert!(error.contains("only") || error.contains("source expectation"));
     }
 }

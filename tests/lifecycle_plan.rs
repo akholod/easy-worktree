@@ -407,7 +407,7 @@ fn enabled_env_rule_is_manifested_without_writing_destination() {
     assert_eq!(output.status.code(), Some(0));
     let value = json(&output);
     assert_eq!(
-        value["data"]["steps"][1]["action"]["FileArtifact"]["rule"],
+        value["data"]["steps"][1]["action"]["CopyFileV3"]["rule"],
         "env"
     );
     assert_eq!(value["data"]["required_consents"][0]["id"], "file-rule:env");
@@ -544,7 +544,7 @@ fn unicode_and_space_paths_are_planned_without_lossy_ordering() {
     let steps = value["data"]["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 3);
     assert!(
-        steps[1]["action"]["FileArtifact"]["source"]
+        steps[1]["action"]["CopyFileV3"]["source"]
             .to_string()
             .contains("Ω")
     );

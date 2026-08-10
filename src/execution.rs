@@ -97,22 +97,57 @@ pub trait ExecutionBackend {
         &self,
         plan: &OperationPlan,
         step: Option<&PlanStep>,
+        phase: ConditionPhase,
         precondition: &Precondition,
     ) -> bool;
-    fn supports_action(&self, step: &PlanStep) -> bool;
-    fn probe_capability(&self, step: &PlanStep) -> ProbeCapability;
+    fn supports_action(&self, context: &StepExecutionContext<'_>) -> bool;
+    fn probe_capability(&self, context: &StepExecutionContext<'_>) -> ProbeCapability;
     fn check_precondition(
         &mut self,
         plan: &OperationPlan,
         step: Option<&PlanStep>,
+        phase: ConditionPhase,
         precondition: &Precondition,
     ) -> Result<ConditionResult, Self::Error>;
-    fn invoke(&mut self, step: &PlanStep) -> Result<(), Self::Error>;
+    fn invoke(&mut self, context: &StepExecutionContext<'_>) -> Result<(), Self::Error>;
     fn probe(
         &mut self,
-        step: &PlanStep,
+        context: &StepExecutionContext<'_>,
         context: ProbeContext,
     ) -> Result<ProbeVerdict, Self::Error>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionPhase {
+    InitialPreflight,
+    BeforeInvoke,
+}
+
+pub struct StepExecutionContext<'a> {
+    plan: &'a OperationPlan,
+    step: &'a PlanStep,
+}
+
+impl<'a> StepExecutionContext<'a> {
+    fn for_step(plan: &'a OperationPlan, step_id: &crate::lifecycle::StepId) -> Option<Self> {
+        plan.steps()
+            .iter()
+            .find(|candidate| candidate.id() == step_id)
+            .map(|step| Self { plan, step })
+    }
+    #[cfg(test)]
+    pub(crate) fn new(plan: &'a OperationPlan, step: &'a PlanStep) -> Self {
+        Self::for_step(plan, step.id()).expect("test step must belong to the plan")
+    }
+    pub fn plan(&self) -> &'a OperationPlan {
+        self.plan
+    }
+    pub fn operation_id(&self) -> &crate::lifecycle::OperationId {
+        self.plan.operation_id()
+    }
+    pub fn step(&self) -> &'a PlanStep {
+        self.step
+    }
 }
 
 pub struct ExecutionEngine<B> {
@@ -128,6 +163,15 @@ impl<B> ExecutionEngine<B> {
 }
 
 impl<B: ExecutionBackend> ExecutionEngine<B> {
+    fn context_for_step<'a>(
+        &self,
+        plan: &'a OperationPlan,
+        step: &'a PlanStep,
+    ) -> Result<StepExecutionContext<'a>, ExecutionError<B::Error>> {
+        StepExecutionContext::for_step(plan, step.id()).ok_or_else(|| {
+            ExecutionError::UnsupportedPlan("step is not a member of its operation plan".into())
+        })
+    }
     pub fn execute(
         &mut self,
         plan: OperationPlan,
@@ -141,6 +185,7 @@ impl<B: ExecutionBackend> ExecutionEngine<B> {
         {
             return Err(ExecutionError::MissingConsent(consent.id.clone()));
         }
+        self.scan_support(&plan)?;
         let discovered = self
             .backend
             .discover_repository()
@@ -148,7 +193,6 @@ impl<B: ExecutionBackend> ExecutionEngine<B> {
         if !self.backend.repository_matches_plan(&discovered, &plan) {
             return Err(ExecutionError::RepositoryIdentityMismatch);
         }
-        self.scan_support(&plan)?;
         let common = self.backend.repository_common_dir(&discovered).to_owned();
         let mut store = LockedJournalStore::acquire(&common)?;
         let rediscovered = self
@@ -173,7 +217,12 @@ impl<B: ExecutionBackend> ExecutionEngine<B> {
         let mut journal = Journal::new(plan.clone());
         store.write_new(&journal)?;
         for step in plan.steps() {
-            if let Some(condition) = self.check_all(&plan, Some(step), step.preconditions())? {
+            if let Some(condition) = self.check_all(
+                &plan,
+                Some(step),
+                ConditionPhase::BeforeInvoke,
+                step.preconditions(),
+            )? {
                 return Ok(ExecutionOutcome::Paused {
                     operation_id: *plan.operation_id(),
                     step_id: step.id().clone(),
@@ -185,9 +234,10 @@ impl<B: ExecutionBackend> ExecutionEngine<B> {
                 .start_step(step.id())
                 .map_err(|_| ExecutionError::Journal(JournalError::InvalidTransition))?;
             store.update(&previous, &journal)?;
-            let effect_error = self.backend.invoke(step);
+            let context = self.context_for_step(&plan, step)?;
+            let effect_error = self.backend.invoke(&context);
             let probe = self.backend.probe(
-                step,
+                &context,
                 ProbeContext::AfterAttempt {
                     executor_succeeded: effect_error.is_ok(),
                 },
@@ -227,29 +277,42 @@ impl<B: ExecutionBackend> ExecutionEngine<B> {
 
     fn scan_support(&self, plan: &OperationPlan) -> Result<(), ExecutionError<B::Error>> {
         for condition in plan.preconditions() {
-            if !self.backend.supports_precondition(plan, None, condition) {
+            if !self.backend.supports_precondition(
+                plan,
+                None,
+                ConditionPhase::InitialPreflight,
+                condition,
+            ) {
                 return Err(ExecutionError::UnsupportedPlan(
                     "unsupported plan precondition".into(),
                 ));
             }
         }
         for step in plan.steps() {
-            if step.preconditions().iter().any(|condition| {
-                !self
-                    .backend
-                    .supports_precondition(plan, Some(step), condition)
+            if [
+                ConditionPhase::InitialPreflight,
+                ConditionPhase::BeforeInvoke,
+            ]
+            .iter()
+            .any(|phase| {
+                step.preconditions().iter().any(|condition| {
+                    !self
+                        .backend
+                        .supports_precondition(plan, Some(step), *phase, condition)
+                })
             }) {
                 return Err(ExecutionError::UnsupportedPlan(
                     "unsupported step precondition".into(),
                 ));
             }
-            if !self.backend.supports_action(step) {
+            let context = self.context_for_step(plan, step)?;
+            if !self.backend.supports_action(&context) {
                 return Err(ExecutionError::UnsupportedPlan(format!(
                     "unsupported step {}",
                     step.name()
                 )));
             }
-            if self.backend.probe_capability(step) == ProbeCapability::Unsupported {
+            if self.backend.probe_capability(&context) == ProbeCapability::Unsupported {
                 return Err(ExecutionError::UnsupportedPlan(format!(
                     "unsupported probe for {}",
                     step.name()
@@ -262,12 +325,13 @@ impl<B: ExecutionBackend> ExecutionEngine<B> {
         &mut self,
         plan: &OperationPlan,
         step: Option<&PlanStep>,
+        phase: ConditionPhase,
         conditions: &[Precondition],
     ) -> Result<Option<Precondition>, ExecutionError<B::Error>> {
         for condition in conditions {
             match self
                 .backend
-                .check_precondition(plan, step, condition)
+                .check_precondition(plan, step, phase, condition)
                 .map_err(ExecutionError::Backend)?
             {
                 ConditionResult::Satisfied => {}
@@ -280,11 +344,21 @@ impl<B: ExecutionBackend> ExecutionEngine<B> {
         &mut self,
         plan: &OperationPlan,
     ) -> Result<Option<Precondition>, ExecutionError<B::Error>> {
-        if let Some(condition) = self.check_all(plan, None, plan.preconditions())? {
+        if let Some(condition) = self.check_all(
+            plan,
+            None,
+            ConditionPhase::InitialPreflight,
+            plan.preconditions(),
+        )? {
             return Ok(Some(condition));
         }
         for step in plan.steps() {
-            if let Some(condition) = self.check_all(plan, Some(step), step.preconditions())? {
+            if let Some(condition) = self.check_all(
+                plan,
+                Some(step),
+                ConditionPhase::InitialPreflight,
+                step.preconditions(),
+            )? {
                 return Ok(Some(condition));
             }
         }
@@ -323,16 +397,19 @@ impl<B: ExecutionBackend> ExecutionEngine<B> {
                 .repository_matches_plan(discovered, journal.plan())
             {
                 ProbeVerdict::Unknown
-            } else if self.backend.probe_capability(plan_step) == ProbeCapability::Deterministic {
-                match self
-                    .backend
-                    .probe(plan_step, ProbeContext::StartupReconciliation)
-                {
-                    Ok(value) => value,
-                    Err(_) => ProbeVerdict::Unknown,
-                }
             } else {
-                ProbeVerdict::Unknown
+                let context = self.context_for_step(journal.plan(), plan_step)?;
+                if self.backend.probe_capability(&context) != ProbeCapability::Deterministic {
+                    ProbeVerdict::Unknown
+                } else {
+                    match self
+                        .backend
+                        .probe(&context, ProbeContext::StartupReconciliation)
+                    {
+                        Ok(value) => value,
+                        Err(_) => ProbeVerdict::Unknown,
+                    }
+                }
             };
             let mut next = journal.clone();
             next.reconcile_step(
@@ -410,7 +487,7 @@ mod tests {
     };
     use serde_json::Value;
     use std::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
         collections::VecDeque,
         fs,
         path::{Path, PathBuf},
@@ -430,6 +507,7 @@ mod tests {
     struct FakeBackend {
         repository: RepositoryIdentity,
         events: Rc<RefCell<Vec<String>>>,
+        discoveries: Rc<Cell<usize>>,
         supports: bool,
         reject_second_action: bool,
         capability: ProbeCapability,
@@ -446,6 +524,7 @@ mod tests {
             Self {
                 repository: plan.repository().clone(),
                 events: Rc::new(RefCell::new(Vec::new())),
+                discoveries: Rc::new(Cell::new(0)),
                 supports: true,
                 reject_second_action: false,
                 capability: ProbeCapability::Deterministic,
@@ -463,6 +542,7 @@ mod tests {
         type Error = FakeError;
         type Repository = RepositoryIdentity;
         fn discover_repository(&mut self) -> Result<Self::Repository, Self::Error> {
+            self.discoveries.set(1);
             Ok(self.repository.clone())
         }
         fn repository_common_dir<'a>(&self, repository: &'a Self::Repository) -> &'a Path {
@@ -479,19 +559,21 @@ mod tests {
             &self,
             _plan: &OperationPlan,
             _step: Option<&PlanStep>,
+            _phase: ConditionPhase,
             _condition: &Precondition,
         ) -> bool {
             self.supports
         }
-        fn supports_action(&self, step: &PlanStep) -> bool {
+        fn supports_action(&self, context: &StepExecutionContext<'_>) -> bool {
             self.supports
-                && !(self.reject_second_action
-                    && matches!(step.action(), StepAction::FileArtifact { destination, .. } if destination.as_path().to_string_lossy().ends_with("/1")))
+                && !(self.reject_second_action && context.step().id().as_str() == "step-1")
         }
-        fn probe_capability(&self, step: &PlanStep) -> ProbeCapability {
+        fn probe_capability(&self, context: &StepExecutionContext<'_>) -> ProbeCapability {
             if !self.supports {
                 ProbeCapability::Unsupported
-            } else if self.run_task_unknown && matches!(step.action(), StepAction::RunTask { .. }) {
+            } else if self.run_task_unknown
+                && matches!(context.step().action(), StepAction::RunTask { .. })
+            {
                 ProbeCapability::UnknownAfterCrash
             } else {
                 self.capability.clone()
@@ -501,6 +583,7 @@ mod tests {
             &mut self,
             _plan: &OperationPlan,
             _step: Option<&PlanStep>,
+            _phase: ConditionPhase,
             _condition: &Precondition,
         ) -> Result<ConditionResult, Self::Error> {
             self.checks += 1;
@@ -513,7 +596,8 @@ mod tests {
                 Ok(ConditionResult::Satisfied)
             }
         }
-        fn invoke(&mut self, step: &PlanStep) -> Result<(), Self::Error> {
+        fn invoke(&mut self, context: &StepExecutionContext<'_>) -> Result<(), Self::Error> {
+            let step = context.step();
             let journal = JournalStore::new(self.repository.common_dir.as_path())
                 .read(&self.operation_id)
                 .ok();
@@ -542,12 +626,13 @@ mod tests {
         }
         fn probe(
             &mut self,
-            step: &PlanStep,
-            context: ProbeContext,
+            context: &StepExecutionContext<'_>,
+            probe_context: ProbeContext,
         ) -> Result<ProbeVerdict, Self::Error> {
+            let step = context.step();
             self.events
                 .borrow_mut()
-                .push(format!("probe:{}:{context:?}", step.name()));
+                .push(format!("probe:{}:{probe_context:?}", step.name()));
             self.probes.pop_front().unwrap_or(Ok(ProbeVerdict::Applied))
         }
     }
@@ -555,7 +640,7 @@ mod tests {
     fn make_plan(temp: &TempDir, count: usize) -> OperationPlan {
         let root = temp.path().to_string_lossy().to_string();
         fs::create_dir_all(temp.path().join(".git")).unwrap();
-        let mut value = serde_json::to_value(crate::lifecycle::test_plan(count)).unwrap();
+        let mut value = serde_json::to_value(crate::lifecycle::v3_test_plan(count)).unwrap();
         fn replace(value: &mut Value, root: &str) {
             match value {
                 Value::String(text) if text == "/r/.git" => {
@@ -575,11 +660,12 @@ mod tests {
             }
         }
         replace(&mut value, &root);
+        refresh_v3_fixture(&mut value);
         serde_json::from_value(value).unwrap()
     }
     fn alternate_plan(root: &Path) -> OperationPlan {
         let root_string = root.to_string_lossy().to_string();
-        let mut value = serde_json::to_value(crate::lifecycle::test_plan(1)).unwrap();
+        let mut value = serde_json::to_value(crate::lifecycle::v3_test_plan(1)).unwrap();
         fn replace(value: &mut Value, root: &str) {
             match value {
                 Value::String(text) if text == "/r/.git" => {
@@ -599,7 +685,62 @@ mod tests {
             }
         }
         replace(&mut value, &root_string);
+        refresh_v3_fixture(&mut value);
         serde_json::from_value(value).unwrap()
+    }
+
+    fn refresh_v3_fixture(value: &mut Value) {
+        if value["steps"]
+            .as_array()
+            .is_none_or(|steps| steps.len() < 2)
+        {
+            return;
+        }
+        let action: StepAction =
+            serde_json::from_value(value["steps"][1]["action"].clone()).unwrap();
+        let StepAction::CreateSymlinkV3 {
+            rule,
+            source_root,
+            source,
+            expected_source,
+            destination,
+            desired,
+            sensitive,
+            confirm,
+            ..
+        } = action
+        else {
+            return;
+        };
+        let target_digest = crate::planner::artifact_digest(
+            desired.target.as_path().as_os_str().as_encoded_bytes(),
+        );
+        let desired = crate::lifecycle::SymlinkStateV3 {
+            target: desired.target,
+            target_digest,
+        };
+        let digest = crate::planner::canonical_manifest_digest_v3(
+            &[crate::planner::ManifestDescriptorV3::CreateSymlinkV3 {
+                source_root: source_root.clone(),
+                source: source.clone(),
+                expected_source: expected_source.clone(),
+                destination: destination.clone(),
+                desired: desired.clone(),
+                sensitive,
+                confirm,
+            }],
+            destination.as_path().parent().unwrap(),
+        );
+        value["steps"][1]["action"]["CreateSymlinkV3"]["desired"] =
+            serde_json::to_value(&desired).unwrap();
+        value["steps"][1]["action"]["CreateSymlinkV3"]["manifest_digest"] =
+            serde_json::json!(digest.as_str());
+        value["steps"][1]["preconditions"][0]["ArtifactSourceAtV3"]["manifest_digest"] =
+            serde_json::json!(digest.as_str());
+        value["steps"][1]["compensation"]["RemoveCreatedArtifactV3"]["expected"] =
+            serde_json::json!({"Symlink": desired});
+        value["intent"]["Create"]["artifact_rule_contracts"][rule.as_str()]["manifest_digest"] =
+            serde_json::json!(digest.as_str());
     }
     fn journal(plan: &OperationPlan) -> Journal {
         Journal::new(plan.clone())
@@ -608,6 +749,25 @@ mod tests {
         fs::read_dir(path)
             .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
             .unwrap_or_default()
+    }
+
+    fn repository_snapshot(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        fn collect(root: &Path, path: &Path, snapshot: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+            let relative = path.strip_prefix(root).unwrap().to_owned();
+            let metadata = fs::symlink_metadata(path).unwrap();
+            if metadata.is_dir() {
+                snapshot.push((relative, None));
+                for entry in fs::read_dir(path).unwrap() {
+                    collect(root, &entry.unwrap().path(), snapshot);
+                }
+            } else {
+                snapshot.push((relative, Some(fs::read(path).unwrap())));
+            }
+        }
+        let mut snapshot = Vec::new();
+        collect(root, root, &mut snapshot);
+        snapshot.sort_by(|left, right| left.0.cmp(&right.0));
+        snapshot
     }
 
     fn preflight_count(plan: &OperationPlan) -> usize {
@@ -759,11 +919,11 @@ mod tests {
         let mut backend = FakeBackend::new(&plan);
         backend.run_task_unknown = true;
         assert_eq!(
-            backend.probe_capability(&plan.steps()[0]),
+            backend.probe_capability(&StepExecutionContext::new(&plan, &plan.steps()[0])),
             ProbeCapability::Deterministic
         );
         assert_eq!(
-            backend.probe_capability(&plan.steps()[1]),
+            backend.probe_capability(&StepExecutionContext::new(&plan, &plan.steps()[1])),
             ProbeCapability::UnknownAfterCrash
         );
     }
@@ -1203,6 +1363,105 @@ mod tests {
             JournalStore::new(requested.repository().common_dir.as_path())
                 .read(requested.operation_id())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn schema2_source_manifest_running_journal_is_skipped_during_plan_b_refusal() {
+        let _guard = crate::journal_store::test_fault_guard();
+        let temp = TempDir::new().unwrap();
+        let historical = make_plan(&temp, 1);
+        let mut wire = serde_json::to_value(&historical).unwrap();
+        wire["plan_schema_version"] = Value::from(2);
+        let source_manifest = serde_json::json!({
+            "SourceManifest": {
+                "rule": "legacy-source",
+                "source": "/r/source",
+                "destination": "/r/w",
+                "digest": "0000000000000000000000000000000000000000"
+            }
+        });
+        wire["preconditions"]
+            .as_array_mut()
+            .unwrap()
+            .push(source_manifest.clone());
+        wire["steps"][0]["preconditions"]
+            .as_array_mut()
+            .unwrap()
+            .push(source_manifest);
+        let historical: OperationPlan = serde_json::from_value(wire).unwrap();
+        assert!(historical.validate_persisted().is_ok());
+        assert!(historical.validate_executable_plan().is_err());
+
+        let common = historical.repository().common_dir.as_path().to_owned();
+        let mut store = LockedJournalStore::acquire(&common).unwrap();
+        let initial = journal(&historical);
+        store.write_new(&initial).unwrap();
+        let mut running = initial.clone();
+        running
+            .start_step(&running.steps()[0].id().clone())
+            .unwrap();
+        store.update(&initial, &running).unwrap();
+        drop(store);
+
+        let journal_path = common
+            .join("ewtm/journal")
+            .join(format!("{}.json", historical.operation_id()));
+        let before_journal = fs::read(&journal_path).unwrap();
+        let before_repository = repository_snapshot(temp.path());
+        let mut before_ewtm = files(&common.join("ewtm"));
+        before_ewtm.sort();
+        let requested = make_plan(&temp, 1);
+        assert_ne!(historical.operation_id(), requested.operation_id());
+        assert_eq!(historical.repository(), requested.repository());
+        let mut backend = FakeBackend::new(&requested);
+        backend.fail_check_after = Some(1);
+        let events = backend.events.clone();
+        let discoveries = backend.discoveries.clone();
+        let result = ExecutionEngine::new(backend).execute(requested.clone());
+
+        // Plan B is refused as an unresolved existing operation after A is skipped;
+        // the ordinary-precondition guard ensures no B preflight is accidentally reached.
+        assert!(matches!(
+            result,
+            Ok(ExecutionOutcome::ExistingOperation {
+                operation_id,
+                status: OperationStatus::Running,
+            }) if operation_id == *historical.operation_id()
+        ));
+        let events = events.borrow();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("check:"))
+                .count(),
+            0
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("probe:"))
+                .count(),
+            0
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("invoke:"))
+                .count(),
+            0
+        );
+        assert_eq!(discoveries.get(), 1);
+        let mut after_ewtm = files(&common.join("ewtm"));
+        after_ewtm.sort();
+        assert_eq!(after_ewtm, before_ewtm);
+        assert_eq!(fs::read(&journal_path).unwrap(), before_journal);
+        assert_eq!(repository_snapshot(temp.path()), before_repository);
+        assert!(
+            !common
+                .join("ewtm/journal")
+                .join(format!("{}.json", requested.operation_id()))
+                .exists()
         );
     }
 

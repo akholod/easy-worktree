@@ -22,7 +22,7 @@ use crate::{
     },
     lifecycle::{
         BranchName, Compensation, CreateSource, CreatedArtifact, ObjectId, RefName, RemoteBranch,
-        RemoteName, ReplacedSymlink, RepositoryIdentity,
+        RemoteName, RepositoryIdentity,
     },
     planner::{
         self, CreateSourceFacts, DestinationFacts, DestinationState, FileActionManifest,
@@ -762,76 +762,83 @@ fn make_artifact(
     source: PathBuf,
     destination: PathBuf,
 ) -> Result<FileArtifact, PlanningError> {
-    let metadata = std::fs::symlink_metadata(&source)
-        .map_err(|error| planning("source_read", &error.to_string()))?;
-    let (kind, bytes, digest, fingerprint, link_target, compensation) = match spec.kind {
-        crate::config::FileRuleKind::Copy | crate::config::FileRuleKind::CopyTree => {
-            if !metadata.is_file() {
-                return Err(planning(
-                    "source_type",
-                    "copy source must be a regular file",
-                ));
+    if spec.kind == crate::config::FileRuleKind::Relink {
+        return Err(planning(
+            "relink_v3_unavailable",
+            "relink planning is unavailable in v3",
+        ));
+    }
+    let observed = readonly_observe_absolute_node(&source)
+        .map_err(|error| planning("source_read", &error.to_string()))?
+        .ok_or_else(|| planning("source_read", "source disappeared or is not observable"))?;
+    let (kind, bytes, digest, fingerprint, link_target, compensation, source_expectation) =
+        match spec.kind {
+            crate::config::FileRuleKind::Copy | crate::config::FileRuleKind::CopyTree => {
+                let ObservedNode::Regular { bytes: data, mode } = observed else {
+                    return Err(planning(
+                        "source_type",
+                        "copy source must be a regular file",
+                    ));
+                };
+                let digest = digest_bytes(&data);
+                (
+                    FileArtifactKind::CopyFile,
+                    data.len() as u64,
+                    digest.clone(),
+                    digest.clone(),
+                    None,
+                    Some(Compensation::RemoveCreatedArtifact(CreatedArtifact {
+                        path: StoredPath::from(destination.clone()),
+                        fingerprint: digest.clone(),
+                    })),
+                    crate::lifecycle::ArtifactSourceExpectationV3::Regular(
+                        crate::lifecycle::RegularFileStateV3 {
+                            bytes: data.len() as u64,
+                            digest: digest.clone(),
+                            mode,
+                        },
+                    ),
+                )
             }
-            let data = std::fs::read(&source)
-                .map_err(|error| planning("source_read", &error.to_string()))?;
-            let digest = digest_bytes(&data);
-            (
-                FileArtifactKind::CopyFile,
-                data.len() as u64,
-                digest.clone(),
-                digest.clone(),
-                None,
-                Some(Compensation::RemoveCreatedArtifact(CreatedArtifact {
-                    path: StoredPath::from(destination.clone()),
-                    fingerprint: digest,
-                })),
-            )
-        }
-        crate::config::FileRuleKind::Symlink => {
-            if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
-                return Err(planning(
-                    "source_type",
-                    "symlink source must be a regular file or directory",
-                ));
+            crate::config::FileRuleKind::Symlink => {
+                let source_expectation = match observed {
+                    ObservedNode::Regular { bytes, mode } => {
+                        crate::lifecycle::ArtifactSourceExpectationV3::Regular(
+                            crate::lifecycle::RegularFileStateV3 {
+                                bytes: bytes.len() as u64,
+                                digest: digest_bytes(&bytes),
+                                mode,
+                            },
+                        )
+                    }
+                    ObservedNode::Directory => {
+                        crate::lifecycle::ArtifactSourceExpectationV3::Directory
+                    }
+                    ObservedNode::Symlink { .. } => {
+                        return Err(planning(
+                            "source_type",
+                            "symlink source must be a regular file or directory",
+                        ));
+                    }
+                };
+                let target = StoredPath::from(source.clone());
+                let bytes = target.as_path().as_os_str().as_encoded_bytes();
+                let digest = digest_bytes(bytes);
+                (
+                    FileArtifactKind::CreateSymlink,
+                    bytes.len() as u64,
+                    digest.clone(),
+                    digest.clone(),
+                    Some(target.clone()),
+                    Some(Compensation::RemoveCreatedArtifact(CreatedArtifact {
+                        path: StoredPath::from(destination.clone()),
+                        fingerprint: digest.clone(),
+                    })),
+                    source_expectation,
+                )
             }
-            let target = StoredPath::from(source.clone());
-            let bytes = target.as_path().as_os_str().as_encoded_bytes();
-            let digest = digest_bytes(bytes);
-            (
-                FileArtifactKind::CreateSymlink,
-                bytes.len() as u64,
-                digest.clone(),
-                digest.clone(),
-                Some(target.clone()),
-                Some(Compensation::RemoveCreatedArtifact(CreatedArtifact {
-                    path: StoredPath::from(destination.clone()),
-                    fingerprint: digest,
-                })),
-            )
-        }
-        crate::config::FileRuleKind::Relink => {
-            if !metadata.file_type().is_symlink() {
-                return Err(planning("source_type", "relink source must be a symlink"));
-            }
-            let target = std::fs::read_link(&source)
-                .map_err(|error| planning("source_read", &error.to_string()))?;
-            let target = StoredPath::from(target);
-            let bytes = target.as_path().as_os_str().as_encoded_bytes();
-            let digest = digest_bytes(bytes);
-            (
-                FileArtifactKind::RelinkSymlink,
-                bytes.len() as u64,
-                digest.clone(),
-                digest.clone(),
-                Some(target.clone()),
-                Some(Compensation::RestoreReplacedSymlink(ReplacedSymlink {
-                    path: StoredPath::from(destination.clone()),
-                    expected_current: digest.clone(),
-                    original_target: target,
-                })),
-            )
-        }
-    };
+            crate::config::FileRuleKind::Relink => unreachable!(),
+        };
     let _ = root;
     Ok(FileArtifact {
         kind,
@@ -839,6 +846,7 @@ fn make_artifact(
         destination: StoredPath::from(destination),
         bytes,
         digest,
+        source_expectation,
         fingerprint,
         link_target,
         sensitive: spec.sensitive,
@@ -2495,36 +2503,21 @@ mod tests {
             skipped_rules: BTreeSet::new(),
             granted_consents: BTreeSet::new(),
         };
-        for (source, target) in [
-            ("relative", "file"),
-            ("absolute", temp.path().join("file").to_str().unwrap()),
-        ] {
+        for source in ["relative", "absolute"] {
             let rule = manifest_rule(
                 &format!(
                     "schema = 1\n[file_rules.link]\nkind = \"relink\"\nsource = \"{source}\"\ndestination = \"{source}-out\"\non_conflict = \"replace_symlink_only\"\n"
                 ),
                 "link",
             );
-            let artifact = &GitCli
+            let error = GitCli
                 .plan_manifests(
                     &request,
                     &manifest_facts(temp.path(), &temp.path().join("future")),
                     vec![rule],
                 )
-                .unwrap()[0]
-                .artifacts[0];
-            assert_eq!(
-                artifact.link_target.as_ref().unwrap().as_path(),
-                Path::new(target)
-            );
-            assert_eq!(
-                artifact.compensation.as_ref().unwrap(),
-                &Compensation::RestoreReplacedSymlink(ReplacedSymlink {
-                    path: artifact.destination.clone(),
-                    expected_current: artifact.fingerprint.clone(),
-                    original_target: StoredPath::from(PathBuf::from(target))
-                })
-            );
+                .unwrap_err();
+            assert_eq!(error.code, "relink_v3_unavailable");
         }
     }
 
@@ -2646,7 +2639,14 @@ mod tests {
             destination: StoredPath::from(temp.path().join("future/a")),
             bytes: 1,
             digest: a.clone(),
-            fingerprint: a,
+            fingerprint: a.clone(),
+            source_expectation: crate::lifecycle::ArtifactSourceExpectationV3::Regular(
+                crate::lifecycle::RegularFileStateV3 {
+                    bytes: 1,
+                    digest: a.clone(),
+                    mode: 0o644,
+                },
+            ),
             link_target: None,
             sensitive: false,
             mode_policy: crate::planner::FileModePolicy::PreserveSafe,
@@ -2817,7 +2817,7 @@ mod tests {
                 "schema = 1\n[file_rules.x]\nkind = \"relink\"\nsource = \"link\"\ndestination = \"link\"\non_conflict = \"replace_symlink_only\"\n",
                 "x",
             );
-            let manifests = GitCli
+            let error = GitCli
                 .plan_manifests(
                     &crate::application::CreatePlanRequest {
                         repo: temp.path().to_owned(),
@@ -2834,15 +2834,8 @@ mod tests {
                     &manifest_facts(temp.path(), &temp.path().join("future")),
                     vec![relink],
                 )
-                .unwrap();
-            assert_eq!(
-                manifests[0].artifacts[0]
-                    .link_target
-                    .as_ref()
-                    .unwrap()
-                    .as_path(),
-                Path::new("target/file")
-            );
+                .unwrap_err();
+            assert_eq!(error.code, "relink_v3_unavailable");
         }
     }
 
