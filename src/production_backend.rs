@@ -1532,7 +1532,10 @@ mod tests {
                 StepAction::CreateSymlinkV3 { desired, .. } => desired.target.clone().into_path(),
                 _ => unreachable!(),
             };
-            assert_eq!(fs::read_link(artifact_destination(&plan)).unwrap(), desired_target);
+            assert_eq!(
+                fs::read_link(artifact_destination(&plan)).unwrap(),
+                desired_target
+            );
             assert_eq!(
                 artifact_probe(&mut ProductionBackend::new(root.to_owned()), &plan),
                 ProbeVerdict::Applied
