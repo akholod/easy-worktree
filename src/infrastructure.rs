@@ -3141,27 +3141,28 @@ mod tests {
     #[test]
     fn relink_reads_old_target_from_exact_checkout_commit() {
         let temp = TempDir::new().unwrap();
-        run_git(temp.path(), ["init"]);
-        std::fs::write(temp.path().join("payload"), b"payload").unwrap();
-        std::os::unix::fs::symlink("old\n", temp.path().join("link")).unwrap();
-        run_git(temp.path(), ["add", "."]);
-        run_git(temp.path(), ["commit", "-m", "old"]);
-        let checkout_oid = git_oid(temp.path(), "HEAD").unwrap();
-        std::fs::remove_file(temp.path().join("link")).unwrap();
-        std::os::unix::fs::symlink("new\n", temp.path().join("link")).unwrap();
-        run_git(temp.path(), ["add", "."]);
-        run_git(temp.path(), ["commit", "-m", "moved-head"]);
-        std::os::unix::fs::symlink("new\n", temp.path().join("source-link")).unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        run_git(&root, ["init"]);
+        std::fs::write(root.join("payload"), b"payload").unwrap();
+        std::os::unix::fs::symlink("old\n", root.join("link")).unwrap();
+        run_git(&root, ["add", "."]);
+        run_git(&root, ["commit", "-m", "old"]);
+        let checkout_oid = git_oid(&root, "HEAD").unwrap();
+        std::fs::remove_file(root.join("link")).unwrap();
+        std::os::unix::fs::symlink("new\n", root.join("link")).unwrap();
+        run_git(&root, ["add", "."]);
+        run_git(&root, ["commit", "-m", "moved-head"]);
+        std::os::unix::fs::symlink("new\n", root.join("source-link")).unwrap();
 
-        let destination = temp.path().join("future");
-        let mut facts = manifest_facts(temp.path(), &destination);
+        let destination = root.join("future");
+        let mut facts = manifest_facts(&root, &destination);
         facts.repository.repository_oid = checkout_oid.clone();
         if let CreateSourceFacts::NewBranch { base_oid, .. } = &mut facts.source_facts {
             *base_oid = checkout_oid.clone();
         }
         let request = crate::application::CreatePlanRequest {
-            repo: temp.path().to_owned(),
-            invocation_cwd: temp.path().to_owned(),
+            repo: root.clone(),
+            invocation_cwd: root.clone(),
             source: crate::application::CreateSourceRequest::New {
                 branch: "feature".into(),
                 base: Some("HEAD".into()),
