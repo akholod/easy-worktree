@@ -1993,6 +1993,215 @@ pub(crate) fn readonly_ongoing(path: &Path) -> Result<bool, GitError> {
     ongoing_git_operation(path).map_err(|error| GitError::Command(error.message))
 }
 
+pub(crate) fn readonly_ref_is_symbolic(cwd: &Path, reference: &str) -> Result<bool, GitError> {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(["symbolic-ref", "--quiet", reference])
+        .output()
+        .map_err(|error| GitError::Command(error.to_string()))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(GitError::Command(
+            String::from_utf8_lossy(&output.stderr).trim().into(),
+        )),
+    }
+}
+
+fn mutation_git(cwd: &Path, args: Vec<OsString>) -> Result<(), GitError> {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .map_err(|error| GitError::Command(error.to_string()))?;
+    if !output.status.success() {
+        return Err(GitError::Command(
+            String::from_utf8_lossy(&output.stderr).trim().into(),
+        ));
+    }
+    #[cfg(test)]
+    if let Some(error) = test_mutation_success_error() {
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+struct MutationFaultState {
+    remaining: bool,
+    invocations: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MUTATION_FAULT: std::cell::RefCell<MutationFaultState> =
+        const { std::cell::RefCell::new(MutationFaultState { remaining: false, invocations: 0 }) };
+}
+
+#[cfg(test)]
+pub(crate) struct MutationFaultGuard;
+
+#[cfg(test)]
+pub(crate) fn arm_mutation_success_error() -> MutationFaultGuard {
+    MUTATION_FAULT.with(|state| {
+        let mut state = state.borrow_mut();
+        state.remaining = true;
+        state.invocations = 0;
+    });
+    MutationFaultGuard
+}
+
+#[cfg(test)]
+pub(crate) fn mutation_invocation_count() -> usize {
+    MUTATION_FAULT.with(|state| state.borrow().invocations)
+}
+
+#[cfg(test)]
+fn test_mutation_success_error() -> Option<GitError> {
+    MUTATION_FAULT.with(|state| {
+        let mut state = state.borrow_mut();
+        state.invocations += 1;
+        state.remaining.then(|| {
+            state.remaining = false;
+            GitError::Command("injected post-success mutation error".into())
+        })
+    })
+}
+
+#[cfg(test)]
+impl Drop for MutationFaultGuard {
+    fn drop(&mut self) {
+        MUTATION_FAULT.with(|state| {
+            let mut state = state.borrow_mut();
+            state.remaining = false;
+            state.invocations = 0;
+        });
+    }
+}
+
+pub(crate) fn mutate_create_worktree(
+    cwd: &Path,
+    destination: &Path,
+    source: &crate::lifecycle::CreateSource,
+    source_oid: &crate::lifecycle::ObjectId,
+) -> Result<(), GitError> {
+    let destination = destination.as_os_str().to_owned();
+    let args = match source {
+        crate::lifecycle::CreateSource::NewBranch { branch, base: _ } => {
+            let args = vec![
+                OsString::from("worktree"),
+                OsString::from("add"),
+                OsString::from("--no-track"),
+                OsString::from("-b"),
+                OsString::from(branch.as_str()),
+                destination,
+                OsString::from(source_oid.as_str()),
+            ];
+            args
+        }
+        crate::lifecycle::CreateSource::ExistingLocal { branch } => {
+            let reference = format!("refs/heads/{branch}");
+            if readonly_ref_oid(cwd, &reference)? != Some(source_oid.clone()) {
+                return Err(GitError::Command(
+                    "existing local branch OID changed".into(),
+                ));
+            }
+            vec![
+                OsString::from("worktree"),
+                OsString::from("add"),
+                destination,
+                OsString::from(reference),
+            ]
+        }
+        crate::lifecycle::CreateSource::RemoteTracking {
+            remote,
+            remote_branch,
+            local_branch,
+        } => {
+            readonly_validate_remote(cwd, remote.as_str())?;
+            let reference = format!("refs/remotes/{remote}/{remote_branch}");
+            if readonly_ref_oid(cwd, &reference)? != Some(source_oid.clone()) {
+                return Err(GitError::Command("remote-tracking ref OID changed".into()));
+            }
+            vec![
+                OsString::from("worktree"),
+                OsString::from("add"),
+                OsString::from("--track"),
+                OsString::from("-b"),
+                OsString::from(local_branch.as_str()),
+                destination,
+                OsString::from(reference),
+            ]
+        }
+    };
+    mutation_git(cwd, args)
+}
+
+pub(crate) fn mutate_remove_worktree(cwd: &Path, path: &Path) -> Result<(), GitError> {
+    mutation_git(
+        cwd,
+        vec![
+            OsString::from("worktree"),
+            OsString::from("remove"),
+            path.as_os_str().to_owned(),
+        ],
+    )
+}
+
+pub(crate) fn mutate_delete_local_branch(
+    cwd: &Path,
+    branch: &str,
+    expected: &crate::lifecycle::ObjectId,
+) -> Result<(), GitError> {
+    if expected.as_str().chars().all(|value| value == '0') {
+        return Err(GitError::Parse(
+            "zero object id is not a deletion lease".into(),
+        ));
+    }
+    let reference = format!("refs/heads/{branch}");
+    if readonly_ref_is_symbolic(cwd, &reference)? {
+        return Err(GitError::Parse(
+            "symbolic local branch ref cannot be deleted".into(),
+        ));
+    }
+    mutation_git(
+        cwd,
+        vec![
+            OsString::from("update-ref"),
+            OsString::from("--no-deref"),
+            OsString::from("-d"),
+            OsString::from(reference),
+            OsString::from(expected.as_str()),
+        ],
+    )
+}
+
+pub(crate) fn mutate_delete_remote_branch(
+    cwd: &Path,
+    remote: &str,
+    branch: &str,
+    expected: &crate::lifecycle::ObjectId,
+) -> Result<(), GitError> {
+    if expected.as_str().chars().all(|value| value == '0') {
+        return Err(GitError::Parse(
+            "zero object id is not a deletion lease".into(),
+        ));
+    }
+    readonly_validate_remote(cwd, remote)?;
+    mutation_git(
+        cwd,
+        vec![
+            OsString::from("push"),
+            OsString::from(format!(
+                "--force-with-lease=refs/heads/{branch}:{}",
+                expected.as_str()
+            )),
+            OsString::from(remote),
+            OsString::from(format!(":refs/heads/{branch}")),
+        ],
+    )
+}
+
 fn git<I, A>(cwd: &Path, args: I) -> Result<Output, GitError>
 where
     I: IntoIterator<Item = A>,

@@ -67,6 +67,51 @@ impl ProductionBackend {
         Ok(infrastructure::readonly_safe_directory(path)?)
     }
 
+    fn create_source_oid(&self, step: &PlanStep) -> Result<ObjectId, ProductionBackendError> {
+        let StepAction::CreateWorktree { source, .. } = step.action() else {
+            return Err(ProductionBackendError::UnsupportedObservation(
+                "create contract requested for non-create action",
+            ));
+        };
+        let expected_ref = match source {
+            crate::lifecycle::CreateSource::NewBranch { base, .. } => base
+                .as_ref()
+                .map_or("HEAD", |value| value.as_str())
+                .to_owned(),
+            crate::lifecycle::CreateSource::ExistingLocal { branch } => branch.as_str().to_owned(),
+            crate::lifecycle::CreateSource::RemoteTracking {
+                remote,
+                remote_branch,
+                ..
+            } => format!("refs/remotes/{remote}/{remote_branch}"),
+        };
+        let matches: Vec<_> = step
+            .preconditions()
+            .iter()
+            .filter_map(|condition| match condition {
+                Precondition::RefAt { reference, oid }
+                    if reference.as_str() == expected_ref
+                        || (matches!(
+                            source,
+                            crate::lifecycle::CreateSource::ExistingLocal { .. }
+                        ) && reference.as_str() == format!("refs/heads/{expected_ref}")) =>
+                {
+                    Some(oid.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        match matches.as_slice() {
+            [oid] => Ok(oid.clone()),
+            [] => Err(ProductionBackendError::UnsupportedObservation(
+                "create source lacks matching RefAt OID",
+            )),
+            _ => Err(ProductionBackendError::UnsupportedObservation(
+                "create source has duplicate matching RefAt OIDs",
+            )),
+        }
+    }
+
     fn ref_at(&self, reference: &str) -> Result<Option<ObjectId>, ProductionBackendError> {
         infrastructure::readonly_ref_oid(&self.anchor, reference).map_err(Into::into)
     }
@@ -298,8 +343,19 @@ impl ExecutionBackend for ProductionBackend {
             _ => true,
         }
     }
-    fn supports_action(&self, _action: &StepAction) -> bool {
-        false
+    fn supports_action(&self, step: &PlanStep) -> bool {
+        match step.action() {
+            StepAction::CreateWorktree { .. }
+            | StepAction::DeleteLocalBranch { .. }
+            | StepAction::DeleteRemoteBranch {
+                expected_oid: Some(_),
+                ..
+            } => true,
+            StepAction::RemoveWorktree { path } => step.preconditions().iter().any(|condition| {
+                matches!(condition, Precondition::WorktreeClean { path: guarded } if guarded == path)
+            }),
+            _ => false,
+        }
     }
     fn probe_capability(&self, step: &PlanStep) -> ProbeCapability {
         if matches!(step.action(), StepAction::RunTask { .. }) {
@@ -327,8 +383,62 @@ impl ExecutionBackend for ProductionBackend {
             }
         })
     }
-    fn invoke(&mut self, _step: &PlanStep) -> Result<(), Self::Error> {
-        Err(ProductionBackendError::MutationUnavailable)
+    fn invoke(&mut self, step: &PlanStep) -> Result<(), Self::Error> {
+        match step.action() {
+            StepAction::CreateWorktree {
+                destination,
+                source,
+            } => {
+                let source_oid = self.create_source_oid(step)?;
+                infrastructure::mutate_create_worktree(
+                    &self.anchor,
+                    destination.as_path(),
+                    source,
+                    &source_oid,
+                )?;
+                Ok(())
+            }
+            StepAction::RemoveWorktree { path } => {
+                infrastructure::mutate_remove_worktree(&self.anchor, path.as_path())?;
+                Ok(())
+            }
+            StepAction::DeleteLocalBranch { branch } => {
+                let expected = step
+                    .preconditions()
+                    .iter()
+                    .find_map(|condition| match condition {
+                        Precondition::RefAt { reference, oid }
+                            if reference.as_str() == branch.as_str()
+                                || reference.as_str() == format!("refs/heads/{branch}") =>
+                        {
+                            Some(oid)
+                        }
+                        _ => None,
+                    })
+                    .ok_or(ProductionBackendError::UnsupportedObservation(
+                        "local branch deletion lacks expected OID",
+                    ))?;
+                infrastructure::mutate_delete_local_branch(
+                    &self.anchor,
+                    branch.as_str(),
+                    expected,
+                )?;
+                Ok(())
+            }
+            StepAction::DeleteRemoteBranch {
+                target,
+                expected_oid: Some(expected),
+            } => {
+                infrastructure::mutate_delete_remote_branch(
+                    &self.anchor,
+                    target.remote.as_str(),
+                    target.branch.as_str(),
+                    expected,
+                )?;
+                Ok(())
+            }
+            _ => Err(ProductionBackendError::MutationUnavailable),
+        }
     }
     fn probe(
         &mut self,
@@ -498,7 +608,9 @@ impl ProductionBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::{ExecutionEngine, ExecutionOutcome};
     use crate::lifecycle::{BranchName, RefName, StepId};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::{fs, process::Command};
     use tempfile::TempDir;
 
@@ -609,16 +721,17 @@ mod tests {
     }
 
     #[test]
-    fn all_actions_are_unsupported_and_invoke_is_mutation_unavailable() {
+    fn unsupported_actions_remain_mutation_unavailable() {
         let temp = repository();
         let plan = crate::lifecycle::test_plan(1);
         let backend = ProductionBackend::new(temp.path().to_owned());
         for step in plan.steps() {
-            assert!(!backend.supports_action(step.action()));
-            assert!(matches!(
-                ProductionBackend::new(temp.path().to_owned()).invoke(step),
-                Err(ProductionBackendError::MutationUnavailable)
-            ));
+            if !backend.supports_action(step) {
+                assert!(matches!(
+                    ProductionBackend::new(temp.path().to_owned()).invoke(step),
+                    Err(ProductionBackendError::MutationUnavailable)
+                ));
+            }
         }
     }
 
@@ -733,6 +846,273 @@ mod tests {
             },
             "condition {condition:?}"
         );
+    }
+
+    fn executable_new_branch_plan(
+        root: &Path,
+        destination: &Path,
+        branch: &str,
+    ) -> crate::lifecycle::OperationPlan {
+        let repository = ProductionBackend::new(root.to_owned())
+            .discover_repository()
+            .unwrap()
+            .identity;
+        let branch = BranchName::new(branch).unwrap();
+        let source = crate::lifecycle::CreateSource::NewBranch {
+            branch: branch.clone(),
+            base: Some(RefName::new("refs/heads/main").unwrap()),
+        };
+        let intent = crate::lifecycle::CreateIntent {
+            repository: repository.clone(),
+            source: source.clone(),
+            destination: Some(stored(destination.to_owned())),
+            selected_tasks: BTreeSet::new(),
+            skipped_rules: BTreeSet::new(),
+            granted_consents: BTreeSet::new(),
+            task_contracts: BTreeMap::new(),
+            current_worktree_root: Some(stored(root.to_owned())),
+            artifact_rule_contracts: BTreeMap::new(),
+        };
+        crate::planner::plan_create(crate::planner::CreatePlanInput {
+            operation_id: crate::planner::new_operation_id(),
+            repository: repository.clone(),
+            intent,
+            bare: false,
+            primary_count: 1,
+            invocation_cwd: stored(root.to_owned()),
+            primary_root: repository.primary_root.clone(),
+            current_worktree_root: repository.primary_root.clone(),
+            destination: crate::planner::DestinationFacts {
+                path: stored(destination.to_owned()),
+                state: crate::planner::DestinationState::Absent,
+                parent: stored(destination.parent().unwrap().to_owned()),
+                parent_safe: true,
+            },
+            source_facts: crate::planner::CreateSourceFacts::NewBranch {
+                branch,
+                base_ref: RefName::new("refs/heads/main").unwrap(),
+                base_oid: oid(root, "refs/heads/main"),
+                branch_absent: true,
+            },
+            branch_checked_out: false,
+            branch_collision: false,
+            known_rules: BTreeSet::new(),
+            enabled_rules: BTreeSet::new(),
+            known_tasks: BTreeSet::new(),
+            manifests: vec![],
+            tasks: vec![],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn engine_applies_new_branch_after_post_success_injected_mutation_error() {
+        let temp = repository();
+        let root = temp.path();
+        let destination = root.join("engine-linked");
+        let branch = "engine-branch";
+        let plan = executable_new_branch_plan(root, &destination, branch);
+        assert!(
+            plan.validate_executable_plan().is_ok(),
+            "schema-v2 zero-artifact plan must be executable"
+        );
+        let expected_oid = oid(root, "refs/heads/main");
+        let guard = infrastructure::arm_mutation_success_error();
+        let outcome = ExecutionEngine::new(ProductionBackend::new(root.to_owned()))
+            .execute(plan.clone())
+            .unwrap();
+        assert_eq!(
+            infrastructure::mutation_invocation_count(),
+            1,
+            "mutation invoke count"
+        );
+        assert!(
+            matches!(outcome, ExecutionOutcome::Applied { .. }),
+            "post-success error reconciles as Applied"
+        );
+        assert_eq!(oid(root, &format!("refs/heads/{branch}")), expected_oid);
+        assert_eq!(oid(&destination, "HEAD"), expected_oid);
+        let common = root.join(".git");
+        let journal = crate::journal_store::JournalStore::new(&common)
+            .read(plan.operation_id())
+            .unwrap();
+        assert_eq!(journal.status(), crate::journal::OperationStatus::Applied);
+        assert_eq!(
+            journal.revision(),
+            2,
+            "pending -> Started -> Applied journal transitions"
+        );
+        assert_eq!(
+            journal.steps()[0].status(),
+            crate::journal::StepStatus::Applied
+        );
+        assert!(!journal.is_unresolved());
+        assert!(
+            journal.started_step().is_none(),
+            "final journal has no active Started step"
+        );
+        drop(guard);
+        assert_eq!(
+            infrastructure::mutation_invocation_count(),
+            0,
+            "fault seam RAII reset"
+        );
+    }
+
+    #[test]
+    fn mutation_fault_guard_resets_on_drop_and_unwind() {
+        let guard = infrastructure::arm_mutation_success_error();
+        assert_eq!(infrastructure::mutation_invocation_count(), 0);
+        drop(guard);
+        assert_eq!(infrastructure::mutation_invocation_count(), 0);
+        let unwind = std::panic::catch_unwind(|| {
+            let _guard = infrastructure::arm_mutation_success_error();
+            panic!("exercise RAII reset");
+        });
+        assert!(unwind.is_err());
+        assert_eq!(
+            infrastructure::mutation_invocation_count(),
+            0,
+            "fault state does not leak after panic"
+        );
+    }
+
+    #[test]
+    fn engine_rejects_unsupported_remove_before_journal_and_requires_exact_clean_guard() {
+        let temp = repository();
+        let root = temp.path();
+        let destination = root.join("unsupported-remove");
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "remove-me",
+                destination.to_str().unwrap(),
+            ],
+        );
+        fs::write(destination.join("dirty"), b"dirty").unwrap();
+        let discovered = ProductionBackend::new(root.to_owned())
+            .discover_repository()
+            .unwrap();
+        let listing = infrastructure::readonly_list(root).unwrap();
+        let worktree = listing
+            .data
+            .worktrees
+            .iter()
+            .find(|item| infrastructure::readonly_same_path(&item.path, &destination))
+            .unwrap();
+        let branch = BranchName::new(worktree.branch.clone().unwrap()).unwrap();
+        let worktree_oid = ObjectId::new(worktree.head_oid.clone().unwrap()).unwrap();
+        let dirty_facts = crate::planner::RemoveFacts {
+            repository: discovered.identity.clone(),
+            class: worktree.classification,
+            locked: worktree.locked.is_some(),
+            prunable: worktree.prunable.is_some(),
+            ongoing: infrastructure::readonly_ongoing(&destination).unwrap(),
+            oid_matches: true,
+            branch_elsewhere: false,
+            dirty: true,
+            local_branch_safe_to_delete: false,
+            safe_target_ref: RefName::new("HEAD").unwrap(),
+            safe_target: oid(root, "HEAD"),
+            merge_provenance: crate::lifecycle::MergeTargetProvenance::Primary,
+            branch: branch.clone(),
+            branch_oid: worktree_oid.clone(),
+            worktree_oid: worktree_oid.clone(),
+            remote_branch: None,
+            remote_branch_oid: None,
+            remote_is_default: false,
+            path: stored(destination.clone()),
+        };
+        let mut grants = BTreeSet::new();
+        grants.insert(crate::lifecycle::ConsentId::new("remove:worktree").unwrap());
+        grants.insert(crate::lifecycle::ConsentId::new("remove:dirty").unwrap());
+        let intent = crate::lifecycle::RemoveIntent::new(
+            discovered.identity.clone(),
+            stored(destination.clone()),
+            true,
+            false,
+            false,
+            None,
+            grants,
+        )
+        .unwrap();
+        let plan = crate::planner::plan_remove(crate::planner::RemovePlanInput {
+            operation_id: crate::planner::new_operation_id(),
+            intent,
+            facts: dirty_facts,
+        })
+        .unwrap();
+        assert!(
+            plan.validate_executable_plan().is_ok(),
+            "genuine schema-v2 dirty remove plan is valid"
+        );
+        assert!(
+            !plan.steps()[0]
+                .preconditions()
+                .iter()
+                .any(|guard| matches!(guard, Precondition::WorktreeClean { .. }))
+        );
+        let before_worktrees = output(root, &["worktree", "list", "--porcelain", "-z"]);
+        let before_refs = output(root, &["show-ref"]);
+        let before_dirty = fs::read(destination.join("dirty")).unwrap();
+        assert!(matches!(
+            ExecutionEngine::new(ProductionBackend::new(root.to_owned())).execute(plan),
+            Err(crate::execution::ExecutionError::UnsupportedPlan(_))
+        ));
+        assert!(
+            !root.join(".git/ewtm").exists(),
+            "support scan precedes journal creation"
+        );
+        assert!(!root.join(".git/ewtm/repository.lock").exists());
+        assert_eq!(
+            output(root, &["worktree", "list", "--porcelain", "-z"]),
+            before_worktrees
+        );
+        assert_eq!(output(root, &["show-ref"]), before_refs);
+        assert_eq!(fs::read(destination.join("dirty")).unwrap(), before_dirty);
+        assert_eq!(
+            infrastructure::mutation_invocation_count(),
+            0,
+            "support scan performs no mutation"
+        );
+        assert!(destination.exists());
+        assert_eq!(oid(root, "refs/heads/remove-me"), oid(&destination, "HEAD"));
+
+        let clean = PlanStep::new(
+            StepId::new("clean-remove").unwrap(),
+            "clean-remove".into(),
+            StepAction::RemoveWorktree {
+                path: stored(destination.clone()),
+            },
+            vec![Precondition::WorktreeClean {
+                path: stored(destination.clone()),
+            }],
+            vec![],
+            None,
+            false,
+        )
+        .unwrap();
+        let backend = ProductionBackend::new(root.to_owned());
+        assert!(backend.supports_action(&clean));
+        let mut extra = clean.clone();
+        extra
+            .preconditions_mut()
+            .push(Precondition::BareRepositoryFalse);
+        assert!(
+            ProductionBackend::new(root.to_owned()).supports_action(&extra),
+            "dirty-removal consent does not replace exact clean guard"
+        );
+        let mut missing = clean.clone();
+        missing.preconditions_mut().clear();
+        assert!(!ProductionBackend::new(root.to_owned()).supports_action(&missing));
+        let mut mismatched = clean;
+        mismatched.preconditions_mut()[0] = Precondition::WorktreeClean {
+            path: stored(root.join("other")),
+        };
+        assert!(!ProductionBackend::new(root.to_owned()).supports_action(&mismatched));
     }
 
     #[test]
@@ -1071,6 +1451,191 @@ mod tests {
                 provenance: crate::lifecycle::MergeTargetProvenance::Primary,
             },
             false,
+        );
+    }
+
+    #[test]
+    fn d2_clean_remove_and_local_branch_cas_are_typed_mutations() {
+        let temp = repository();
+        let root = temp.path();
+        git(root, &["branch", "feature"]);
+        let expected = oid(root, "refs/heads/feature");
+        let delete = PlanStep::new(
+            StepId::new("delete").unwrap(),
+            "delete".into(),
+            StepAction::DeleteLocalBranch {
+                branch: BranchName::new("feature").unwrap(),
+            },
+            vec![Precondition::RefAt {
+                reference: RefName::new("feature").unwrap(),
+                oid: expected.clone(),
+            }],
+            vec![],
+            None,
+            false,
+        )
+        .unwrap();
+        ProductionBackend::new(root.to_owned())
+            .invoke(&delete)
+            .unwrap();
+        assert!(
+            infrastructure::readonly_ref_oid(root, "refs/heads/feature")
+                .unwrap()
+                .is_none()
+        );
+
+        git(root, &["branch", "feature"]);
+        fs::write(root.join("stale-source"), b"stale-source").unwrap();
+        git(root, &["add", "stale-source"]);
+        git(root, &["commit", "-m", "stale-cas"]);
+        let stale_oid = oid(root, "HEAD");
+        let stale = PlanStep::new(
+            StepId::new("stale").unwrap(),
+            "stale".into(),
+            delete.action().clone(),
+            vec![Precondition::RefAt {
+                reference: RefName::new("feature").unwrap(),
+                oid: stale_oid,
+            }],
+            vec![],
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            ProductionBackend::new(root.to_owned())
+                .invoke(&stale)
+                .is_err()
+        );
+        assert_eq!(oid(root, "refs/heads/feature"), expected);
+
+        git(root, &["symbolic-ref", "refs/heads/sym", "refs/heads/main"]);
+        let referent = oid(root, "refs/heads/main");
+        let symbolic = PlanStep::new(
+            StepId::new("symbolic").unwrap(),
+            "symbolic".into(),
+            StepAction::DeleteLocalBranch {
+                branch: BranchName::new("sym").unwrap(),
+            },
+            vec![Precondition::RefAt {
+                reference: RefName::new("sym").unwrap(),
+                oid: referent.clone(),
+            }],
+            vec![],
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            ProductionBackend::new(root.to_owned())
+                .invoke(&symbolic)
+                .is_err()
+        );
+        assert_eq!(oid(root, "refs/heads/main"), referent);
+
+        let linked = root.join("remove-me");
+        git(root, &["worktree", "add", linked.to_str().unwrap(), "HEAD"]);
+        let remove = PlanStep::new(
+            StepId::new("remove").unwrap(),
+            "remove".into(),
+            StepAction::RemoveWorktree {
+                path: stored(linked.clone()),
+            },
+            vec![],
+            vec![],
+            None,
+            false,
+        )
+        .unwrap();
+        ProductionBackend::new(root.to_owned())
+            .invoke(&remove)
+            .unwrap();
+        assert!(!linked.exists());
+    }
+
+    #[test]
+    fn d2_create_sources_and_remote_lease_deletion_use_closed_helpers() {
+        let temp = repository();
+        let root = temp.path();
+        let new_path = root.join("new-source");
+        let main_oid = oid(root, "refs/heads/main");
+        infrastructure::mutate_create_worktree(
+            root,
+            &new_path,
+            &crate::lifecycle::CreateSource::NewBranch {
+                branch: BranchName::new("new-source").unwrap(),
+                base: Some(RefName::new("main").unwrap()),
+            },
+            &main_oid,
+        )
+        .unwrap();
+        assert!(infrastructure::readonly_list(&new_path).is_ok());
+
+        git(root, &["branch", "existing"]);
+        let existing_path = root.join("existing-source");
+        let existing_oid = oid(root, "refs/heads/existing");
+        infrastructure::mutate_create_worktree(
+            root,
+            &existing_path,
+            &crate::lifecycle::CreateSource::ExistingLocal {
+                branch: BranchName::new("existing").unwrap(),
+            },
+            &existing_oid,
+        )
+        .unwrap();
+        assert!(infrastructure::readonly_list(&existing_path).is_ok());
+
+        let bare = TempDir::new().unwrap();
+        git(bare.path(), &["init", "--bare"]);
+        git(
+            root,
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+        git(root, &["push", "origin", "HEAD:refs/heads/remote-base"]);
+        git(root, &["fetch", "origin"]);
+        let remote_path = root.join("remote-source");
+        let remote_oid = infrastructure::readonly_remote_ref(root, "origin", "remote-base")
+            .unwrap()
+            .unwrap();
+        infrastructure::mutate_create_worktree(
+            root,
+            &remote_path,
+            &crate::lifecycle::CreateSource::RemoteTracking {
+                remote: crate::lifecycle::RemoteName::new("origin").unwrap(),
+                remote_branch: BranchName::new("remote-base").unwrap(),
+                local_branch: BranchName::new("remote-local").unwrap(),
+            },
+            &remote_oid,
+        )
+        .unwrap();
+        assert!(infrastructure::readonly_list(&remote_path).is_ok());
+
+        fs::write(root.join("remote-change"), b"remote-change").unwrap();
+        git(root, &["add", "remote-change"]);
+        git(root, &["commit", "-m", "remote-change"]);
+        git(root, &["push", "origin", "HEAD:refs/heads/remote-base"]);
+        let changed_remote_oid = infrastructure::readonly_remote_ref(root, "origin", "remote-base")
+            .unwrap()
+            .unwrap();
+        assert!(
+            infrastructure::mutate_delete_remote_branch(root, "origin", "remote-base", &remote_oid)
+                .is_err()
+        );
+        assert_eq!(
+            infrastructure::readonly_remote_ref(root, "origin", "remote-base").unwrap(),
+            Some(changed_remote_oid.clone())
+        );
+        infrastructure::mutate_delete_remote_branch(
+            root,
+            "origin",
+            "remote-base",
+            &changed_remote_oid,
+        )
+        .unwrap();
+        assert!(
+            infrastructure::readonly_remote_ref(root, "origin", "remote-base")
+                .unwrap()
+                .is_none()
         );
     }
 

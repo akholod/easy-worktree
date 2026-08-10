@@ -1,7 +1,7 @@
 use crate::{
     journal::{Journal, OperationStatus, Reconciliation},
     journal_store::{JournalError, LockedJournalStore},
-    lifecycle::{OperationPlan, PlanStep, Precondition, StepAction},
+    lifecycle::{OperationPlan, PlanStep, Precondition},
 };
 use std::{error::Error, fmt, path::Path};
 
@@ -99,7 +99,7 @@ pub trait ExecutionBackend {
         step: Option<&PlanStep>,
         precondition: &Precondition,
     ) -> bool;
-    fn supports_action(&self, action: &StepAction) -> bool;
+    fn supports_action(&self, step: &PlanStep) -> bool;
     fn probe_capability(&self, step: &PlanStep) -> ProbeCapability;
     fn check_precondition(
         &mut self,
@@ -243,7 +243,7 @@ impl<B: ExecutionBackend> ExecutionEngine<B> {
                     "unsupported step precondition".into(),
                 ));
             }
-            if !self.backend.supports_action(step.action()) {
+            if !self.backend.supports_action(step) {
                 return Err(ExecutionError::UnsupportedPlan(format!(
                     "unsupported step {}",
                     step.name()
@@ -406,7 +406,7 @@ mod tests {
     use crate::{
         domain::StoredPath,
         journal_store::{JournalStore, LockedJournalStore, RepositoryLock},
-        lifecycle::{OperationId, OperationPlan, RepositoryIdentity},
+        lifecycle::{OperationId, OperationPlan, RepositoryIdentity, StepAction},
     };
     use serde_json::Value;
     use std::{
@@ -483,10 +483,10 @@ mod tests {
         ) -> bool {
             self.supports
         }
-        fn supports_action(&self, _action: &StepAction) -> bool {
+        fn supports_action(&self, step: &PlanStep) -> bool {
             self.supports
                 && !(self.reject_second_action
-                    && matches!(_action, StepAction::FileArtifact { destination, .. } if destination.as_path().to_string_lossy().ends_with("/1")))
+                    && matches!(step.action(), StepAction::FileArtifact { destination, .. } if destination.as_path().to_string_lossy().ends_with("/1")))
         }
         fn probe_capability(&self, step: &PlanStep) -> ProbeCapability {
             if !self.supports {
