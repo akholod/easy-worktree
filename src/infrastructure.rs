@@ -1608,6 +1608,31 @@ pub(crate) enum ObservedNode {
     Symlink { target: PathBuf },
 }
 
+fn exact_source(
+    node: &ObservedNode,
+    expected: &crate::lifecycle::ArtifactSourceExpectationV3,
+) -> bool {
+    match (node, expected) {
+        (ObservedNode::Directory, crate::lifecycle::ArtifactSourceExpectationV3::Directory) => true,
+        (
+            ObservedNode::Regular { bytes, mode },
+            crate::lifecycle::ArtifactSourceExpectationV3::Regular(want),
+        ) => {
+            bytes.len() as u64 == want.bytes
+                && crate::planner::artifact_digest(bytes) == want.digest
+                && *mode == want.mode
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn source_expectation_matches(
+    node: &ObservedNode,
+    expected: &crate::lifecycle::ArtifactSourceExpectationV3,
+) -> bool {
+    exact_source(node, expected)
+}
+
 #[cfg(unix)]
 pub(crate) fn readonly_observe_node(
     trusted_root: &Path,
@@ -1668,16 +1693,11 @@ pub(crate) fn readonly_observe_node(
             target: PathBuf::from(std::ffi::OsString::from_vec(target)),
         }));
     }
-    if file_type.is_dir() {
-        return Ok(Some(ObservedNode::Directory));
-    }
-    if !file_type.is_file() {
-        return Ok(None);
-    }
+    observation_fifo_swap_hook(&path, &dirfd, name)?;
     let final_fd = match openat(
         &dirfd,
         name,
-        OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     ) {
         Ok(value) => value,
@@ -1685,7 +1705,11 @@ pub(crate) fn readonly_observe_node(
         Err(error) => return Err(GitError::Command(error.to_string())),
     };
     let final_stat = fstat(&final_fd).map_err(|error| GitError::Command(error.to_string()))?;
-    if !FileType::from_raw_mode(final_stat.st_mode).is_file() {
+    let final_type = FileType::from_raw_mode(final_stat.st_mode);
+    if final_type.is_dir() {
+        return Ok(Some(ObservedNode::Directory));
+    }
+    if !final_type.is_file() {
         return Ok(None);
     }
     let mut file = File::from(final_fd);
@@ -1697,6 +1721,90 @@ pub(crate) fn readonly_observe_node(
     #[cfg(not(target_os = "macos"))]
     let mode = final_stat.st_mode & 0o7777;
     Ok(Some(ObservedNode::Regular { bytes, mode }))
+}
+
+#[cfg(all(unix, test))]
+struct ObservationFifoSwapState {
+    armed_path: Option<PathBuf>,
+    invocations: usize,
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    static OBSERVATION_FIFO_SWAP: std::cell::RefCell<ObservationFifoSwapState> = const {
+        std::cell::RefCell::new(ObservationFifoSwapState { armed_path: None, invocations: 0 })
+    };
+}
+
+#[cfg(all(unix, test))]
+#[allow(dead_code)]
+pub(crate) struct ObservationFifoSwapGuard;
+
+#[cfg(all(unix, test))]
+#[allow(dead_code)]
+pub(crate) fn arm_observation_fifo_swap(path: &Path) -> ObservationFifoSwapGuard {
+    OBSERVATION_FIFO_SWAP.with(|state| {
+        let mut state = state.borrow_mut();
+        state.armed_path = Some(path.to_owned());
+        state.invocations = 0;
+    });
+    ObservationFifoSwapGuard
+}
+
+#[cfg(all(unix, test))]
+#[allow(dead_code)]
+pub(crate) fn observation_fifo_swap_invocation_count() -> usize {
+    OBSERVATION_FIFO_SWAP.with(|state| state.borrow().invocations)
+}
+
+#[cfg(all(unix, test))]
+impl Drop for ObservationFifoSwapGuard {
+    fn drop(&mut self) {
+        OBSERVATION_FIFO_SWAP.with(|state| {
+            let mut state = state.borrow_mut();
+            state.armed_path = None;
+            state.invocations = 0;
+        });
+    }
+}
+
+#[cfg(all(unix, test))]
+fn observation_fifo_swap_hook(
+    path: &Path,
+    dirfd: &rustix::fd::OwnedFd,
+    name: &OsStr,
+) -> Result<(), GitError> {
+    use rustix::fs::{AtFlags, renameat, unlinkat};
+    OBSERVATION_FIFO_SWAP.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.armed_path.as_deref() != Some(path) {
+            return Ok(());
+        }
+        state.invocations += 1;
+        state.armed_path = None;
+        let temporary = OsString::from(".ewtm-observation-original");
+        renameat(dirfd, name, dirfd, &temporary)
+            .map_err(|error| GitError::Command(error.to_string()))?;
+        let status = Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .map_err(|error| GitError::Command(error.to_string()))?;
+        if !status.success() {
+            return Err(GitError::Command("mkfifo test hook failed".into()));
+        }
+        unlinkat(dirfd, &temporary, AtFlags::empty())
+            .map_err(|error| GitError::Command(error.to_string()))?;
+        Ok(())
+    })
+}
+
+#[cfg(all(unix, not(test)))]
+fn observation_fifo_swap_hook(
+    _path: &Path,
+    _dirfd: &rustix::fd::OwnedFd,
+    _name: &OsStr,
+) -> Result<(), GitError> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1967,6 +2075,351 @@ pub(crate) fn readonly_final_absent(path: &Path) -> Result<bool, GitError> {
 pub(crate) fn readonly_final_absent(_path: &Path) -> Result<bool, GitError> {
     Err(GitError::Parse(
         "descriptor-relative observations unsupported on this platform".into(),
+    ))
+}
+
+#[cfg(unix)]
+fn validate_absolute_path(path: &Path) -> Result<PathBuf, GitError> {
+    let normalized = planner::normalize_lexical(path.to_owned());
+    if !normalized.is_absolute()
+        || normalized != path
+        || !normalized.components().all(|component| {
+            !matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(GitError::Parse(
+            "mutation path is not normalized absolute".into(),
+        ));
+    }
+    Ok(normalized)
+}
+
+#[cfg(unix)]
+fn validate_mutation_path(path: &Path) -> Result<PathBuf, GitError> {
+    let normalized = validate_absolute_path(path)?;
+    if !matches!(normalized.file_name(), Some(name) if !name.is_empty()) {
+        return Err(GitError::Parse("mutation path has no final name".into()));
+    }
+    Ok(normalized)
+}
+
+#[cfg(unix)]
+fn mutation_parent(path: &Path) -> Result<(rustix::fd::OwnedFd, OsString), GitError> {
+    use rustix::fs::{Mode, OFlags, open, openat};
+    let path = validate_mutation_path(path)?;
+    let name = path
+        .file_name()
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| GitError::Parse("mutation path has no final name".into()))?
+        .to_owned();
+    let parent = path
+        .parent()
+        .ok_or_else(|| GitError::Parse("mutation path has no parent".into()))?;
+    let trusted_root = platform_alias_root(&path);
+    let canonical_root = trusted_root
+        .canonicalize()
+        .map_err(|error| GitError::Discovery(error.to_string()))?;
+    let relative_parent = parent
+        .strip_prefix(&trusted_root)
+        .map_err(|_| GitError::Parse("mutation path is outside trusted root".into()))?;
+    let mut fd = open(
+        &canonical_root,
+        OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| GitError::Command(e.to_string()))?;
+    for component in relative_parent.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(GitError::Parse("mutation parent is not normalized".into()));
+        };
+        fd = openat(
+            &fd,
+            part,
+            OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| GitError::Command(e.to_string()))?;
+    }
+    Ok((fd, name))
+}
+
+#[cfg(unix)]
+fn mutation_parents(
+    destination: &Path,
+    staging: &Path,
+) -> Result<(rustix::fd::OwnedFd, OsString, OsString), GitError> {
+    let destination = validate_mutation_path(destination)?;
+    let staging = validate_mutation_path(staging)?;
+    let destination_parent = destination
+        .parent()
+        .ok_or_else(|| GitError::Parse("destination has no parent".into()))?;
+    let staging_parent = staging
+        .parent()
+        .ok_or_else(|| GitError::Parse("staging has no parent".into()))?;
+    if destination_parent != staging_parent {
+        return Err(GitError::Parse(
+            "staging and destination parents differ".into(),
+        ));
+    }
+    let destination_name = destination.file_name().unwrap().to_owned();
+    let staging_name = staging.file_name().unwrap().to_owned();
+    if destination_name == staging_name {
+        return Err(GitError::Parse(
+            "staging and destination names must differ".into(),
+        ));
+    }
+    let (parent, _) = mutation_parent(&destination)?;
+    Ok((parent, destination_name, staging_name))
+}
+
+#[cfg(unix)]
+fn mutation_source(path: &Path) -> Result<(rustix::fd::OwnedFd, ObservedNode), GitError> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
+    let (parent, name) = mutation_parent(path)?;
+    let fd = openat(
+        &parent,
+        &name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|e| GitError::Command(e.to_string()))?;
+    let st = fstat(&fd).map_err(|e| GitError::Command(e.to_string()))?;
+    let ty = FileType::from_raw_mode(st.st_mode);
+    if ty.is_dir() {
+        return Ok((fd, ObservedNode::Directory));
+    }
+    if !ty.is_file() {
+        return Err(GitError::Command(
+            "source is not a regular file or directory".into(),
+        ));
+    }
+    let mut file = std::fs::File::from(fd);
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)
+        .map_err(|e| GitError::Command(e.to_string()))?;
+    #[cfg(target_os = "macos")]
+    let mode = u32::from(st.st_mode & 0o7777);
+    #[cfg(not(target_os = "macos"))]
+    let mode = st.st_mode & 0o7777;
+    let fd = file.into();
+    Ok((fd, ObservedNode::Regular { bytes, mode }))
+}
+
+#[cfg(all(unix, test))]
+fn artifact_fault(point: ArtifactFaultPoint) -> Result<(), GitError> {
+    ARTIFACT_FAULT.with(|state| {
+        let mut state = state.borrow_mut();
+        state.counts[point as usize] += 1;
+        if state.armed == Some(point) {
+            state.armed = None;
+            return Err(GitError::Command("injected artifact fault".into()));
+        }
+        Ok(())
+    })
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArtifactFaultPoint {
+    StagingCreate,
+    Write,
+    Fchmod,
+    FileFsync,
+    Rename,
+    CopyParentFsync,
+    SymlinkCreate,
+    SymlinkParentFsync,
+}
+
+#[cfg(all(unix, test))]
+struct ArtifactFaultState {
+    armed: Option<ArtifactFaultPoint>,
+    counts: [usize; 8],
+}
+#[cfg(all(unix, test))]
+thread_local! {
+    static ARTIFACT_FAULT: std::cell::RefCell<ArtifactFaultState> = const {
+        std::cell::RefCell::new(ArtifactFaultState { armed: None, counts: [0; 8] })
+    };
+}
+#[cfg(all(unix, test))]
+#[allow(dead_code)]
+pub(crate) struct ArtifactFaultGuard;
+#[cfg(all(unix, test))]
+#[allow(dead_code)]
+pub(crate) fn arm_artifact_fault(point: ArtifactFaultPoint) -> ArtifactFaultGuard {
+    ARTIFACT_FAULT.with(|state| {
+        let mut state = state.borrow_mut();
+        state.armed = Some(point);
+        state.counts = [0; 8];
+    });
+    ArtifactFaultGuard
+}
+#[cfg(all(unix, test))]
+#[allow(dead_code)]
+pub(crate) fn artifact_fault_invocation_count(point: ArtifactFaultPoint) -> usize {
+    ARTIFACT_FAULT.with(|state| state.borrow().counts[point as usize])
+}
+#[cfg(all(unix, test))]
+impl Drop for ArtifactFaultGuard {
+    fn drop(&mut self) {
+        ARTIFACT_FAULT.with(|state| {
+            let mut state = state.borrow_mut();
+            state.armed = None;
+            state.counts = [0; 8];
+        });
+    }
+}
+#[cfg(all(unix, not(test)))]
+fn artifact_fault(_point: ArtifactFaultPoint) -> Result<(), GitError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn mutate_copy_file_v3(
+    source_root: &Path,
+    source: &Path,
+    expected_source: &crate::lifecycle::RegularFileStateV3,
+    destination: &Path,
+    desired: &crate::lifecycle::RegularFileStateV3,
+    staging: &crate::lifecycle::OwnedStagingV3,
+) -> Result<(), GitError> {
+    use rustix::fs::{
+        AtFlags, Mode, OFlags, RenameFlags, fchmod, fsync, openat, renameat_with, statat,
+    };
+    let source_root = validate_absolute_path(source_root)?;
+    let source = validate_mutation_path(source)?;
+    let staging_path = validate_mutation_path(staging.path.as_path())?;
+    validate_mutation_path(destination)?;
+    if source == source_root || !source.starts_with(&source_root) {
+        return Err(GitError::Parse("source is outside source root".into()));
+    }
+    if expected_source.mode > 0o7777
+        || desired.mode > 0o7777
+        || desired.bytes != expected_source.bytes
+        || desired.digest != expected_source.digest
+    {
+        return Err(GitError::Parse(
+            "copy source/output contract is invalid".into(),
+        ));
+    }
+    let (_source_fd, observed) = mutation_source(&source)?;
+    if !exact_source(
+        &observed,
+        &crate::lifecycle::ArtifactSourceExpectationV3::Regular(expected_source.clone()),
+    ) {
+        return Err(GitError::Command("source changed since planning".into()));
+    }
+    let data = match observed {
+        ObservedNode::Regular { bytes, .. } => bytes,
+        _ => unreachable!(),
+    };
+    let (parent, final_name, stage_name) = mutation_parents(destination, &staging_path)?;
+    match statat(&parent, &final_name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => return Err(GitError::Command("destination already exists".into())),
+        Err(error) if error == rustix::io::Errno::NOENT => {}
+        Err(error) => return Err(GitError::Command(error.to_string())),
+    }
+    let stage = openat(
+        &parent,
+        &stage_name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(|e| GitError::Command(e.to_string()))?;
+    artifact_fault(ArtifactFaultPoint::StagingCreate)?;
+    let mut file = std::fs::File::from(stage);
+    std::io::Write::write_all(&mut file, &data).map_err(|e| GitError::Command(e.to_string()))?;
+    artifact_fault(ArtifactFaultPoint::Write)?;
+    #[cfg(target_os = "macos")]
+    let desired_mode = u16::try_from(desired.mode)
+        .map_err(|_| GitError::Parse("copy output mode is out of range".into()))?;
+    #[cfg(not(target_os = "macos"))]
+    let desired_mode = desired.mode;
+    fchmod(&file, Mode::from_raw_mode(desired_mode))
+        .map_err(|e| GitError::Command(e.to_string()))?;
+    artifact_fault(ArtifactFaultPoint::Fchmod)?;
+    fsync(&file).map_err(|e| GitError::Command(e.to_string()))?;
+    artifact_fault(ArtifactFaultPoint::FileFsync)?;
+    drop(file);
+    renameat_with(
+        &parent,
+        &stage_name,
+        &parent,
+        &final_name,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(|e| GitError::Command(e.to_string()))?;
+    artifact_fault(ArtifactFaultPoint::Rename)?;
+    fsync(&parent).map_err(|e| GitError::Command(e.to_string()))?;
+    artifact_fault(ArtifactFaultPoint::CopyParentFsync)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn mutate_copy_file_v3(
+    _: &Path,
+    _: &Path,
+    _: &crate::lifecycle::RegularFileStateV3,
+    _: &Path,
+    _: &crate::lifecycle::RegularFileStateV3,
+    _: &crate::lifecycle::OwnedStagingV3,
+) -> Result<(), GitError> {
+    Err(GitError::Parse(
+        "descriptor-relative mutation unsupported on this platform".into(),
+    ))
+}
+
+#[cfg(unix)]
+pub(crate) fn mutate_create_symlink_v3(
+    source_root: &Path,
+    source: &Path,
+    expected: &crate::lifecycle::ArtifactSourceExpectationV3,
+    destination: &Path,
+    desired: &crate::lifecycle::SymlinkStateV3,
+) -> Result<(), GitError> {
+    use rustix::fs::{fsync, symlinkat};
+    let root = validate_absolute_path(source_root)?;
+    let source = validate_mutation_path(source)?;
+    validate_mutation_path(destination)?;
+    if source == root || !source.starts_with(&root) {
+        return Err(GitError::Parse("source is outside source root".into()));
+    }
+    match expected {
+        crate::lifecycle::ArtifactSourceExpectationV3::Regular(state) if state.mode <= 0o7777 => {}
+        crate::lifecycle::ArtifactSourceExpectationV3::Directory => {}
+        _ => return Err(GitError::Parse("symlink source contract is invalid".into())),
+    }
+    if desired.target.as_path() != source
+        || crate::planner::artifact_digest(desired.target.as_path().as_os_str().as_encoded_bytes())
+            != desired.target_digest
+    {
+        return Err(GitError::Parse("symlink target contract is invalid".into()));
+    }
+    let (_fd, observed) = mutation_source(&source)?;
+    if !exact_source(&observed, expected) {
+        return Err(GitError::Command("source changed since planning".into()));
+    }
+    let (parent, name) = mutation_parent(destination)?;
+    symlinkat(desired.target.as_path(), &parent, &name)
+        .map_err(|e| GitError::Command(e.to_string()))?;
+    artifact_fault(ArtifactFaultPoint::SymlinkCreate)?;
+    fsync(&parent).map_err(|e| GitError::Command(e.to_string()))?;
+    artifact_fault(ArtifactFaultPoint::SymlinkParentFsync)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn mutate_create_symlink_v3(
+    _: &Path,
+    _: &Path,
+    _: &crate::lifecycle::ArtifactSourceExpectationV3,
+    _: &Path,
+    _: &crate::lifecycle::SymlinkStateV3,
+) -> Result<(), GitError> {
+    Err(GitError::Parse(
+        "descriptor-relative mutation unsupported on this platform".into(),
     ))
 }
 
@@ -3046,5 +3499,497 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(unix)]
+    mod artifact_primitives {
+        use super::*;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        fn id(bytes: &[u8]) -> ObjectId {
+            crate::planner::artifact_digest(bytes)
+        }
+
+        fn regular(bytes: &[u8], mode: u32) -> crate::lifecycle::RegularFileStateV3 {
+            crate::lifecycle::RegularFileStateV3 {
+                bytes: bytes.len() as u64,
+                digest: id(bytes),
+                mode,
+            }
+        }
+
+        fn staging(path: &Path) -> crate::lifecycle::OwnedStagingV3 {
+            crate::lifecycle::OwnedStagingV3 {
+                path: StoredPath::from(path.to_owned()),
+                ownership_token: id(b"staging-token"),
+            }
+        }
+
+        fn setup(
+            bytes: &[u8],
+        ) -> (
+            TempDir,
+            PathBuf,
+            PathBuf,
+            PathBuf,
+            PathBuf,
+            crate::lifecycle::RegularFileStateV3,
+        ) {
+            let temp = TempDir::new().unwrap();
+            let root = temp.path().join("root");
+            std::fs::create_dir_all(root.join("sub")).unwrap();
+            let source = root.join("sub/source");
+            let destination = root.join("sub/destination");
+            let stage = root.join("sub/.destination.stage");
+            std::fs::write(&source, bytes).unwrap();
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o641)).unwrap();
+            (
+                temp,
+                root,
+                source,
+                destination,
+                stage,
+                regular(bytes, 0o641),
+            )
+        }
+
+        fn assert_mode(path: &Path, mode: u32) {
+            assert_eq!(
+                std::fs::symlink_metadata(path).unwrap().mode() & 0o7777,
+                mode
+            );
+        }
+
+        #[test]
+        fn copy_contract_bytes_modes_and_publish_are_exact() {
+            for mode in [0o600, 0o641] {
+                let (_temp, root, source, destination, stage, expected) = setup(b"exact\0bytes");
+                let desired = crate::lifecycle::RegularFileStateV3 {
+                    mode,
+                    ..expected.clone()
+                };
+                mutate_copy_file_v3(
+                    &root,
+                    &source,
+                    &expected,
+                    &destination,
+                    &desired,
+                    &staging(&stage),
+                )
+                .unwrap();
+                assert_eq!(std::fs::read(&destination).unwrap(), b"exact\0bytes");
+                assert_mode(&destination, mode);
+                assert!(!stage.exists());
+            }
+        }
+
+        #[test]
+        fn symlink_regular_and_directory_expectations_are_exact() {
+            let (_temp, root, source, destination, _stage, expected) = setup(b"source");
+            let target = crate::lifecycle::SymlinkStateV3 {
+                target: StoredPath::from(source.clone()),
+                target_digest: id(source.as_os_str().as_encoded_bytes()),
+            };
+            mutate_create_symlink_v3(
+                &root,
+                &source,
+                &crate::lifecycle::ArtifactSourceExpectationV3::Regular(expected),
+                &destination,
+                &target,
+            )
+            .unwrap();
+            assert_eq!(std::fs::read_link(&destination).unwrap(), source);
+
+            let dir = root.join("sub/dir");
+            std::fs::create_dir(&dir).unwrap();
+            let out = root.join("sub/dir-link");
+            let target = crate::lifecycle::SymlinkStateV3 {
+                target: StoredPath::from(dir.clone()),
+                target_digest: id(dir.as_os_str().as_encoded_bytes()),
+            };
+            mutate_create_symlink_v3(
+                &root,
+                &dir,
+                &crate::lifecycle::ArtifactSourceExpectationV3::Directory,
+                &out,
+                &target,
+            )
+            .unwrap();
+            assert_eq!(std::fs::read_link(out).unwrap(), dir);
+        }
+
+        #[test]
+        fn unix_non_utf8_names_are_preserved() {
+            let (_temp, root, _source, _destination, _stage, _) = setup(b"unused");
+            let parent = root.join("sub");
+            let source = parent.join(OsString::from_vec(b"src-\xff".to_vec()));
+            let destination = parent.join(OsString::from_vec(b"dst-\xfe".to_vec()));
+            let stage = parent.join(OsString::from_vec(b"stage-\xfd".to_vec()));
+            std::fs::write(&source, b"raw").unwrap();
+            let mode = std::fs::metadata(&source).unwrap().permissions().mode() & 0o7777;
+            let expected = regular(b"raw", mode);
+            mutate_copy_file_v3(
+                &root,
+                &source,
+                &expected,
+                &destination,
+                &expected,
+                &staging(&stage),
+            )
+            .unwrap();
+            assert_eq!(std::fs::read(&destination).unwrap(), b"raw");
+            assert!(!stage.exists());
+            assert_eq!(
+                destination.file_name().unwrap().as_encoded_bytes(),
+                b"dst-\xfe"
+            );
+        }
+
+        fn unchanged_copy(
+            case: impl FnOnce(
+                &Path,
+                &Path,
+                &Path,
+                &Path,
+                &crate::lifecycle::RegularFileStateV3,
+            ) -> Result<(), GitError>,
+        ) {
+            let (_temp, root, source, destination, stage, expected) = setup(b"before");
+            std::fs::write(&destination, b"final").unwrap();
+            std::fs::write(&stage, b"staging").unwrap();
+            let before = (
+                std::fs::read(&destination).unwrap(),
+                std::fs::read(&stage).unwrap(),
+            );
+            assert!(case(&root, &source, &destination, &stage, &expected).is_err());
+            assert_eq!(std::fs::read(&destination).unwrap(), before.0);
+            assert_eq!(std::fs::read(&stage).unwrap(), before.1);
+        }
+
+        #[test]
+        fn invalid_copy_contracts_reject_before_mutation() {
+            unchanged_copy(|root, source, dest, stage, expected| {
+                let mut desired = expected.clone();
+                desired.bytes += 1;
+                mutate_copy_file_v3(root, source, expected, dest, &desired, &staging(stage))
+            });
+            unchanged_copy(|root, source, dest, stage, expected| {
+                let mut bad = expected.clone();
+                bad.mode = 0o10000;
+                mutate_copy_file_v3(root, source, &bad, dest, expected, &staging(stage))
+            });
+            unchanged_copy(|root, _source, dest, stage, expected| {
+                mutate_copy_file_v3(root, root, expected, dest, expected, &staging(stage))
+            });
+            unchanged_copy(|root, source, dest, stage, expected| {
+                mutate_copy_file_v3(
+                    root,
+                    source,
+                    expected,
+                    &dest.join(".."),
+                    expected,
+                    &staging(stage),
+                )
+            });
+            unchanged_copy(|root, source, dest, _stage, expected| {
+                mutate_copy_file_v3(
+                    root,
+                    source,
+                    expected,
+                    dest,
+                    expected,
+                    &staging(&dest.join("other/.stage")),
+                )
+            });
+        }
+
+        #[test]
+        fn symlink_contracts_reject_without_touching_existing_output() {
+            let (_temp, root, source, destination, _stage, expected) = setup(b"source");
+            std::fs::write(&destination, b"keep").unwrap();
+            let good = crate::lifecycle::SymlinkStateV3 {
+                target: StoredPath::from(source.clone()),
+                target_digest: id(source.as_os_str().as_encoded_bytes()),
+            };
+            let bad_target = crate::lifecycle::SymlinkStateV3 {
+                target: StoredPath::from(root.join("other")),
+                target_digest: id(b"other"),
+            };
+            assert!(
+                mutate_create_symlink_v3(
+                    &root,
+                    &source,
+                    &crate::lifecycle::ArtifactSourceExpectationV3::Symlink(good.clone()),
+                    &destination,
+                    &good
+                )
+                .is_err()
+            );
+            assert!(
+                mutate_create_symlink_v3(
+                    &root,
+                    &source,
+                    &crate::lifecycle::ArtifactSourceExpectationV3::Regular(expected.clone()),
+                    &destination,
+                    &bad_target
+                )
+                .is_err()
+            );
+            let mut stale = expected;
+            stale.digest = id(b"stale");
+            assert!(
+                mutate_create_symlink_v3(
+                    &root,
+                    &source,
+                    &crate::lifecycle::ArtifactSourceExpectationV3::Regular(stale),
+                    &destination,
+                    &good
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read(&destination).unwrap(), b"keep");
+        }
+
+        #[test]
+        fn no_follow_overwrite_and_missing_parent_safety() {
+            let (_temp, root, source, destination, stage, expected) = setup(b"source");
+            for existing in ["regular", "stage"] {
+                let p = if existing == "regular" {
+                    destination.clone()
+                } else {
+                    stage.clone()
+                };
+                std::fs::write(&p, b"preserve").unwrap();
+            }
+            assert!(
+                mutate_copy_file_v3(
+                    &root,
+                    &source,
+                    &expected,
+                    &destination,
+                    &expected,
+                    &staging(&stage)
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read(&destination).unwrap(), b"preserve");
+            assert_eq!(std::fs::read(&stage).unwrap(), b"preserve");
+            std::fs::remove_file(&destination).unwrap();
+            std::fs::remove_file(&stage).unwrap();
+            std::os::unix::fs::symlink("elsewhere", &destination).unwrap();
+            assert!(
+                mutate_copy_file_v3(
+                    &root,
+                    &source,
+                    &expected,
+                    &destination,
+                    &expected,
+                    &staging(&stage)
+                )
+                .is_err()
+            );
+            assert_eq!(
+                std::fs::read_link(&destination).unwrap(),
+                PathBuf::from("elsewhere")
+            );
+            std::fs::remove_file(&destination).unwrap();
+            std::fs::create_dir(&destination).unwrap();
+            assert!(
+                mutate_copy_file_v3(
+                    &root,
+                    &source,
+                    &expected,
+                    &destination,
+                    &expected,
+                    &staging(&stage)
+                )
+                .is_err()
+            );
+            assert!(std::fs::symlink_metadata(&destination).unwrap().is_dir());
+            std::fs::remove_dir(&destination).unwrap();
+            std::os::unix::fs::symlink("preserved", &stage).unwrap();
+            assert!(
+                mutate_copy_file_v3(
+                    &root,
+                    &source,
+                    &expected,
+                    &destination,
+                    &expected,
+                    &staging(&stage)
+                )
+                .is_err()
+            );
+            assert_eq!(
+                std::fs::read_link(&stage).unwrap(),
+                PathBuf::from("preserved")
+            );
+            std::fs::remove_file(&stage).unwrap();
+            let outside = TempDir::new().unwrap();
+            std::fs::write(outside.path().join("outside"), b"untouched").unwrap();
+            let outside_link = root.join("sub/outside-parent");
+            std::os::unix::fs::symlink(outside.path(), &outside_link).unwrap();
+            let escaped = outside_link.join("new");
+            assert!(
+                mutate_copy_file_v3(
+                    &root,
+                    &source,
+                    &expected,
+                    &escaped,
+                    &expected,
+                    &staging(&outside.path().join("stage"))
+                )
+                .is_err()
+            );
+            assert_eq!(
+                std::fs::read(outside.path().join("outside")).unwrap(),
+                b"untouched"
+            );
+            let missing = root.join("missing/child");
+            assert!(
+                mutate_copy_file_v3(
+                    &root,
+                    &source,
+                    &expected,
+                    &missing,
+                    &expected,
+                    &staging(&root.join("missing/.stage"))
+                )
+                .is_err()
+            );
+            assert!(!root.join("missing").exists());
+        }
+
+        #[test]
+        fn source_drift_special_file_and_symlink_ancestors_are_refused() {
+            let (_temp, root, source, destination, stage, expected) = setup(b"source");
+            std::fs::write(&source, b"drift").unwrap();
+            assert!(
+                mutate_copy_file_v3(
+                    &root,
+                    &source,
+                    &expected,
+                    &destination,
+                    &expected,
+                    &staging(&stage)
+                )
+                .is_err()
+            );
+            std::fs::remove_file(&source).unwrap();
+            std::os::unix::fs::symlink(root.join("sub"), &source).unwrap();
+            assert!(
+                mutate_copy_file_v3(
+                    &root,
+                    &source,
+                    &expected,
+                    &destination,
+                    &expected,
+                    &staging(&stage)
+                )
+                .is_err()
+            );
+            std::fs::remove_file(&source).unwrap();
+            std::process::Command::new("mkfifo")
+                .arg(&source)
+                .status()
+                .unwrap();
+            assert!(
+                mutate_copy_file_v3(
+                    &root,
+                    &source,
+                    &expected,
+                    &destination,
+                    &expected,
+                    &staging(&stage)
+                )
+                .is_err()
+            );
+            assert!(!destination.exists() && !stage.exists());
+        }
+
+        #[test]
+        fn every_artifact_fault_has_one_invocation_and_exact_partial_state() {
+            let points = [
+                ArtifactFaultPoint::StagingCreate,
+                ArtifactFaultPoint::Write,
+                ArtifactFaultPoint::Fchmod,
+                ArtifactFaultPoint::FileFsync,
+                ArtifactFaultPoint::Rename,
+                ArtifactFaultPoint::CopyParentFsync,
+            ];
+            for point in points {
+                let (_temp, root, source, destination, stage, expected) = setup(b"fault");
+                let desired = crate::lifecycle::RegularFileStateV3 {
+                    mode: 0o600,
+                    ..expected.clone()
+                };
+                let guard = arm_artifact_fault(point);
+                assert!(
+                    mutate_copy_file_v3(
+                        &root,
+                        &source,
+                        &expected,
+                        &destination,
+                        &desired,
+                        &staging(&stage)
+                    )
+                    .is_err()
+                );
+                assert_eq!(artifact_fault_invocation_count(point), 1);
+                match point {
+                    ArtifactFaultPoint::Rename | ArtifactFaultPoint::CopyParentFsync => {
+                        assert_eq!(std::fs::read(&destination).unwrap(), b"fault");
+                        assert!(!stage.exists());
+                    }
+                    ArtifactFaultPoint::StagingCreate => {
+                        assert_eq!(std::fs::read(&stage).unwrap(), b"");
+                        assert!(!destination.exists());
+                    }
+                    _ => {
+                        assert_eq!(std::fs::read(&stage).unwrap(), b"fault");
+                        assert!(!destination.exists());
+                    }
+                }
+                drop(guard);
+                assert_eq!(artifact_fault_invocation_count(point), 0);
+            }
+            for point in [
+                ArtifactFaultPoint::SymlinkCreate,
+                ArtifactFaultPoint::SymlinkParentFsync,
+            ] {
+                let (_temp, root, source, destination, _stage, expected) = setup(b"fault");
+                let target = crate::lifecycle::SymlinkStateV3 {
+                    target: StoredPath::from(source.clone()),
+                    target_digest: id(source.as_os_str().as_encoded_bytes()),
+                };
+                let guard = arm_artifact_fault(point);
+                assert!(
+                    mutate_create_symlink_v3(
+                        &root,
+                        &source,
+                        &crate::lifecycle::ArtifactSourceExpectationV3::Regular(expected),
+                        &destination,
+                        &target
+                    )
+                    .is_err()
+                );
+                assert_eq!(artifact_fault_invocation_count(point), 1);
+                assert_eq!(std::fs::read_link(&destination).unwrap(), source);
+                drop(guard);
+            }
+        }
+
+        #[test]
+        fn artifact_fault_guard_resets_on_unwind() {
+            let result = std::panic::catch_unwind(|| {
+                let _guard = arm_artifact_fault(ArtifactFaultPoint::Write);
+                panic!("intentional");
+            });
+            assert!(result.is_err());
+            assert_eq!(
+                artifact_fault_invocation_count(ArtifactFaultPoint::Write),
+                0
+            );
+        }
     }
 }

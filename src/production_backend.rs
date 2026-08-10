@@ -218,6 +218,7 @@ impl ProductionBackend {
         &mut self,
         plan: &OperationPlan,
         step: Option<&PlanStep>,
+        phase: crate::execution::ConditionPhase,
         condition: &Precondition,
     ) -> Result<bool, ProductionBackendError> {
         let listing = || self.list();
@@ -226,7 +227,22 @@ impl ProductionBackend {
             Precondition::ExactlyOnePrimary => listing()?.data.worktrees.iter().filter(|w| w.classification == WorktreeClass::Primary).count() == 1,
             Precondition::BareRepositoryFalse => !listing()?.data.repository.bare,
             Precondition::PathAbsent(path) => {
-                infrastructure::readonly_final_absent(path.as_path())?
+                let future_artifact_path = step.is_some_and(|step| match step.action() {
+                    StepAction::CopyFileV3 {
+                        destination,
+                        staging,
+                        ..
+                    } => path == destination || path == &staging.path,
+                    StepAction::CreateSymlinkV3 { destination, .. } => path == destination,
+                    _ => false,
+                });
+                if phase == crate::execution::ConditionPhase::InitialPreflight
+                    && future_artifact_path
+                {
+                    true
+                } else {
+                    infrastructure::readonly_final_absent(path.as_path())?
+                }
             }
             Precondition::ParentSafe(path) => Self::parent_safe(path.as_path())?,
             Precondition::RefAbsent(reference) => self.authoritative_ref(plan, reference.as_str(), None)?.is_none(),
@@ -259,8 +275,21 @@ impl ProductionBackend {
                 if rule != action_rule || source != action_source || destination != action_destination || digest != action_digest || manifest_digest != action_manifest || !matches!(kind, crate::planner::FileArtifactKind::CopyFile | crate::planner::FileArtifactKind::CreateSymlink | crate::planner::FileArtifactKind::RelinkSymlink) { return Ok(false); }
                 self.artifact_source(source_root.as_path(), source.as_path(), *kind, *bytes, digest)?
             }
-            Precondition::ArtifactSourceAtV3 { .. } | Precondition::TreeSymlinkAtV3 { .. } | Precondition::SymlinkAtV3 { .. } => {
-                return Err(ProductionBackendError::UnsupportedObservation("v3 artifact observation is phase-A unsupported"));
+            Precondition::ArtifactSourceAtV3 { rule, source_root, source, expectation, manifest_digest } => {
+                let Some(action) = step.map(|s| s.action()) else { return Ok(false) };
+                let matches = match action {
+                    StepAction::CopyFileV3 { rule: r, source_root: root, source: s, expected_source, manifest_digest: md, .. } =>
+                        r == rule && root == source_root && s == source && matches!(expectation, crate::lifecycle::ArtifactSourceExpectationV3::Regular(want) if expected_source == want) && md == manifest_digest,
+                    StepAction::CreateSymlinkV3 { rule: r, source_root: root, source: s, expected_source, manifest_digest: md, .. } =>
+                        r == rule && root == source_root && s == source && *expected_source == *expectation && md == manifest_digest,
+                    _ => false,
+                };
+                if !matches { return Ok(false); }
+                let Some(node) = infrastructure::readonly_observe_node(source_root.as_path(), source.as_path())? else { return Ok(false) };
+                infrastructure::source_expectation_matches(&node, expectation)
+            }
+            Precondition::TreeSymlinkAtV3 { .. } | Precondition::SymlinkAtV3 { .. } => {
+                return Err(ProductionBackendError::UnsupportedObservation("unsupported v3 artifact observation"));
             }
         })
     }
@@ -323,11 +352,49 @@ impl ExecutionBackend for ProductionBackend {
         }
         if matches!(
             precondition,
-            Precondition::ArtifactSourceAtV3 { .. }
-                | Precondition::TreeSymlinkAtV3 { .. }
-                | Precondition::SymlinkAtV3 { .. }
+            Precondition::TreeSymlinkAtV3 { .. } | Precondition::SymlinkAtV3 { .. }
         ) {
             return false;
+        }
+        if let Precondition::ArtifactSourceAtV3 {
+            rule,
+            source_root,
+            source,
+            expectation,
+            manifest_digest,
+        } = precondition
+        {
+            return match step.map(|s| s.action()) {
+                Some(StepAction::CopyFileV3 {
+                    rule: r,
+                    source_root: root,
+                    source: s,
+                    expected_source,
+                    manifest_digest: md,
+                    ..
+                }) => {
+                    r == rule
+                        && root == source_root
+                        && s == source
+                        && matches!(expectation, crate::lifecycle::ArtifactSourceExpectationV3::Regular(want) if expected_source == want)
+                        && md == manifest_digest
+                }
+                Some(StepAction::CreateSymlinkV3 {
+                    rule: r,
+                    source_root: root,
+                    source: s,
+                    expected_source,
+                    manifest_digest: md,
+                    ..
+                }) => {
+                    r == rule
+                        && root == source_root
+                        && s == source
+                        && expected_source == expectation
+                        && md == manifest_digest
+                }
+                _ => false,
+            };
         }
         match (precondition, step.map(|value| value.action())) {
             (
@@ -363,6 +430,8 @@ impl ExecutionBackend for ProductionBackend {
                 expected_oid: Some(_),
                 ..
             } => true,
+            StepAction::CopyFileV3 { publication: crate::lifecycle::PublicationStrategyV3::AtomicNoReplaceV1, .. }
+            | StepAction::CreateSymlinkV3 { expected_source: crate::lifecycle::ArtifactSourceExpectationV3::Regular(_) | crate::lifecycle::ArtifactSourceExpectationV3::Directory, .. } => true,
             StepAction::RemoveWorktree { path } => context.step().preconditions().iter().any(|condition| {
                 matches!(condition, Precondition::WorktreeClean { path: guarded } if *guarded == *path)
             }),
@@ -373,13 +442,21 @@ impl ExecutionBackend for ProductionBackend {
         &self,
         context: &crate::execution::StepExecutionContext<'_>,
     ) -> ProbeCapability {
+        if matches!(context.step().action(), StepAction::RelinkSymlinkV3 { .. }) {
+            return ProbeCapability::Unsupported;
+        }
         if matches!(
             context.step().action(),
-            StepAction::CopyFileV3 { .. }
-                | StepAction::CreateSymlinkV3 { .. }
-                | StepAction::RelinkSymlinkV3 { .. }
+            StepAction::CopyFileV3 {
+                publication: crate::lifecycle::PublicationStrategyV3::AtomicNoReplaceV1,
+                ..
+            } | StepAction::CreateSymlinkV3 {
+                expected_source: crate::lifecycle::ArtifactSourceExpectationV3::Regular(_)
+                    | crate::lifecycle::ArtifactSourceExpectationV3::Directory,
+                ..
+            }
         ) {
-            return ProbeCapability::Unsupported;
+            return ProbeCapability::Deterministic;
         }
         if matches!(context.step().action(), StepAction::RunTask { .. }) {
             ProbeCapability::UnknownAfterCrash
@@ -399,7 +476,7 @@ impl ExecutionBackend for ProductionBackend {
                 "artifact guard without FileArtifact step",
             ));
         }
-        self.condition(plan, step, precondition).map(|v| {
+        self.condition(plan, step, phase, precondition).map(|v| {
             if v {
                 ConditionResult::Satisfied
             } else {
@@ -423,6 +500,42 @@ impl ExecutionBackend for ProductionBackend {
                     destination.as_path(),
                     source,
                     &source_oid,
+                )?;
+                Ok(())
+            }
+            StepAction::CopyFileV3 {
+                source_root,
+                source,
+                expected_source,
+                destination,
+                desired_output,
+                staging,
+                ..
+            } => {
+                infrastructure::mutate_copy_file_v3(
+                    source_root.as_path(),
+                    source.as_path(),
+                    expected_source,
+                    destination.as_path(),
+                    desired_output,
+                    staging,
+                )?;
+                Ok(())
+            }
+            StepAction::CreateSymlinkV3 {
+                source_root,
+                source,
+                expected_source,
+                destination,
+                desired,
+                ..
+            } => {
+                infrastructure::mutate_create_symlink_v3(
+                    source_root.as_path(),
+                    source.as_path(),
+                    expected_source,
+                    destination.as_path(),
+                    desired,
                 )?;
                 Ok(())
             }
@@ -503,6 +616,70 @@ impl ExecutionBackend for ProductionBackend {
                     ProbeVerdict::NotApplied
                 },
             );
+        }
+        if let StepAction::CopyFileV3 {
+            destination,
+            desired_output,
+            staging,
+            ..
+        } = step.action()
+        {
+            let stage_absent = match infrastructure::readonly_final_absent(staging.path.as_path()) {
+                Ok(absent) => absent,
+                Err(_) => return Ok(ProbeVerdict::Unknown),
+            };
+            if !stage_absent {
+                return Ok(ProbeVerdict::Unknown);
+            }
+            let final_absent = match infrastructure::readonly_final_absent(destination.as_path()) {
+                Ok(absent) => absent,
+                Err(_) => return Ok(ProbeVerdict::Unknown),
+            };
+            if final_absent {
+                return Ok(ProbeVerdict::NotApplied);
+            }
+            let final_state =
+                match infrastructure::readonly_observe_absolute_node(destination.as_path()) {
+                    Ok(state) => state,
+                    Err(_) => return Ok(ProbeVerdict::Unknown),
+                };
+            return match final_state {
+                Some(infrastructure::ObservedNode::Regular { bytes, mode })
+                    if bytes.len() as u64 == desired_output.bytes
+                        && crate::planner::artifact_digest(&bytes) == desired_output.digest
+                        && mode == desired_output.mode =>
+                {
+                    Ok(ProbeVerdict::Applied)
+                }
+                None => Ok(ProbeVerdict::Unknown),
+                _ => Ok(ProbeVerdict::Unknown),
+            };
+        }
+        if let StepAction::CreateSymlinkV3 {
+            destination,
+            desired,
+            ..
+        } = step.action()
+        {
+            let final_absent = match infrastructure::readonly_final_absent(destination.as_path()) {
+                Ok(absent) => absent,
+                Err(_) => return Ok(ProbeVerdict::Unknown),
+            };
+            if final_absent {
+                return Ok(ProbeVerdict::NotApplied);
+            }
+            return match infrastructure::readonly_observe_absolute_node(destination.as_path()) {
+                Ok(Some(infrastructure::ObservedNode::Symlink { target }))
+                    if target == desired.target.as_path()
+                        && crate::planner::artifact_digest(
+                            target.as_os_str().as_encoded_bytes(),
+                        ) == desired.target_digest =>
+                {
+                    Ok(ProbeVerdict::Applied)
+                }
+                Ok(None) => Ok(ProbeVerdict::Unknown),
+                _ => Ok(ProbeVerdict::Unknown),
+            };
         }
         if let StepAction::CreateWorktree {
             destination,
@@ -767,6 +944,82 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn readonly_observer_fifo_swap_is_nonblocking_and_raii_scoped() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let regular = root.join("regular");
+        let directory = root.join("directory");
+        fs::write(&regular, b"stable bytes").unwrap();
+        fs::create_dir(&directory).unwrap();
+        assert!(matches!(
+            infrastructure::readonly_observe_node(root, &regular),
+            Ok(Some(infrastructure::ObservedNode::Regular { ref bytes, .. })) if bytes == b"stable bytes"
+        ));
+        assert!(matches!(
+            infrastructure::readonly_observe_node(root, &directory),
+            Ok(Some(infrastructure::ObservedNode::Directory))
+        ));
+
+        let guard = infrastructure::arm_observation_fifo_swap(&regular);
+        assert!(
+            infrastructure::readonly_observe_node(root, &regular)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fs::symlink_metadata(&regular)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        assert_eq!(infrastructure::observation_fifo_swap_invocation_count(), 1);
+        drop(guard);
+        assert_eq!(infrastructure::observation_fifo_swap_invocation_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_swap_during_copy_preflight_refuses_before_journal_or_invoke() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let (temp, plan, destination, staging) = copy_fixture();
+        let root = temp.path();
+        let source = root.join("artifact");
+        let before = fs::read(root.join("tracked")).unwrap();
+        let guard = infrastructure::arm_observation_fifo_swap(&source);
+        let outcome = ExecutionEngine::new(ProductionBackend::new(root.to_owned()))
+            .execute(plan.clone())
+            .unwrap();
+        assert!(matches!(outcome, ExecutionOutcome::PreflightRefused { .. }));
+        assert_eq!(infrastructure::observation_fifo_swap_invocation_count(), 1);
+        assert!(fs::symlink_metadata(&source).unwrap().file_type().is_fifo());
+        assert!(!destination.exists());
+        assert!(!staging.exists());
+        assert_eq!(fs::read(root.join("tracked")).unwrap(), before);
+        let journal_entries = fs::read_dir(root.join(".git/ewtm/journal"))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(journal_entries, 0);
+        for point in [
+            infrastructure::ArtifactFaultPoint::StagingCreate,
+            infrastructure::ArtifactFaultPoint::Write,
+            infrastructure::ArtifactFaultPoint::Fchmod,
+            infrastructure::ArtifactFaultPoint::FileFsync,
+            infrastructure::ArtifactFaultPoint::Rename,
+            infrastructure::ArtifactFaultPoint::CopyParentFsync,
+            infrastructure::ArtifactFaultPoint::SymlinkCreate,
+            infrastructure::ArtifactFaultPoint::SymlinkParentFsync,
+        ] {
+            assert_eq!(infrastructure::artifact_fault_invocation_count(point), 0);
+        }
+        drop(guard);
+        assert_eq!(infrastructure::observation_fifo_swap_invocation_count(), 0);
+    }
+
     #[test]
     fn unsupported_actions_remain_mutation_unavailable() {
         let temp = repository();
@@ -906,6 +1159,15 @@ mod tests {
         destination: &Path,
         branch: &str,
     ) -> crate::lifecycle::OperationPlan {
+        executable_new_branch_plan_with_manifests(root, destination, branch, vec![])
+    }
+
+    fn executable_new_branch_plan_with_manifests(
+        root: &Path,
+        destination: &Path,
+        branch: &str,
+        manifests: Vec<crate::planner::FileActionManifest>,
+    ) -> crate::lifecycle::OperationPlan {
         let repository = ProductionBackend::new(root.to_owned())
             .discover_repository()
             .unwrap()
@@ -915,17 +1177,30 @@ mod tests {
             branch: branch.clone(),
             base: Some(RefName::new("refs/heads/main").unwrap()),
         };
+        let mut granted_consents = BTreeSet::new();
+        if manifests
+            .iter()
+            .flat_map(|manifest| manifest.artifacts.iter())
+            .any(|artifact| artifact.sensitive)
+        {
+            granted_consents.insert(crate::lifecycle::ConsentId::new("file-rule:fixture").unwrap());
+        }
         let intent = crate::lifecycle::CreateIntent {
             repository: repository.clone(),
             source: source.clone(),
             destination: Some(stored(destination.to_owned())),
             selected_tasks: BTreeSet::new(),
             skipped_rules: BTreeSet::new(),
-            granted_consents: BTreeSet::new(),
+            granted_consents,
             task_contracts: BTreeMap::new(),
             current_worktree_root: Some(stored(root.to_owned())),
             artifact_rule_contracts: BTreeMap::new(),
         };
+        let known_rules = manifests
+            .iter()
+            .map(|m| m.rule.clone())
+            .collect::<BTreeSet<_>>();
+        let enabled_rules = known_rules.clone();
         crate::planner::plan_create(crate::planner::CreatePlanInput {
             operation_id: crate::planner::new_operation_id(),
             repository: repository.clone(),
@@ -949,13 +1224,560 @@ mod tests {
             },
             branch_checked_out: false,
             branch_collision: false,
-            known_rules: BTreeSet::new(),
-            enabled_rules: BTreeSet::new(),
+            known_rules,
+            enabled_rules,
             known_tasks: BTreeSet::new(),
-            manifests: vec![],
+            manifests,
             tasks: vec![],
         })
         .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn artifact_manifest(
+        root: &Path,
+        destination: &Path,
+        source_name: &str,
+        kind: crate::planner::FileArtifactKind,
+        mode_policy: crate::planner::FileModePolicy,
+    ) -> crate::planner::FileActionManifest {
+        use std::os::unix::fs::PermissionsExt;
+        let source = root.join(source_name);
+        let source_path = stored(source.clone());
+        let destination_path = stored(destination.join(source_name));
+        let (expectation, bytes, digest, link_target) = match kind {
+            crate::planner::FileArtifactKind::CopyFile => {
+                let data = fs::read(&source).unwrap();
+                let mode = fs::metadata(&source).unwrap().permissions().mode() & 0o7777;
+                (
+                    crate::lifecycle::ArtifactSourceExpectationV3::Regular(
+                        crate::lifecycle::RegularFileStateV3 {
+                            bytes: data.len() as u64,
+                            digest: crate::planner::artifact_digest(&data),
+                            mode,
+                        },
+                    ),
+                    data.len() as u64,
+                    crate::planner::artifact_digest(&data),
+                    None,
+                )
+            }
+            crate::planner::FileArtifactKind::CreateSymlink => {
+                let target = source.as_os_str().as_encoded_bytes();
+                (
+                    if source.is_dir() {
+                        crate::lifecycle::ArtifactSourceExpectationV3::Directory
+                    } else {
+                        let data = fs::read(&source).unwrap();
+                        crate::lifecycle::ArtifactSourceExpectationV3::Regular(
+                            crate::lifecycle::RegularFileStateV3 {
+                                bytes: data.len() as u64,
+                                digest: crate::planner::artifact_digest(&data),
+                                mode: fs::metadata(&source).unwrap().permissions().mode() & 0o7777,
+                            },
+                        )
+                    },
+                    target.len() as u64,
+                    crate::planner::artifact_digest(target),
+                    Some(source_path.clone()),
+                )
+            }
+            crate::planner::FileArtifactKind::RelinkSymlink => unreachable!(),
+        };
+        crate::planner::FileActionManifest {
+            rule: "fixture".into(),
+            source_root: stored(root.to_owned()),
+            artifacts: vec![crate::planner::FileArtifact {
+                kind,
+                source: source_path,
+                destination: destination_path,
+                bytes,
+                digest: digest.clone(),
+                source_expectation: expectation,
+                fingerprint: digest,
+                link_target,
+                sensitive: mode_policy == crate::planner::FileModePolicy::Private,
+                mode_policy,
+                confirm: false,
+                conflict: false,
+                overlap: false,
+                replace_symlink: false,
+                compensation: None,
+            }],
+            digest: crate::planner::artifact_digest(b"fixture-manifest-placeholder"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn artifact_step(plan: &crate::lifecycle::OperationPlan) -> &PlanStep {
+        &plan.steps()[1]
+    }
+
+    #[cfg(unix)]
+    fn artifact_destination(plan: &crate::lifecycle::OperationPlan) -> PathBuf {
+        match artifact_step(plan).action() {
+            StepAction::CopyFileV3 { destination, .. }
+            | StepAction::CreateSymlinkV3 { destination, .. } => destination.clone().into_path(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn artifact_probe(
+        backend: &mut ProductionBackend,
+        plan: &crate::lifecycle::OperationPlan,
+    ) -> ProbeVerdict {
+        let step = artifact_step(plan);
+        let context = crate::execution::StepExecutionContext::new(plan, step);
+        backend
+            .probe(
+                &context,
+                ProbeContext::AfterAttempt {
+                    executor_succeeded: false,
+                },
+            )
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn journal_for(root: &Path, plan: &crate::lifecycle::OperationPlan) -> crate::journal::Journal {
+        crate::journal_store::JournalStore::new(&root.join(".git"))
+            .read(plan.operation_id())
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn copy_fixture() -> (TempDir, crate::lifecycle::OperationPlan, PathBuf, PathBuf) {
+        let temp = repository();
+        let root = temp.path();
+        let source = root.join("artifact");
+        fs::write(&source, b"durable fixture").unwrap();
+        let destination = root.join("linked");
+        let manifest = artifact_manifest(
+            root,
+            &destination,
+            "artifact",
+            crate::planner::FileArtifactKind::CopyFile,
+            crate::planner::FileModePolicy::Private,
+        );
+        let plan = executable_new_branch_plan_with_manifests(
+            root,
+            &destination,
+            "artifact-branch",
+            vec![manifest],
+        );
+        let staging = match artifact_step(&plan).action() {
+            StepAction::CopyFileV3 { staging, .. } => staging.path.clone().into_path(),
+            _ => unreachable!(),
+        };
+        (temp, plan.clone(), artifact_destination(&plan), staging)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_faults_before_publication_remain_owned_and_need_attention() {
+        use std::os::unix::fs::PermissionsExt;
+        for point in [
+            infrastructure::ArtifactFaultPoint::StagingCreate,
+            infrastructure::ArtifactFaultPoint::Write,
+            infrastructure::ArtifactFaultPoint::Fchmod,
+            infrastructure::ArtifactFaultPoint::FileFsync,
+        ] {
+            let (temp, plan, final_path, staging) = copy_fixture();
+            let root = temp.path();
+            let guard = infrastructure::arm_artifact_fault(point);
+            let first = ExecutionEngine::new(ProductionBackend::new(root.to_owned()))
+                .execute(plan.clone())
+                .unwrap();
+            assert!(matches!(first, ExecutionOutcome::NeedsAttention { .. }));
+            assert_eq!(infrastructure::artifact_fault_invocation_count(point), 1);
+            assert!(!final_path.exists());
+            let staged_bytes = fs::read(&staging).unwrap();
+            if point == infrastructure::ArtifactFaultPoint::StagingCreate {
+                assert!(staged_bytes.is_empty());
+            } else {
+                assert_eq!(staged_bytes, b"durable fixture");
+            }
+            let snapshot = (
+                fs::read(&staging).unwrap(),
+                fs::metadata(&staging).unwrap().permissions().mode() & 0o7777,
+            );
+            assert_eq!(
+                artifact_probe(&mut ProductionBackend::new(root.to_owned()), &plan),
+                ProbeVerdict::Unknown
+            );
+            let journal = journal_for(root, &plan);
+            assert_eq!(
+                journal.status(),
+                crate::journal::OperationStatus::NeedsAttention
+            );
+            assert_eq!(
+                journal.steps()[1].status(),
+                crate::journal::StepStatus::NeedsAttention
+            );
+            let bytes = fs::read(
+                root.join(".git/ewtm/journal")
+                    .join(format!("{}.json", plan.operation_id())),
+            )
+            .unwrap();
+            let second = ExecutionEngine::new(ProductionBackend::new(root.to_owned()))
+                .execute(plan.clone())
+                .unwrap();
+            assert!(matches!(second, ExecutionOutcome::ExistingOperation { .. }));
+            assert_eq!(infrastructure::artifact_fault_invocation_count(point), 1);
+            assert_eq!(
+                snapshot,
+                (
+                    fs::read(&staging).unwrap(),
+                    fs::metadata(&staging).unwrap().permissions().mode() & 0o7777
+                )
+            );
+            assert!(!final_path.exists());
+            assert_eq!(
+                bytes,
+                fs::read(
+                    root.join(".git/ewtm/journal")
+                        .join(format!("{}.json", plan.operation_id()))
+                )
+                .unwrap()
+            );
+            drop(guard);
+            assert_eq!(infrastructure::artifact_fault_invocation_count(point), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_faults_after_publication_reconcile_applied() {
+        use std::os::unix::fs::PermissionsExt;
+        for point in [
+            infrastructure::ArtifactFaultPoint::Rename,
+            infrastructure::ArtifactFaultPoint::CopyParentFsync,
+        ] {
+            let (temp, plan, final_path, staging) = copy_fixture();
+            let root = temp.path();
+            let guard = infrastructure::arm_artifact_fault(point);
+            let outcome = ExecutionEngine::new(ProductionBackend::new(root.to_owned()))
+                .execute(plan.clone())
+                .unwrap();
+            assert!(
+                matches!(outcome, ExecutionOutcome::Applied { .. }),
+                "{outcome:?}"
+            );
+            assert_eq!(infrastructure::artifact_fault_invocation_count(point), 1);
+            assert_eq!(fs::read(&final_path).unwrap(), b"durable fixture");
+            assert_eq!(
+                fs::metadata(&final_path).unwrap().permissions().mode() & 0o7777,
+                0o600
+            );
+            assert!(!staging.exists());
+            assert_eq!(
+                artifact_probe(&mut ProductionBackend::new(root.to_owned()), &plan),
+                ProbeVerdict::Applied
+            );
+            assert_eq!(
+                journal_for(root, &plan).status(),
+                crate::journal::OperationStatus::Applied
+            );
+            drop(guard);
+            assert_eq!(infrastructure::artifact_fault_invocation_count(point), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_durability_faults_reconcile_applied() {
+        for (point, source_name) in [
+            (
+                infrastructure::ArtifactFaultPoint::SymlinkCreate,
+                "link-source",
+            ),
+            (
+                infrastructure::ArtifactFaultPoint::SymlinkParentFsync,
+                "link-source-2",
+            ),
+        ] {
+            let temp = repository();
+            let root = temp.path();
+            let source = root.join(source_name);
+            fs::write(&source, b"target").unwrap();
+            let destination = root.join(format!("linked-{source_name}"));
+            let manifest = artifact_manifest(
+                root,
+                &destination,
+                source_name,
+                crate::planner::FileArtifactKind::CreateSymlink,
+                crate::planner::FileModePolicy::NotApplicable,
+            );
+            let plan = executable_new_branch_plan_with_manifests(
+                root,
+                &destination,
+                &format!("branch-{source_name}"),
+                vec![manifest],
+            );
+            let guard = infrastructure::arm_artifact_fault(point);
+            let outcome = ExecutionEngine::new(ProductionBackend::new(root.to_owned()))
+                .execute(plan.clone())
+                .unwrap();
+            assert!(
+                matches!(outcome, ExecutionOutcome::Applied { .. }),
+                "{outcome:?}"
+            );
+            assert_eq!(infrastructure::artifact_fault_invocation_count(point), 1);
+            assert_eq!(fs::read_link(artifact_destination(&plan)).unwrap(), source);
+            assert_eq!(
+                artifact_probe(&mut ProductionBackend::new(root.to_owned()), &plan),
+                ProbeVerdict::Applied
+            );
+            assert_eq!(
+                journal_for(root, &plan).status(),
+                crate::journal::OperationStatus::Applied
+            );
+            drop(guard);
+            assert_eq!(infrastructure::artifact_fault_invocation_count(point), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_probe_classifies_contradictory_states_unknown() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let (temp, plan, final_path, staging) = copy_fixture();
+        let root = temp.path();
+        fs::create_dir(root.join("linked")).unwrap();
+        let mut backend = ProductionBackend::new(root.to_owned());
+        assert_eq!(
+            artifact_probe(&mut backend, &plan),
+            ProbeVerdict::NotApplied
+        );
+        fs::write(&staging, b"durable fixture").unwrap();
+        assert_eq!(artifact_probe(&mut backend, &plan), ProbeVerdict::Unknown);
+        fs::remove_file(&staging).unwrap();
+        fs::write(&final_path, b"wrong").unwrap();
+        assert_eq!(artifact_probe(&mut backend, &plan), ProbeVerdict::Unknown);
+        fs::write(&final_path, b"durable fixture").unwrap();
+        fs::set_permissions(&final_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(artifact_probe(&mut backend, &plan), ProbeVerdict::Unknown);
+        fs::remove_file(&final_path).unwrap();
+        fs::create_dir(&final_path).unwrap();
+        assert_eq!(artifact_probe(&mut backend, &plan), ProbeVerdict::Unknown);
+        fs::remove_dir(&final_path).unwrap();
+        let temp = repository();
+        let root = temp.path();
+        let source = root.join("target");
+        fs::write(&source, b"target").unwrap();
+        let destination = root.join("linked");
+        let manifest = artifact_manifest(
+            root,
+            &destination,
+            "target",
+            crate::planner::FileArtifactKind::CreateSymlink,
+            crate::planner::FileModePolicy::NotApplicable,
+        );
+        let plan = executable_new_branch_plan_with_manifests(
+            root,
+            &destination,
+            "symlink-probe",
+            vec![manifest],
+        );
+        let final_path = artifact_destination(&plan);
+        fs::create_dir(&destination).unwrap();
+        let mut backend = ProductionBackend::new(root.to_owned());
+        assert_eq!(
+            artifact_probe(&mut backend, &plan),
+            ProbeVerdict::NotApplied
+        );
+        symlink(&source, &final_path).unwrap();
+        assert_eq!(artifact_probe(&mut backend, &plan), ProbeVerdict::Applied);
+        fs::remove_file(&final_path).unwrap();
+        symlink("wrong", &final_path).unwrap();
+        assert_eq!(artifact_probe(&mut backend, &plan), ProbeVerdict::Unknown);
+        fs::remove_file(&final_path).unwrap();
+        fs::write(&final_path, b"regular").unwrap();
+        assert_eq!(artifact_probe(&mut backend, &plan), ProbeVerdict::Unknown);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_support_boundaries_precede_state() {
+        let (temp, plan, _, _) = copy_fixture();
+        let root = temp.path();
+        let step = artifact_step(&plan).clone();
+        let mut mismatched = step.clone();
+        mismatched.preconditions_mut()[0] = Precondition::ArtifactSourceAtV3 {
+            rule: "other".into(),
+            source_root: stored(root.to_owned()),
+            source: stored(root.join("artifact")),
+            expectation: match step.action() {
+                StepAction::CopyFileV3 {
+                    expected_source, ..
+                } => {
+                    crate::lifecycle::ArtifactSourceExpectationV3::Regular(expected_source.clone())
+                }
+                _ => unreachable!(),
+            },
+            manifest_digest: ObjectId::new("0".repeat(40)).unwrap(),
+        };
+        let mismatched_plan = context_plan(&plan, mismatched.clone());
+        let backend = ProductionBackend::new(root.to_owned());
+        for phase in [
+            crate::execution::ConditionPhase::InitialPreflight,
+            crate::execution::ConditionPhase::BeforeInvoke,
+        ] {
+            assert!(!backend.supports_precondition(
+                &mismatched_plan,
+                Some(&mismatched),
+                phase,
+                &mismatched.preconditions()[0]
+            ));
+        }
+        assert!(matches!(
+            ExecutionEngine::new(ProductionBackend::new(root.to_owned())).execute(mismatched_plan),
+            Err(crate::execution::ExecutionError::UnsupportedPlan(_))
+        ));
+        assert!(!root.join(".git/ewtm").exists());
+        let mut probe_only = step;
+        probe_only
+            .preconditions_mut()
+            .push(Precondition::TreeSymlinkAtV3 {
+                commit_oid: oid(root, "HEAD"),
+                checkout_relative_path: stored("artifact"),
+                expected: crate::lifecycle::SymlinkStateV3 {
+                    target: stored(root.join("artifact")),
+                    target_digest: crate::planner::artifact_digest(
+                        root.join("artifact").as_os_str().as_encoded_bytes(),
+                    ),
+                },
+            });
+        let probe_plan = context_plan(&plan, probe_only.clone());
+        assert!(!backend.supports_precondition(
+            &probe_plan,
+            Some(&probe_only),
+            crate::execution::ConditionPhase::InitialPreflight,
+            probe_only.preconditions().last().unwrap()
+        ));
+        assert!(!backend.supports_precondition(
+            &probe_plan,
+            Some(&probe_only),
+            crate::execution::ConditionPhase::BeforeInvoke,
+            probe_only.preconditions().last().unwrap()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn engine_applies_v3_artifacts_with_exact_state() {
+        use std::os::unix::fs::PermissionsExt;
+        for (kind, policy, source_name) in [
+            (
+                crate::planner::FileArtifactKind::CopyFile,
+                crate::planner::FileModePolicy::Private,
+                "private",
+            ),
+            (
+                crate::planner::FileArtifactKind::CopyFile,
+                crate::planner::FileModePolicy::PreserveSafe,
+                "safe",
+            ),
+            (
+                crate::planner::FileArtifactKind::CreateSymlink,
+                crate::planner::FileModePolicy::NotApplicable,
+                "regular",
+            ),
+            (
+                crate::planner::FileArtifactKind::CreateSymlink,
+                crate::planner::FileModePolicy::NotApplicable,
+                "directory",
+            ),
+        ] {
+            let temp = repository();
+            let root = temp.path();
+            let source = root.join(source_name);
+            if source_name == "directory" {
+                fs::create_dir(&source).unwrap();
+            } else {
+                fs::write(&source, b"fixture bytes\0").unwrap();
+            }
+            fs::set_permissions(
+                &source,
+                fs::Permissions::from_mode(if source_name == "safe" { 0o6777 } else { 0o754 }),
+            )
+            .unwrap_or(());
+            let destination = root.join(format!("linked-{source_name}"));
+            let manifest = artifact_manifest(root, &destination, source_name, kind, policy);
+            let plan = executable_new_branch_plan_with_manifests(
+                root,
+                &destination,
+                &format!("b-{source_name}"),
+                vec![manifest],
+            );
+            assert_eq!(plan.steps().len(), 2);
+            assert!(matches!(
+                artifact_step(&plan).action(),
+                StepAction::CopyFileV3 { .. } | StepAction::CreateSymlinkV3 { .. }
+            ));
+            let backend = ProductionBackend::new(root.to_owned());
+            let context = crate::execution::StepExecutionContext::new(&plan, artifact_step(&plan));
+            assert_eq!(
+                backend.probe_capability(&context),
+                ProbeCapability::Deterministic
+            );
+            for phase in [
+                crate::execution::ConditionPhase::InitialPreflight,
+                crate::execution::ConditionPhase::BeforeInvoke,
+            ] {
+                let guard = &artifact_step(&plan).preconditions()[0];
+                assert!(backend.supports_precondition(
+                    &plan,
+                    Some(artifact_step(&plan)),
+                    phase,
+                    guard
+                ));
+            }
+            let outcome = ExecutionEngine::new(ProductionBackend::new(root.to_owned()))
+                .execute(plan.clone())
+                .unwrap();
+            assert!(matches!(outcome, ExecutionOutcome::Applied { .. }));
+            let output = artifact_destination(&plan);
+            match kind {
+                crate::planner::FileArtifactKind::CopyFile => {
+                    let desired = match artifact_step(&plan).action() {
+                        StepAction::CopyFileV3 { desired_output, .. } => desired_output,
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(fs::read(&output).unwrap(), fs::read(&source).unwrap());
+                    assert_eq!(
+                        fs::metadata(&output).unwrap().permissions().mode() & 0o7777,
+                        desired.mode
+                    );
+                    if let StepAction::CopyFileV3 { staging, .. } = artifact_step(&plan).action() {
+                        assert!(!staging.path.as_path().exists());
+                    }
+                }
+                crate::planner::FileArtifactKind::CreateSymlink => {
+                    let target = fs::read_link(&output).unwrap();
+                    assert_eq!(target, source);
+                    let desired = match artifact_step(&plan).action() {
+                        StepAction::CreateSymlinkV3 { desired, .. } => desired,
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(
+                        crate::planner::artifact_digest(target.as_os_str().as_encoded_bytes()),
+                        desired.target_digest
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let journal = journal_for(root, &plan);
+            assert_eq!(journal.status(), crate::journal::OperationStatus::Applied);
+            assert!(
+                journal
+                    .steps()
+                    .iter()
+                    .all(|s| s.status() == crate::journal::StepStatus::Applied)
+            );
+            assert!(!journal.is_unresolved());
+        }
     }
 
     #[test]
