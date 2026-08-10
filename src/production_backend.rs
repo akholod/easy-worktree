@@ -1242,7 +1242,8 @@ mod tests {
         mode_policy: crate::planner::FileModePolicy,
     ) -> crate::planner::FileActionManifest {
         use std::os::unix::fs::PermissionsExt;
-        let source = root.join(source_name);
+        let source_root = root.canonicalize().unwrap();
+        let source = source_root.join(source_name);
         let source_path = stored(source.clone());
         let destination_path = stored(destination.join(source_name));
         let (expectation, bytes, digest, link_target) = match kind {
@@ -1286,7 +1287,7 @@ mod tests {
         };
         crate::planner::FileActionManifest {
             rule: "fixture".into(),
-            source_root: stored(root.to_owned()),
+            source_root: stored(source_root),
             artifacts: vec![crate::planner::FileArtifact {
                 kind,
                 source: source_path,
@@ -1756,11 +1757,11 @@ mod tests {
                 }
                 crate::planner::FileArtifactKind::CreateSymlink => {
                     let target = fs::read_link(&output).unwrap();
-                    assert_eq!(target, source);
                     let desired = match artifact_step(&plan).action() {
                         StepAction::CreateSymlinkV3 { desired, .. } => desired,
                         _ => unreachable!(),
                     };
+                    assert_eq!(target, desired.target.as_path());
                     assert_eq!(
                         crate::planner::artifact_digest(target.as_os_str().as_encoded_bytes()),
                         desired.target_digest

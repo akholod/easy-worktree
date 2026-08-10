@@ -3504,6 +3504,7 @@ mod tests {
     #[cfg(unix)]
     mod artifact_primitives {
         use super::*;
+        #[cfg(not(target_os = "macos"))]
         use std::os::unix::ffi::OsStringExt;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -3619,6 +3620,7 @@ mod tests {
             assert_eq!(std::fs::read_link(out).unwrap(), dir);
         }
 
+        #[cfg(not(target_os = "macos"))]
         #[test]
         fn unix_non_utf8_names_are_preserved() {
             let (_temp, root, _source, _destination, _stage, _) = setup(b"unused");
