@@ -2603,6 +2603,7 @@ pub(crate) fn assert_shape_valid_but_not_executable(value: serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use serde_json::json;
     use std::{collections::BTreeSet, path::PathBuf};
 

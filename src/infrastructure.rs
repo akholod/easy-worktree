@@ -703,7 +703,12 @@ fn ignored_candidates(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, PlanningEr
         .split(|byte| *byte == 0)
         .filter(|value| !value.is_empty())
     {
-        let relative = PathBuf::from(std::ffi::OsString::from_vec(value.to_vec()));
+        let relative = PathBuf::from(platform_os_string(value).map_err(|_| {
+            planning(
+                "path_encoding",
+                "Git path is not representable on this platform",
+            )
+        })?);
         result.push((relative.clone(), root.join(relative)));
     }
     Ok(result)
@@ -796,7 +801,7 @@ fn relink_checkout_facts(
     }))
 }
 
-fn observe_committed_tree_symlink(
+pub(crate) fn observe_committed_tree_symlink(
     repo: &Path,
     commit_oid: &ObjectId,
     relative: &Path,
@@ -809,7 +814,7 @@ fn observe_committed_tree_symlink(
         OsString::from("--full-tree"),
         OsString::from(commit_oid.as_str()),
         OsString::from("--"),
-        std::ffi::OsString::from_vec(path.to_vec()),
+        relative.as_os_str().to_os_string(),
     ];
     let listing =
         git(repo, args).map_err(|error| planning("tree_subprocess", &error.to_string()))?;
@@ -822,11 +827,88 @@ fn observe_committed_tree_symlink(
             "committed symlink target is empty or contains NUL",
         ));
     }
-    let target = StoredPath::from(PathBuf::from(OsString::from_vec(blob.stdout)));
+    let target = StoredPath::from(PathBuf::from(platform_os_string(&blob.stdout).map_err(
+        |_| {
+            planning(
+                "tree_invalid_target",
+                "committed symlink target is not representable on this platform",
+            )
+        },
+    )?));
     Ok(crate::lifecycle::SymlinkStateV3 {
         target: target.clone(),
         target_digest: digest_bytes(target.as_path().as_os_str().as_encoded_bytes()),
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) enum RelinkProbeState {
+    NotApplied,
+    Applied,
+    Unknown,
+}
+
+#[cfg(unix)]
+pub(crate) fn probe_relink_symlink_v3(
+    destination: &Path,
+    replacement: &Path,
+    backup: &Path,
+    expected_old: &crate::lifecycle::SymlinkStateV3,
+    desired: &crate::lifecycle::SymlinkStateV3,
+) -> Result<RelinkProbeState, GitError> {
+    use rustix::fs::{AtFlags, FileType, readlinkat, statat};
+    let destination = validate_mutation_path(destination)?;
+    let replacement = validate_mutation_path(replacement)?;
+    let backup = validate_mutation_path(backup)?;
+    if destination.parent() != replacement.parent() || destination.parent() != backup.parent() {
+        return Ok(RelinkProbeState::Unknown);
+    }
+    let (parent, destination_name) = mutation_parent(&destination)?;
+    let replacement_name = replacement.file_name().unwrap().to_owned();
+    let backup_name = backup.file_name().unwrap().to_owned();
+    let state = |name: &OsString| -> Result<Option<Vec<u8>>, GitError> {
+        let stat = match statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(value) => value,
+            Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+            Err(error) => return Err(GitError::Command(error.to_string())),
+        };
+        if !FileType::from_raw_mode(stat.st_mode).is_symlink() {
+            return Ok(Some(Vec::new()));
+        }
+        Ok(Some(
+            readlinkat(&parent, name, Vec::new())
+                .map_err(|e| GitError::Command(e.to_string()))?
+                .into_bytes(),
+        ))
+    };
+    let destination_state = state(&destination_name)?;
+    let replacement_state = state(&replacement_name)?;
+    let backup_state = state(&backup_name)?;
+    if replacement_state.is_some() || backup_state.is_some() {
+        return Ok(RelinkProbeState::Unknown);
+    }
+    match destination_state {
+        None => Ok(RelinkProbeState::Unknown),
+        Some(actual) if actual == expected_old.target.as_path().as_os_str().as_encoded_bytes() => {
+            Ok(RelinkProbeState::NotApplied)
+        }
+        Some(actual) if actual == desired.target.as_path().as_os_str().as_encoded_bytes() => {
+            Ok(RelinkProbeState::Applied)
+        }
+        Some(_) => Ok(RelinkProbeState::Unknown),
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn probe_relink_symlink_v3(
+    _: &Path,
+    _: &Path,
+    _: &Path,
+    _: &crate::lifecycle::SymlinkStateV3,
+    _: &crate::lifecycle::SymlinkStateV3,
+) -> Result<RelinkProbeState, GitError> {
+    Ok(RelinkProbeState::Unknown)
 }
 
 fn parse_tree_listing(stdout: &[u8], expected_path: &[u8]) -> Result<ObjectId, PlanningError> {
@@ -1511,7 +1593,7 @@ fn parse_path_line(bytes: &[u8]) -> Result<PathBuf, GitError> {
     if value.is_empty() {
         return Err(GitError::Discovery("empty path output".into()));
     }
-    Ok(PathBuf::from(os_string(&value)))
+    Ok(PathBuf::from(os_string(&value)?))
 }
 
 fn warning(code: &str, message: &str, path: &Path) -> Warning {
@@ -1564,7 +1646,7 @@ fn parse_worktrees(bytes: &[u8]) -> Result<Vec<WorktreeRecord>, GitError> {
                 return Err(GitError::Parse("empty worktree path".into()));
             }
             current = Some(WorktreeRecord {
-                path: PathBuf::from(os_string(value)),
+                path: PathBuf::from(os_string(value)?),
                 head: None,
                 branch: None,
                 detached: false,
@@ -1751,19 +1833,25 @@ fn utf8(value: &[u8]) -> Result<&str, GitError> {
 }
 
 #[cfg(unix)]
-fn os_string(value: &[u8]) -> std::ffi::OsString {
+fn platform_os_string(value: &[u8]) -> Result<std::ffi::OsString, ()> {
     use std::os::unix::ffi::OsStringExt;
-    std::ffi::OsString::from_vec(value.to_vec())
+    Ok(std::ffi::OsString::from_vec(value.to_vec()))
 }
 #[cfg(not(unix))]
-fn os_string(value: &[u8]) -> std::ffi::OsString {
-    std::ffi::OsString::from(String::from_utf8_lossy(value).into_owned())
+fn platform_os_string(value: &[u8]) -> Result<std::ffi::OsString, ()> {
+    String::from_utf8(value.to_vec())
+        .map(std::ffi::OsString::from)
+        .map_err(|_| ())
+}
+fn os_string(value: &[u8]) -> Result<std::ffi::OsString, GitError> {
+    platform_os_string(value).map_err(|_| GitError::Parse("non-UTF-8 path metadata".into()))
 }
 
 struct Output {
     stdout: Vec<u8>,
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ObservedNode {
     Regular { bytes: Vec<u8>, mode: u32 },
@@ -1784,6 +1872,14 @@ fn exact_source(
             bytes.len() as u64 == want.bytes
                 && crate::planner::artifact_digest(bytes) == want.digest
                 && *mode == want.mode
+        }
+        (
+            ObservedNode::Symlink { target },
+            crate::lifecycle::ArtifactSourceExpectationV3::Symlink(want),
+        ) => {
+            target == want.target.as_path()
+                && crate::planner::artifact_digest(target.as_os_str().as_encoded_bytes())
+                    == want.target_digest
         }
         _ => false,
     }
@@ -2395,17 +2491,33 @@ pub(crate) enum ArtifactFaultPoint {
     CopyParentFsync,
     SymlinkCreate,
     SymlinkParentFsync,
+    RelinkReplacementCreate,
+    RelinkReplacementFsync,
+    RelinkBackupRename,
+    RelinkBackupFsync,
+    RelinkPublicationRename,
+    RelinkPublicationFsync,
+    RelinkBackupUnlink,
+    RelinkCleanupFsync,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RelinkVerificationPoint {
+    Replacement,
+    Backup,
+    Publication,
 }
 
 #[cfg(all(unix, test))]
 struct ArtifactFaultState {
     armed: Option<ArtifactFaultPoint>,
-    counts: [usize; 8],
+    counts: [usize; 16],
 }
 #[cfg(all(unix, test))]
 thread_local! {
     static ARTIFACT_FAULT: std::cell::RefCell<ArtifactFaultState> = const {
-        std::cell::RefCell::new(ArtifactFaultState { armed: None, counts: [0; 8] })
+        std::cell::RefCell::new(ArtifactFaultState { armed: None, counts: [0; 16] })
     };
 }
 #[cfg(all(unix, test))]
@@ -2417,7 +2529,7 @@ pub(crate) fn arm_artifact_fault(point: ArtifactFaultPoint) -> ArtifactFaultGuar
     ARTIFACT_FAULT.with(|state| {
         let mut state = state.borrow_mut();
         state.armed = Some(point);
-        state.counts = [0; 8];
+        state.counts = [0; 16];
     });
     ArtifactFaultGuard
 }
@@ -2432,9 +2544,61 @@ impl Drop for ArtifactFaultGuard {
         ARTIFACT_FAULT.with(|state| {
             let mut state = state.borrow_mut();
             state.armed = None;
-            state.counts = [0; 8];
+            state.counts = [0; 16];
         });
     }
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    static RELINK_INTERFERENCE: std::cell::RefCell<Option<(RelinkVerificationPoint, Vec<u8>)>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(all(unix, test))]
+#[allow(dead_code)]
+pub(crate) struct RelinkInterferenceGuard;
+#[cfg(all(unix, test))]
+#[allow(dead_code)]
+pub(crate) fn arm_relink_interference(
+    point: RelinkVerificationPoint,
+    target: &[u8],
+) -> RelinkInterferenceGuard {
+    RELINK_INTERFERENCE.with(|state| *state.borrow_mut() = Some((point, target.to_vec())));
+    RelinkInterferenceGuard
+}
+#[cfg(all(unix, test))]
+impl Drop for RelinkInterferenceGuard {
+    fn drop(&mut self) {
+        RELINK_INTERFERENCE.with(|state| *state.borrow_mut() = None);
+    }
+}
+#[cfg(all(unix, test))]
+fn relink_verification_hook(
+    point: RelinkVerificationPoint,
+    parent: &rustix::fd::OwnedFd,
+    name: &OsString,
+) -> Result<(), GitError> {
+    use rustix::fs::{AtFlags, symlinkat, unlinkat};
+    let target = RELINK_INTERFERENCE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .and_then(|(armed, target)| (*armed == point).then(|| target.clone()))
+    });
+    if let Some(target) = target {
+        use std::os::unix::ffi::OsStringExt;
+        let _ = unlinkat(parent, name, AtFlags::empty());
+        symlinkat(OsString::from_vec(target), parent, name)
+            .map_err(|e| GitError::Command(e.to_string()))?;
+    }
+    Ok(())
+}
+#[cfg(all(unix, not(test)))]
+fn relink_verification_hook(
+    _: RelinkVerificationPoint,
+    _: &rustix::fd::OwnedFd,
+    _: &OsString,
+) -> Result<(), GitError> {
+    Ok(())
 }
 #[cfg(all(unix, not(test)))]
 fn artifact_fault(_point: ArtifactFaultPoint) -> Result<(), GitError> {
@@ -2573,6 +2737,220 @@ pub(crate) fn mutate_create_symlink_v3(
     artifact_fault(ArtifactFaultPoint::SymlinkParentFsync)
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct RelinkMutationSpec<'a> {
+    pub source_root: &'a Path,
+    pub source: &'a Path,
+    pub expected_source: &'a crate::lifecycle::SymlinkStateV3,
+    pub destination: &'a Path,
+    pub expected_old: &'a crate::lifecycle::SymlinkStateV3,
+    pub desired: &'a crate::lifecycle::SymlinkStateV3,
+    pub replacement: &'a crate::lifecycle::OwnedStagingV3,
+    pub backup: &'a crate::lifecycle::OwnedStagingV3,
+}
+
+#[cfg(unix)]
+pub(crate) fn mutate_relink_symlink_v3(spec: &RelinkMutationSpec<'_>) -> Result<(), GitError> {
+    use rustix::fs::{
+        AtFlags, FileType, RenameFlags, fsync, readlinkat, renameat_with, statat, symlinkat,
+        unlinkat,
+    };
+    let source_root = validate_absolute_path(spec.source_root)?;
+    let source = validate_mutation_path(spec.source)?;
+    let destination = validate_mutation_path(spec.destination)?;
+    let replacement_path = validate_mutation_path(spec.replacement.path.as_path())?;
+    let backup_path = validate_mutation_path(spec.backup.path.as_path())?;
+    let expected_source = spec.expected_source;
+    let expected_old = spec.expected_old;
+    let desired = spec.desired;
+    if !source.starts_with(&source_root) || source == source_root {
+        return Err(GitError::Parse(
+            "relink source is outside source root".into(),
+        ));
+    }
+    if expected_source
+        .target
+        .as_path()
+        .as_os_str()
+        .as_encoded_bytes()
+        .is_empty()
+        || desired
+            .target
+            .as_path()
+            .as_os_str()
+            .as_encoded_bytes()
+            .is_empty()
+        || expected_old
+            .target
+            .as_path()
+            .as_os_str()
+            .as_encoded_bytes()
+            .is_empty()
+        || expected_source != desired
+        || expected_source
+            .target
+            .as_path()
+            .as_os_str()
+            .as_encoded_bytes()
+            .contains(&0)
+        || expected_old
+            .target
+            .as_path()
+            .as_os_str()
+            .as_encoded_bytes()
+            .contains(&0)
+        || desired
+            .target
+            .as_path()
+            .as_os_str()
+            .as_encoded_bytes()
+            .contains(&0)
+        || expected_source.target_digest
+            != crate::planner::artifact_digest(
+                expected_source
+                    .target
+                    .as_path()
+                    .as_os_str()
+                    .as_encoded_bytes(),
+            )
+        || desired.target_digest
+            != crate::planner::artifact_digest(
+                desired.target.as_path().as_os_str().as_encoded_bytes(),
+            )
+        || expected_old.target_digest
+            != crate::planner::artifact_digest(
+                expected_old.target.as_path().as_os_str().as_encoded_bytes(),
+            )
+        || expected_old == desired
+    {
+        return Err(GitError::Parse("invalid relink symlink contract".into()));
+    }
+    let Some(ObservedNode::Symlink { target }) = readonly_observe_node(&source_root, &source)?
+    else {
+        return Err(GitError::Command(
+            "relink source changed since planning".into(),
+        ));
+    };
+    if target != expected_source.target.as_path() {
+        return Err(GitError::Command(
+            "relink source changed since planning".into(),
+        ));
+    }
+    let (parent, destination_name, replacement_name) =
+        mutation_parents(&destination, &replacement_path)?;
+    let backup_parent = backup_path
+        .parent()
+        .ok_or_else(|| GitError::Parse("backup has no parent".into()))?;
+    if backup_parent != destination.parent().unwrap() {
+        return Err(GitError::Parse("relink staging parents differ".into()));
+    }
+    let backup_name = backup_path.file_name().unwrap().to_owned();
+    let exact =
+        |name: &OsString, expected: &crate::lifecycle::SymlinkStateV3| -> Result<bool, GitError> {
+            let stat = match statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(value) => value,
+                Err(error) if error == rustix::io::Errno::NOENT => return Ok(false),
+                Err(error) => return Err(GitError::Command(error.to_string())),
+            };
+            if !FileType::from_raw_mode(stat.st_mode).is_symlink() {
+                return Ok(false);
+            }
+            let bytes = readlinkat(&parent, name, Vec::new())
+                .map_err(|error| GitError::Command(error.to_string()))?
+                .into_bytes();
+            Ok(bytes == expected.target.as_path().as_os_str().as_encoded_bytes())
+        };
+    let absent = |name: &OsString| -> Result<bool, GitError> {
+        match statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => Ok(false),
+            Err(error) if error == rustix::io::Errno::NOENT => Ok(true),
+            Err(error) => Err(GitError::Command(error.to_string())),
+        }
+    };
+    if !exact(&destination_name, expected_old)?
+        || !absent(&replacement_name)?
+        || !absent(&backup_name)?
+    {
+        return Err(GitError::Command(
+            "relink destination or staging drifted".into(),
+        ));
+    }
+    symlinkat(desired.target.as_path(), &parent, &replacement_name)
+        .map_err(|error| GitError::Command(error.to_string()))?;
+    artifact_fault(ArtifactFaultPoint::RelinkReplacementCreate)?;
+    fsync(&parent).map_err(|error| GitError::Command(error.to_string()))?;
+    artifact_fault(ArtifactFaultPoint::RelinkReplacementFsync)?;
+    relink_verification_hook(
+        RelinkVerificationPoint::Replacement,
+        &parent,
+        &replacement_name,
+    )?;
+    if !exact(&destination_name, expected_old)?
+        || !exact(&replacement_name, desired)?
+        || !absent(&backup_name)?
+    {
+        return Err(GitError::Command(
+            "relink replacement verification failed".into(),
+        ));
+    }
+    renameat_with(
+        &parent,
+        &destination_name,
+        &parent,
+        &backup_name,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| GitError::Command(error.to_string()))?;
+    artifact_fault(ArtifactFaultPoint::RelinkBackupRename)?;
+    fsync(&parent).map_err(|error| GitError::Command(error.to_string()))?;
+    artifact_fault(ArtifactFaultPoint::RelinkBackupFsync)?;
+    relink_verification_hook(RelinkVerificationPoint::Backup, &parent, &replacement_name)?;
+    if !absent(&destination_name)?
+        || !exact(&replacement_name, desired)?
+        || !exact(&backup_name, expected_old)?
+    {
+        return Err(GitError::Command(
+            "relink backup verification failed".into(),
+        ));
+    }
+    renameat_with(
+        &parent,
+        &replacement_name,
+        &parent,
+        &destination_name,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| GitError::Command(error.to_string()))?;
+    artifact_fault(ArtifactFaultPoint::RelinkPublicationRename)?;
+    fsync(&parent).map_err(|error| GitError::Command(error.to_string()))?;
+    artifact_fault(ArtifactFaultPoint::RelinkPublicationFsync)?;
+    relink_verification_hook(
+        RelinkVerificationPoint::Publication,
+        &parent,
+        &replacement_name,
+    )?;
+    if !exact(&destination_name, desired)?
+        || !absent(&replacement_name)?
+        || !exact(&backup_name, expected_old)?
+    {
+        return Err(GitError::Command(
+            "relink publication verification failed".into(),
+        ));
+    }
+    unlinkat(&parent, &backup_name, AtFlags::empty())
+        .map_err(|error| GitError::Command(error.to_string()))?;
+    artifact_fault(ArtifactFaultPoint::RelinkBackupUnlink)?;
+    fsync(&parent).map_err(|error| GitError::Command(error.to_string()))?;
+    artifact_fault(ArtifactFaultPoint::RelinkCleanupFsync)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn mutate_relink_symlink_v3(_: &RelinkMutationSpec<'_>) -> Result<(), GitError> {
+    Err(GitError::Parse(
+        "descriptor-relative relink unsupported on this platform".into(),
+    ))
+}
+
 #[cfg(not(unix))]
 pub(crate) fn mutate_create_symlink_v3(
     _: &Path,
@@ -2593,7 +2971,10 @@ fn platform_alias_root(path: &Path) -> PathBuf {
     }) else {
         return PathBuf::from("/");
     };
+    #[cfg(unix)]
     let prefix = Path::new("/").join(first);
+    #[cfg(not(unix))]
+    let _ = first;
     #[cfg(unix)]
     if let Ok(metadata) = std::fs::symlink_metadata(&prefix)
         && metadata.file_type().is_symlink()
@@ -4213,6 +4594,314 @@ mod tests {
                 .is_err()
             );
             assert!(!root.join("missing").exists());
+        }
+
+        #[test]
+        fn relink_transaction_publishes_exact_target_and_removes_owned_staging() {
+            let temp = TempDir::new().unwrap();
+            let root = temp.path().join("root");
+            let parent = root.join("sub");
+            std::fs::create_dir_all(&parent).unwrap();
+            let source = root.join("source");
+            let destination = parent.join("destination");
+            let replacement = parent.join(".destination.replacement");
+            let backup = parent.join(".destination.backup");
+            std::os::unix::fs::symlink("new\n", &source).unwrap();
+            std::os::unix::fs::symlink("old\n", &destination).unwrap();
+            let state = |target: &str| crate::lifecycle::SymlinkStateV3 {
+                target: StoredPath::from(PathBuf::from(target)),
+                target_digest: id(target.as_bytes()),
+            };
+            assert_eq!(
+                probe_relink_symlink_v3(
+                    &destination,
+                    &replacement,
+                    &backup,
+                    &state("old\n"),
+                    &state("new\n"),
+                )
+                .unwrap(),
+                RelinkProbeState::NotApplied
+            );
+            mutate_relink_symlink_v3(&RelinkMutationSpec {
+                source_root: &root,
+                source: &source,
+                expected_source: &state("new\n"),
+                destination: &destination,
+                expected_old: &state("old\n"),
+                desired: &state("new\n"),
+                replacement: &staging(&replacement),
+                backup: &staging(&backup),
+            })
+            .unwrap();
+            assert_eq!(
+                std::fs::read_link(&destination).unwrap(),
+                PathBuf::from("new\n")
+            );
+            assert!(!replacement.exists());
+            assert!(!backup.exists());
+            assert_eq!(
+                probe_relink_symlink_v3(
+                    &destination,
+                    &replacement,
+                    &backup,
+                    &state("old\n"),
+                    &state("new\n"),
+                )
+                .unwrap(),
+                RelinkProbeState::Applied
+            );
+        }
+
+        #[test]
+        fn relink_fault_points_leave_only_their_documented_tuple() {
+            let points = [
+                (
+                    ArtifactFaultPoint::RelinkReplacementCreate,
+                    (Some("old\n".to_owned()), Some("new\n".to_owned()), None),
+                ),
+                (
+                    ArtifactFaultPoint::RelinkReplacementFsync,
+                    (Some("old\n".to_owned()), Some("new\n".to_owned()), None),
+                ),
+                (
+                    ArtifactFaultPoint::RelinkBackupRename,
+                    (None, Some("new\n".to_owned()), Some("old\n".to_owned())),
+                ),
+                (
+                    ArtifactFaultPoint::RelinkBackupFsync,
+                    (None, Some("new\n".to_owned()), Some("old\n".to_owned())),
+                ),
+                (
+                    ArtifactFaultPoint::RelinkPublicationRename,
+                    (Some("new\n".to_owned()), None, Some("old\n".to_owned())),
+                ),
+                (
+                    ArtifactFaultPoint::RelinkPublicationFsync,
+                    (Some("new\n".to_owned()), None, Some("old\n".to_owned())),
+                ),
+                (
+                    ArtifactFaultPoint::RelinkBackupUnlink,
+                    (Some("new\n".to_owned()), None, None),
+                ),
+                (
+                    ArtifactFaultPoint::RelinkCleanupFsync,
+                    (Some("new\n".to_owned()), None, None),
+                ),
+            ];
+            for (point, expected) in points {
+                let temp = TempDir::new().unwrap();
+                let root = temp.path().join("root");
+                let parent = root.join("sub");
+                std::fs::create_dir_all(&parent).unwrap();
+                let source = root.join("source");
+                let destination = parent.join("destination");
+                let replacement = parent.join(".destination.replacement");
+                let backup = parent.join(".destination.backup");
+                std::os::unix::fs::symlink("new\n", &source).unwrap();
+                std::os::unix::fs::symlink("old\n", &destination).unwrap();
+                let state = |target: &str| crate::lifecycle::SymlinkStateV3 {
+                    target: StoredPath::from(PathBuf::from(target)),
+                    target_digest: id(target.as_bytes()),
+                };
+                let _fault = arm_artifact_fault(point);
+                assert!(
+                    mutate_relink_symlink_v3(&RelinkMutationSpec {
+                        source_root: &root,
+                        source: &source,
+                        expected_source: &state("new\n"),
+                        destination: &destination,
+                        expected_old: &state("old\n"),
+                        desired: &state("new\n"),
+                        replacement: &staging(&replacement),
+                        backup: &staging(&backup)
+                    })
+                    .is_err()
+                );
+                let target = |path: &Path| {
+                    std::fs::read_link(path)
+                        .ok()
+                        .and_then(|value| value.to_str().map(str::to_owned))
+                };
+                assert_eq!(
+                    (target(&destination), target(&replacement), target(&backup)),
+                    expected
+                );
+            }
+        }
+
+        #[test]
+        fn relink_foreign_replacement_at_verification_is_preserved() {
+            let temp = TempDir::new().unwrap();
+            let root = temp.path().join("root");
+            let parent = root.join("sub");
+            std::fs::create_dir_all(&parent).unwrap();
+            let source = root.join("source");
+            let destination = parent.join("destination");
+            let replacement = parent.join(".destination.replacement");
+            let backup = parent.join(".destination.backup");
+            std::os::unix::fs::symlink("new", &source).unwrap();
+            std::os::unix::fs::symlink("old", &destination).unwrap();
+            let state = |target: &str| crate::lifecycle::SymlinkStateV3 {
+                target: StoredPath::from(PathBuf::from(target)),
+                target_digest: id(target.as_bytes()),
+            };
+            let _hook = arm_relink_interference(RelinkVerificationPoint::Replacement, b"foreign");
+            assert!(
+                mutate_relink_symlink_v3(&RelinkMutationSpec {
+                    source_root: &root,
+                    source: &source,
+                    expected_source: &state("new"),
+                    destination: &destination,
+                    expected_old: &state("old"),
+                    desired: &state("new"),
+                    replacement: &staging(&replacement),
+                    backup: &staging(&backup)
+                })
+                .is_err()
+            );
+            assert_eq!(
+                std::fs::read_link(&destination).unwrap(),
+                PathBuf::from("old")
+            );
+            assert_eq!(
+                std::fs::read_link(&replacement).unwrap(),
+                PathBuf::from("foreign")
+            );
+            assert!(!backup.exists());
+        }
+
+        #[test]
+        fn relink_foreign_replacement_is_preserved_at_all_verification_windows() {
+            let points = [
+                (
+                    RelinkVerificationPoint::Replacement,
+                    Some("old"),
+                    Some("foreign"),
+                    None,
+                ),
+                (
+                    RelinkVerificationPoint::Backup,
+                    None,
+                    Some("foreign"),
+                    Some("old"),
+                ),
+                (
+                    RelinkVerificationPoint::Publication,
+                    Some("new"),
+                    Some("foreign"),
+                    Some("old"),
+                ),
+            ];
+            for (point, destination_target, replacement_target, backup_target) in points {
+                let temp = TempDir::new().unwrap();
+                let root = temp.path().join("root");
+                let parent = root.join("sub");
+                std::fs::create_dir_all(&parent).unwrap();
+                let source = root.join("source");
+                let destination = parent.join("destination");
+                let replacement = parent.join(".replacement");
+                let backup = parent.join(".backup");
+                std::os::unix::fs::symlink("new", &source).unwrap();
+                std::os::unix::fs::symlink("old", &destination).unwrap();
+                let state = |target: &str| crate::lifecycle::SymlinkStateV3 {
+                    target: StoredPath::from(PathBuf::from(target)),
+                    target_digest: id(target.as_bytes()),
+                };
+                let _hook = arm_relink_interference(point, b"foreign");
+                assert!(
+                    mutate_relink_symlink_v3(&RelinkMutationSpec {
+                        source_root: &root,
+                        source: &source,
+                        expected_source: &state("new"),
+                        destination: &destination,
+                        expected_old: &state("old"),
+                        desired: &state("new"),
+                        replacement: &staging(&replacement),
+                        backup: &staging(&backup)
+                    })
+                    .is_err()
+                );
+                let target = |path: &Path| std::fs::read_link(path).ok();
+                assert_eq!(target(&destination), destination_target.map(PathBuf::from));
+                assert_eq!(target(&replacement), replacement_target.map(PathBuf::from));
+                assert_eq!(target(&backup), backup_target.map(PathBuf::from));
+            }
+        }
+
+        #[test]
+        fn relink_collisions_and_drift_preserve_foreign_entries() {
+            let cases = [
+                "replacement",
+                "backup",
+                "destination",
+                "source",
+                "missing",
+                "ancestor",
+            ];
+            for case in cases {
+                let temp = TempDir::new().unwrap();
+                let root = temp.path().join("root");
+                let parent = root.join("sub");
+                std::fs::create_dir_all(&parent).unwrap();
+                let source = root.join("source");
+                let destination = parent.join("destination");
+                let replacement = parent.join(".replacement");
+                let backup = parent.join(".backup");
+                std::os::unix::fs::symlink("new", &source).unwrap();
+                std::os::unix::fs::symlink("old", &destination).unwrap();
+                let state = |target: &str| crate::lifecycle::SymlinkStateV3 {
+                    target: StoredPath::from(PathBuf::from(target)),
+                    target_digest: id(target.as_bytes()),
+                };
+                if case == "replacement" {
+                    std::os::unix::fs::symlink("foreign", &replacement).unwrap();
+                }
+                if case == "backup" {
+                    std::os::unix::fs::symlink("foreign", &backup).unwrap();
+                }
+                if case == "destination" {
+                    std::fs::remove_file(&destination).unwrap();
+                    std::os::unix::fs::symlink("foreign", &destination).unwrap();
+                }
+                if case == "source" {
+                    std::fs::remove_file(&source).unwrap();
+                    std::os::unix::fs::symlink("foreign", &source).unwrap();
+                }
+                let (destination, replacement, backup) = if case == "missing" {
+                    (
+                        parent.join("missing/destination"),
+                        parent.join("missing/.replacement"),
+                        parent.join("missing/.backup"),
+                    )
+                } else if case == "ancestor" {
+                    std::os::unix::fs::symlink("sub", root.join("alias")).unwrap();
+                    (
+                        root.join("alias/destination"),
+                        root.join("alias/.replacement"),
+                        root.join("alias/.backup"),
+                    )
+                } else {
+                    (destination, replacement, backup)
+                };
+                let snap = |path: &Path| std::fs::read_link(path).ok();
+                let before = (snap(&destination), snap(&replacement), snap(&backup));
+                let result = mutate_relink_symlink_v3(&RelinkMutationSpec {
+                    source_root: &root,
+                    source: &source,
+                    expected_source: &state("new"),
+                    destination: &destination,
+                    expected_old: &state("old"),
+                    desired: &state("new"),
+                    replacement: &staging(&replacement),
+                    backup: &staging(&backup),
+                });
+                assert!(result.is_err());
+                assert_eq!(
+                    (snap(&destination), snap(&replacement), snap(&backup)),
+                    before
+                );
+            }
         }
 
         #[test]
