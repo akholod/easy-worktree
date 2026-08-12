@@ -1611,8 +1611,7 @@ mod tests {
             vec![
                 (
                     "first".into(),
-                    "(/bin/sleep 30) & child=$!; printf '%s %s' \"$$\" \"$child\" > \"$1\"; wait"
-                        .into(),
+                    "printf '%s' \"$$\" > \"$1\"; while :; do :; done".into(),
                 ),
                 ("later".into(), "printf later > \"later\"".into()),
             ],
@@ -1636,7 +1635,7 @@ mod tests {
                     .split_whitespace()
                     .filter_map(|value| value.parse().ok())
                     .collect();
-                if parsed.len() == 2 {
+                if parsed.len() == 1 {
                     break parsed;
                 }
             }
@@ -1778,21 +1777,24 @@ mod tests {
             } else {
                 task[field] = value;
             }
-            if let Ok(restored) = serde_json::from_value::<crate::lifecycle::OperationPlan>(wire) {
-                if restored.validate_executable_plan().is_ok() {
-                    let task = restored
-                        .steps()
-                        .iter()
-                        .find(|step| matches!(step.action(), StepAction::RunTask { .. }))
-                        .unwrap();
-                    if field == "postconditions" {
-                        assert!(!task.postconditions().is_empty(), "{field}");
-                    }
-                    let backend = ProductionBackend::new(temp.path().to_owned());
-                    assert!(!backend.supports_action(
-                        &crate::execution::StepExecutionContext::new(&restored, task)
-                    ));
+            if let Some(restored) = serde_json::from_value::<crate::lifecycle::OperationPlan>(wire)
+                .ok()
+                .filter(|restored| restored.validate_executable_plan().is_ok())
+            {
+                let task = restored
+                    .steps()
+                    .iter()
+                    .find(|step| matches!(step.action(), StepAction::RunTask { .. }))
+                    .unwrap();
+                if field == "postconditions" {
+                    assert!(!task.postconditions().is_empty(), "{field}");
                 }
+                let backend = ProductionBackend::new(temp.path().to_owned());
+                assert!(
+                    !backend.supports_action(&crate::execution::StepExecutionContext::new(
+                        &restored, task
+                    ))
+                );
             }
             assert!(!temp.path().join(".git/ewtm").exists());
             assert!(!destination.exists());

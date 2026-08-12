@@ -927,10 +927,11 @@ mod runtime_tests {
     fn wait_pid_file(p: &Path) -> u32 {
         let end = Instant::now() + Duration::from_secs(2);
         loop {
-            if let Ok(v) = fs::read_to_string(p) {
-                if let Ok(pid) = v.trim().parse() {
-                    return pid;
-                }
+            if let Some(pid) = fs::read_to_string(p)
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+            {
+                return pid;
             }
             assert!(Instant::now() < end, "readiness PID file was not written");
             thread::sleep(test_timing().poll);
