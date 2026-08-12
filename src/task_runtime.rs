@@ -1060,16 +1060,11 @@ mod runtime_tests {
     fn dual_streams_are_drained_capped_and_tagged() {
         for n in 0..10 {
             let d = tempfile::tempdir().unwrap();
-            let dd = utility(&["/bin/dd", "/usr/bin/dd"]);
-            let tr = utility(&["/usr/bin/tr", "/bin/tr"]);
+            let perl = utility(&["/usr/bin/perl", "/bin/perl"]);
             let argv = vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                format!(
-                    "{} if=/dev/zero bs=1048576 count=2 2>/dev/null | {} '\\000' O; {} if=/dev/zero bs=1048576 count=2 2>/dev/null | {} '\\000' E >&2",
-                    dd, tr, dd, tr
-                ),
-                "ewtm-test".into(),
+                perl,
+                "-e".into(),
+                "print 'O' x (2 * 1024 * 1024); print STDERR 'E' x (2 * 1024 * 1024);".into(),
             ];
             let r = run_task(&input(
                 d.path(),
@@ -1480,11 +1475,9 @@ mod runtime_tests {
     fn cancellation_requires_child_and_group_containment() {
         let d = tempfile::tempdir().unwrap();
         let pid_file = d.path().join("running.pid");
-        let sleep = utility(&["/bin/sleep", "/usr/bin/sleep"]);
         let script = format!(
-            "echo $$ > {}; trap '' TERM; {} 30",
-            pid_file.display(),
-            sleep
+            "echo $$ > '{}'; trap '' TERM; while :; do :; done",
+            pid_file.display()
         );
         let argv = shell(&script, &[]);
         let token = CancellationToken::default();
@@ -1505,6 +1498,9 @@ mod runtime_tests {
         let pid = wait_pid_file(&pid_file);
         token.cancel();
         assert_eq!(worker.join().unwrap(), Err(TaskRuntimeError::Cancelled));
+        let metadata = metadata_at(&leaf(d.path()));
+        assert_eq!(metadata["outcome"], "cancelled");
+        assert_eq!(metadata["cancellation_phase"], "during_run");
         assert!(
             wait_gone(pid),
             "cancelled direct child survived containment"
