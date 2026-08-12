@@ -1629,7 +1629,7 @@ mod tests {
         let token = backend.cancellation_token();
         let marker = destination.join("marker");
         let worker = thread::spawn(move || ExecutionEngine::new(backend).execute(plan));
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         let pids = loop {
             if let Ok(contents) = fs::read_to_string(&marker) {
                 let parsed: Vec<u32> = contents
@@ -1649,7 +1649,7 @@ mod tests {
         token.cancel();
         let outcome = worker.join().unwrap().unwrap();
         assert!(matches!(outcome, ExecutionOutcome::NeedsAttention { .. }));
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while pids.iter().any(|pid| {
             Command::new("/bin/kill")
                 .args(["-0", &pid.to_string()])

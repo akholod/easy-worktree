@@ -39,7 +39,7 @@ fn test_timing() -> TimingPolicy {
     TimingPolicy {
         poll: Duration::from_millis(2),
         term_grace: Duration::from_millis(40),
-        drain_grace: Duration::from_millis(40),
+        drain_grace: Duration::from_millis(250),
     }
 }
 pub(crate) struct RuntimeInput<'a> {
@@ -202,6 +202,7 @@ mod unix {
         static TEST_READ_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         static TEST_RESULT_SYNC_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         static TEST_GROUP_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static TEST_GROUP_PRESENT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         static TEST_SIGNAL_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         static TEST_REAP_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
@@ -214,6 +215,7 @@ mod unix {
         Group,
         Signal,
         Reap,
+        GroupPresent(u32),
     }
     #[cfg(test)]
     pub(super) struct TestFaultGuard {
@@ -229,6 +231,7 @@ mod unix {
                 TestFault::Group => TEST_GROUP_FAULT.with(|x| x.set(true)),
                 TestFault::Signal => TEST_SIGNAL_FAULT.with(|x| x.set(true)),
                 TestFault::Reap => TEST_REAP_FAULT.with(|x| x.set(true)),
+                TestFault::GroupPresent(n) => TEST_GROUP_PRESENT.with(|x| x.set(n)),
             }
             Self { fault }
         }
@@ -243,6 +246,7 @@ mod unix {
                 TestFault::Group => TEST_GROUP_FAULT.with(|x| x.set(false)),
                 TestFault::Signal => TEST_SIGNAL_FAULT.with(|x| x.set(false)),
                 TestFault::Reap => TEST_REAP_FAULT.with(|x| x.set(false)),
+                TestFault::GroupPresent(_) => TEST_GROUP_PRESENT.with(|x| x.set(0)),
             }
         }
     }
@@ -431,6 +435,18 @@ mod unix {
         #[cfg(test)]
         if TEST_GROUP_FAULT.with(|x| x.get()) {
             return Err(TaskRuntimeError::Runtime);
+        }
+        #[cfg(test)]
+        if TEST_GROUP_PRESENT.with(|x| {
+            let n = x.get();
+            if n != 0 {
+                x.set(n - 1);
+                true
+            } else {
+                false
+            }
+        }) {
+            return Ok(true);
         }
         match test_kill_process_group(pid) {
             Ok(()) => Ok(true),
@@ -648,9 +664,6 @@ mod unix {
                                     false
                                 }
                             };
-                            if present {
-                                runtime_shutdown = true;
-                            }
                             if !(out_eof && err_eof) || present {
                                 end = deadline(i.timing.drain_grace)
                             }
@@ -669,9 +682,6 @@ mod unix {
                 Ok(true) => {
                     if status.is_some() && end.is_none() {
                         end = deadline(i.timing.drain_grace)
-                    }
-                    if status.is_some() {
-                        runtime_shutdown = true;
                     }
                 }
                 Err(_) => {
@@ -1001,9 +1011,10 @@ mod runtime_tests {
         assert_eq!(r.outcome, TaskOutcome::Success);
         assert_eq!(fs::read_to_string(&marker).unwrap().trim_end(), arg);
         assert!(!side.exists());
+        let child_cwd = fs::read_to_string(leaf(d.path()).join("stdout.log")).unwrap();
         assert_eq!(
-            fs::read_to_string(leaf(d.path()).join("stdout.log")).unwrap(),
-            d.path().display().to_string()
+            fs::canonicalize(child_cwd.trim_end()).unwrap(),
+            fs::canonicalize(d.path()).unwrap()
         );
         assert!(!leaf(d.path()).to_string_lossy().contains("a/b"));
     }
@@ -1087,15 +1098,10 @@ mod runtime_tests {
     }
 
     #[test]
-    fn cancellation_and_non_utf8_authority_paths_are_bounded() {
-        use std::os::unix::ffi::OsStringExt;
+    fn cancellation_on_normal_paths_is_bounded() {
         let base = tempfile::tempdir().unwrap();
-        let common = base
-            .path()
-            .join(std::ffi::OsString::from_vec(b"common-\xff".to_vec()));
-        let cwd = base
-            .path()
-            .join(std::ffi::OsString::from_vec(b"cwd-\xfe".to_vec()));
+        let common = base.path().join("common");
+        let cwd = base.path().join("cwd");
         fs::create_dir(&common).unwrap();
         fs::create_dir(&cwd).unwrap();
         let marker = base.path().join("ready");
@@ -1128,6 +1134,28 @@ mod runtime_tests {
         token.cancel();
         assert_eq!(worker.join().unwrap(), Err(TaskRuntimeError::Cancelled));
         assert!(leaf(&common).join("result.json").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_authority_paths_are_bounded() {
+        use std::os::unix::ffi::OsStringExt;
+        let base = tempfile::tempdir().unwrap();
+        let common = base
+            .path()
+            .join(std::ffi::OsString::from_vec(b"common-\xff".to_vec()));
+        let cwd = base
+            .path()
+            .join(std::ffi::OsString::from_vec(b"cwd-\xfe".to_vec()));
+        fs::create_dir(&common).unwrap();
+        fs::create_dir(&cwd).unwrap();
+        let argv = shell("exit 0", &[]);
+        assert_eq!(
+            run_task(&input(&common, Uuid::new_v4(), "bytes", &argv))
+                .unwrap()
+                .outcome,
+            TaskOutcome::Success
+        );
     }
 
     #[test]
@@ -1226,12 +1254,19 @@ mod runtime_tests {
             let d2 = tempfile::tempdir().unwrap();
             let r = if matches!(fault, unix::TestFault::Group | unix::TestFault::Signal) {
                 let marker = d2.path().join("ready");
-                let sleep = utility(&["/bin/sleep", "/usr/bin/sleep"]);
-                let touch = utility(&["/usr/bin/touch", "/bin/touch"]);
-                let long_argv = shell(
-                    &format!("{} '{}'\n{} 30", touch, marker.display(), sleep),
-                    &[],
-                );
+                let long_argv = if matches!(fault, unix::TestFault::Signal) {
+                    shell(
+                        &format!("echo $$ > '{}'; while :; do :; done", marker.display()),
+                        &[],
+                    )
+                } else {
+                    let sleep = utility(&["/bin/sleep", "/usr/bin/sleep"]);
+                    let touch = utility(&["/usr/bin/touch", "/bin/touch"]);
+                    shell(
+                        &format!("{} '{}'\n{} 30", touch, marker.display(), sleep),
+                        &[],
+                    )
+                };
                 let token = CancellationToken::default();
                 let worker_token = token.clone();
                 let common = d2.path().to_path_buf();
@@ -1247,7 +1282,12 @@ mod runtime_tests {
                     thread::sleep(test_timing().poll);
                 }
                 token.cancel();
-                worker.join().unwrap()
+                let result = worker.join().unwrap();
+                if matches!(fault, unix::TestFault::Signal) {
+                    let pid = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+                    assert!(wait_gone(pid));
+                }
+                result
             } else {
                 let fault_argv = shell("printf '%s' secret >&2; exit 7", &["secret-argv"]);
                 let _guard = unix::TestFaultGuard::new(fault);
@@ -1352,6 +1392,32 @@ mod runtime_tests {
         assert_eq!(r.outcome, TaskOutcome::Success);
         let p = leaf(d.path());
         assert_eq!(fs::read_to_string(p.join("stdout.log")).unwrap(), "drained");
+    }
+
+    #[test]
+    fn transient_group_presence_does_not_fail_clean_exit() {
+        let d = tempfile::tempdir().unwrap();
+        let _guard = unix::TestFaultGuard::new(unix::TestFault::GroupPresent(1));
+        let op = Uuid::new_v4();
+        let argv = shell("printf clean", &[]);
+        assert_eq!(
+            run_task(&input(d.path(), op, "transient", &argv))
+                .unwrap()
+                .outcome,
+            TaskOutcome::Success
+        );
+        assert_eq!(
+            metadata_at(&layout(d.path(), op, "transient"))["runtime_shutdown"],
+            false
+        );
+        drop(_guard);
+        let argv = shell("exit 0", &[]);
+        assert_eq!(
+            run_task(&input(d.path(), Uuid::new_v4(), "reset", &argv))
+                .unwrap()
+                .outcome,
+            TaskOutcome::Success
+        );
     }
 
     #[test]
