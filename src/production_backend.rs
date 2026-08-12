@@ -1,8 +1,11 @@
+#[cfg(unix)]
+use crate::task_runtime::RuntimeInput;
 use crate::{
     domain::{CheckoutStatus, WorktreeClass},
     execution::{ConditionResult, ExecutionBackend, ProbeCapability, ProbeContext, ProbeVerdict},
     infrastructure::{self, GitError},
     lifecycle::{ObjectId, OperationPlan, PlanStep, Postcondition, Precondition, StepAction},
+    task_runtime::{CancellationToken, TimingPolicy},
 };
 use std::{
     io,
@@ -20,6 +23,8 @@ pub enum ProductionBackendError {
     MutationUnavailable,
     #[error("unsupported persisted observation: {0}")]
     UnsupportedObservation(&'static str),
+    #[error("task execution failed")]
+    TaskExecutionFailed,
 }
 
 #[derive(Debug, Clone)]
@@ -27,9 +32,20 @@ pub struct ProductionRepository {
     pub identity: crate::lifecycle::RepositoryIdentity,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProductionBackend {
     anchor: PathBuf,
+    cancellation: CancellationToken,
+    timing: TimingPolicy,
+}
+
+impl std::fmt::Debug for ProductionBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProductionBackend")
+            .field("anchor", &self.anchor)
+            .finish_non_exhaustive()
+    }
 }
 
 struct FileArtifactProbe<'a> {
@@ -45,7 +61,29 @@ struct FileArtifactProbe<'a> {
 
 impl ProductionBackend {
     pub fn new(anchor: PathBuf) -> Self {
-        Self { anchor }
+        Self {
+            anchor,
+            cancellation: CancellationToken::default(),
+            timing: TimingPolicy::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_runtime(
+        anchor: PathBuf,
+        cancellation: CancellationToken,
+        timing: TimingPolicy,
+    ) -> Self {
+        Self {
+            anchor,
+            cancellation,
+            timing,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
     }
 
     fn list(&self) -> Result<crate::domain::ListResult, ProductionBackendError> {
@@ -361,6 +399,82 @@ fn relink_step_shape(step: &PlanStep) -> bool {
         && step.preconditions().len() == 5
 }
 
+#[cfg(unix)]
+fn supported_task(context: &crate::execution::StepExecutionContext<'_>) -> bool {
+    let StepAction::RunTask {
+        name,
+        argv,
+        cwd,
+        required,
+        environment_allowlist,
+    } = context.step().action()
+    else {
+        return false;
+    };
+    let crate::lifecycle::OperationIntent::Create(intent) = context.plan().intent() else {
+        return false;
+    };
+    let Some(destination) = intent.destination.as_ref() else {
+        return false;
+    };
+    let Some(contract) = intent.task_contracts.get(name) else {
+        return false;
+    };
+    let normalized = |path: &Path| {
+        path.is_absolute()
+            && path.components().all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                        | std::path::Component::Normal(_)
+                )
+            })
+    };
+    let contained = normalized(destination.as_path())
+        && normalized(cwd.as_path())
+        && cwd.as_path().strip_prefix(destination.as_path()).is_ok();
+    let env_unique = environment_allowlist
+        .iter()
+        .map(|value| value.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        == environment_allowlist.len()
+        && environment_allowlist.iter().all(|value| {
+            !value.as_str().is_empty()
+                && !value.as_str().contains('\0')
+                && !value.as_str().contains('=')
+        });
+    let consent_id = format!("task:{name}");
+    let consent = context
+        .plan()
+        .required_consents()
+        .iter()
+        .find(|value| value.id.as_str() == consent_id);
+    contract.argv == *argv
+        && contract.cwd == *cwd
+        && contract.required == *required
+        && contract.environment_allowlist == *environment_allowlist
+        && argv
+            .as_slice()
+            .iter()
+            .all(|value| !value.is_empty() && !value.contains('\0'))
+        && env_unique
+        && contained
+        && context.step().irreversible()
+        && context.step().compensation().is_none()
+        && context.step().postconditions().is_empty()
+        && consent.is_some_and(|value| {
+            value.risks.len() == 1
+                && value.risks[0].kind == crate::lifecycle::RiskKind::ExecuteTask
+                && context
+                    .plan()
+                    .risks()
+                    .iter()
+                    .any(|risk| risk.kind == crate::lifecycle::RiskKind::ExecuteTask)
+        })
+}
+
 impl ExecutionBackend for ProductionBackend {
     type Error = ProductionBackendError;
     type Repository = ProductionRepository;
@@ -517,6 +631,8 @@ impl ExecutionBackend for ProductionBackend {
             StepAction::RemoveWorktree { path } => context.step().preconditions().iter().any(|condition| {
                 matches!(condition, Precondition::WorktreeClean { path: guarded } if *guarded == *path)
             }),
+            #[cfg(unix)]
+            StepAction::RunTask { .. } => supported_task(context),
             _ => false,
         }
     }
@@ -654,6 +770,38 @@ impl ExecutionBackend for ProductionBackend {
                 })?;
                 Ok(())
             }
+            #[cfg(unix)]
+            StepAction::RunTask {
+                argv,
+                cwd,
+                environment_allowlist,
+                ..
+            } => {
+                if !supported_task(context) {
+                    return Err(ProductionBackendError::MutationUnavailable);
+                }
+                let repository = self.discover_repository()?;
+                if !self.repository_matches_plan(&repository, context.plan()) {
+                    return Err(ProductionBackendError::MutationUnavailable);
+                }
+                let argv = argv.as_slice().to_vec();
+                let step_id = context.step().id().as_str();
+                crate::task_runtime::run_task(&RuntimeInput {
+                    common_dir: self.repository_common_dir(&repository),
+                    operation_id: context.operation_id().as_uuid(),
+                    step_id,
+                    argv: &argv,
+                    cwd: cwd.as_path(),
+                    environment_allowlist: &environment_allowlist
+                        .iter()
+                        .map(|value| value.as_str().to_owned())
+                        .collect::<Vec<_>>(),
+                    token: self.cancellation.clone(),
+                    timing: self.timing,
+                })
+                .map(|_| ())
+                .map_err(|_| ProductionBackendError::TaskExecutionFailed)
+            }
             StepAction::RemoveWorktree { path } => {
                 infrastructure::mutate_remove_worktree(&self.anchor, path.as_path())?;
                 Ok(())
@@ -699,7 +847,7 @@ impl ExecutionBackend for ProductionBackend {
     fn probe(
         &mut self,
         context: &crate::execution::StepExecutionContext<'_>,
-        _probe_context: ProbeContext,
+        probe_context: ProbeContext,
     ) -> Result<ProbeVerdict, Self::Error> {
         let step = context.step();
         if let StepAction::RelinkSymlinkV3 {
@@ -727,7 +875,15 @@ impl ExecutionBackend for ProductionBackend {
             );
         }
         if matches!(step.action(), StepAction::RunTask { .. }) {
-            return Ok(ProbeVerdict::Unknown);
+            return Ok(match probe_context {
+                ProbeContext::AfterAttempt {
+                    executor_succeeded: true,
+                } => ProbeVerdict::Applied,
+                ProbeContext::AfterAttempt {
+                    executor_succeeded: false,
+                }
+                | ProbeContext::StartupReconciliation => ProbeVerdict::Unknown,
+            });
         }
         if let StepAction::FileArtifact {
             kind,
@@ -957,6 +1113,7 @@ mod tests {
     use super::*;
     use crate::execution::{ExecutionEngine, ExecutionOutcome};
     use crate::lifecycle::{BranchName, RefName, StepId};
+    use sha2::Digest;
     use std::collections::{BTreeMap, BTreeSet};
     use std::{fs, process::Command};
     use tempfile::TempDir;
@@ -1002,6 +1159,661 @@ mod tests {
             granted_consents: base.granted_consents().clone(),
         })
         .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn generated_task_plan(
+        required: bool,
+        commands: Vec<(String, String)>,
+    ) -> (TempDir, crate::lifecycle::OperationPlan, PathBuf) {
+        let temp = repository();
+        let root = temp.path();
+        let mut backend = ProductionBackend::new(root.to_owned());
+        let identity = backend.discover_repository().unwrap().identity;
+        let destination = root
+            .parent()
+            .unwrap()
+            .join(format!("ewtm-b2a-{}", uuid::Uuid::new_v4()));
+        let mut selected_tasks = BTreeSet::new();
+        let mut granted_consents = BTreeSet::new();
+        let mut tasks = Vec::new();
+        for (name, body) in commands {
+            selected_tasks.insert(name.clone());
+            granted_consents
+                .insert(crate::lifecycle::ConsentId::new(format!("task:{name}")).unwrap());
+            let argv = if body == "__spawn_failure__" {
+                vec!["/no/such/ewtm-command".into()]
+            } else {
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    body,
+                    "ewtm-task".into(),
+                    "marker".into(),
+                ]
+            };
+            tasks.push(crate::planner::TaskSpec {
+                name,
+                argv: crate::lifecycle::CommandArgv::new(argv).unwrap(),
+                cwd: stored(&destination),
+                enabled: true,
+                post_create: true,
+                required,
+                environment_allowlist: vec![],
+            });
+        }
+        let branch = crate::lifecycle::BranchName::new("b2a-task").unwrap();
+        let intent = crate::lifecycle::CreateIntent {
+            repository: identity.clone(),
+            source: crate::lifecycle::CreateSource::NewBranch {
+                branch: branch.clone(),
+                base: None,
+            },
+            destination: Some(stored(&destination)),
+            selected_tasks,
+            skipped_rules: BTreeSet::new(),
+            granted_consents,
+            task_contracts: BTreeMap::new(),
+            current_worktree_root: None,
+            artifact_rule_contracts: BTreeMap::new(),
+        };
+        let input = crate::planner::CreatePlanInput {
+            operation_id: crate::planner::new_operation_id(),
+            repository: identity.clone(),
+            intent,
+            bare: false,
+            primary_count: 1,
+            invocation_cwd: stored(root),
+            primary_root: identity.primary_root.clone(),
+            current_worktree_root: identity.primary_root.clone(),
+            destination: crate::planner::DestinationFacts {
+                path: stored(&destination),
+                state: crate::planner::DestinationState::Absent,
+                parent: stored(destination.parent().unwrap()),
+                parent_safe: true,
+            },
+            source_facts: crate::planner::CreateSourceFacts::NewBranch {
+                branch,
+                base_ref: crate::lifecycle::RefName::new("HEAD").unwrap(),
+                base_oid: oid(root, "HEAD"),
+                branch_absent: true,
+            },
+            branch_checked_out: false,
+            branch_collision: false,
+            known_rules: BTreeSet::new(),
+            enabled_rules: BTreeSet::new(),
+            known_tasks: tasks.iter().map(|task| task.name.clone()).collect(),
+            manifests: vec![],
+            tasks,
+        };
+        (
+            temp,
+            crate::planner::plan_create(input).unwrap(),
+            destination,
+        )
+    }
+
+    #[cfg(unix)]
+    fn task_step_indices(plan: &crate::lifecycle::OperationPlan) -> Vec<usize> {
+        plan.steps()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, step)| {
+                matches!(step.action(), StepAction::RunTask { .. }).then_some(index)
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn task_logs_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn collect(root: &Path, path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            if let Ok(entries) = fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        collect(root, &path, out);
+                    } else {
+                        out.push((
+                            path.strip_prefix(root).unwrap().to_owned(),
+                            fs::read(path).unwrap(),
+                        ));
+                    }
+                }
+            }
+        }
+        let mut result = Vec::new();
+        collect(root, root, &mut result);
+        result.sort_by(|left, right| left.0.cmp(&right.0));
+        result
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_started_write_fault_has_no_task_effect_and_exact_order() {
+        let _faults = crate::journal_store::test_fault_guard();
+        let (temp, plan, destination) = generated_task_plan(
+            true,
+            vec![
+                ("first".into(), "printf never > \"$1\"".into()),
+                ("later".into(), "printf later > later".into()),
+            ],
+        );
+        let task_indices = task_step_indices(&plan);
+        assert_eq!(task_indices, vec![1, 2]);
+        crate::journal_store::inject_fail_on_atomic_write(4);
+        assert!(matches!(
+            ExecutionEngine::new(ProductionBackend::new(temp.path().to_owned()))
+                .execute(plan.clone()),
+            Err(crate::execution::ExecutionError::Journal(_))
+        ));
+        let journal = journal_for(temp.path(), &plan);
+        assert_eq!(
+            journal.revision(),
+            2,
+            "writes 1..2 persisted; write 3 was task Started"
+        );
+        assert_eq!(journal.status(), crate::journal::OperationStatus::Pending);
+        assert_eq!(
+            journal.steps()[0].status(),
+            crate::journal::StepStatus::Applied
+        );
+        assert_eq!(
+            journal.steps()[1].status(),
+            crate::journal::StepStatus::Pending
+        );
+        assert!(destination.exists());
+        assert!(!destination.join("marker").exists());
+        assert!(task_logs_snapshot(&temp.path().join(".git/ewtm/task-logs")).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_applied_write_fault_restarts_attention_without_reinvocation() {
+        let _faults = crate::journal_store::test_fault_guard();
+        let (temp, plan, destination) = generated_task_plan(
+            true,
+            vec![(
+                "first".into(),
+                "printf once > \"$1\"; printf task-output".into(),
+            )],
+        );
+        crate::journal_store::inject_fail_on_atomic_write(5);
+        assert!(matches!(
+            ExecutionEngine::new(ProductionBackend::new(temp.path().to_owned()))
+                .execute(plan.clone()),
+            Err(crate::execution::ExecutionError::Journal(_))
+        ));
+        assert_eq!(fs::read(destination.join("marker")).unwrap(), b"once");
+        let logs = task_logs_snapshot(&temp.path().join(".git/ewtm/task-logs"));
+        let journal = journal_for(temp.path(), &plan);
+        assert_eq!(journal.revision(), 3);
+        assert_eq!(journal.status(), crate::journal::OperationStatus::Running);
+        assert_eq!(
+            journal.steps()[1].status(),
+            crate::journal::StepStatus::Started
+        );
+        let restarted = ExecutionEngine::new(ProductionBackend::new(temp.path().to_owned()))
+            .execute(plan.clone())
+            .unwrap();
+        assert!(matches!(
+            restarted,
+            ExecutionOutcome::ExistingOperation {
+                status: crate::journal::OperationStatus::NeedsAttention,
+                ..
+            }
+        ));
+        assert_eq!(
+            journal_for(temp.path(), &plan).status(),
+            crate::journal::OperationStatus::NeedsAttention
+        );
+        assert_eq!(
+            task_logs_snapshot(&temp.path().join(".git/ewtm/task-logs")),
+            logs
+        );
+        assert_eq!(fs::read(destination.join("marker")).unwrap(), b"once");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_task_applied_write_fault_restarts_unknown_without_mutation() {
+        let _faults = crate::journal_store::test_fault_guard();
+        let (temp, plan, destination) = generated_task_plan(
+            false,
+            vec![
+                (
+                    "first".into(),
+                    "printf failed > \"$1\"; printf noisy; printf error >&2; exit 9".into(),
+                ),
+                ("later".into(), "printf later > later".into()),
+            ],
+        );
+        crate::journal_store::inject_fail_on_atomic_write(5);
+        assert!(matches!(
+            ExecutionEngine::new(ProductionBackend::new(temp.path().to_owned()))
+                .execute(plan.clone()),
+            Err(crate::execution::ExecutionError::Journal(_))
+        ));
+        let logs = task_logs_snapshot(&temp.path().join(".git/ewtm/task-logs"));
+        assert!(destination.join("marker").exists());
+        assert!(!destination.join("later").exists());
+        assert_eq!(
+            journal_for(temp.path(), &plan).steps()[1].status(),
+            crate::journal::StepStatus::Started
+        );
+        let restarted = ExecutionEngine::new(ProductionBackend::new(temp.path().to_owned()))
+            .execute(plan.clone())
+            .unwrap();
+        assert!(matches!(
+            restarted,
+            ExecutionOutcome::ExistingOperation {
+                status: crate::journal::OperationStatus::NeedsAttention,
+                ..
+            }
+        ));
+        let journal = journal_for(temp.path(), &plan);
+        assert_eq!(
+            journal.status(),
+            crate::journal::OperationStatus::NeedsAttention
+        );
+        assert_eq!(
+            journal.steps()[1].status(),
+            crate::journal::StepStatus::NeedsAttention
+        );
+        assert_eq!(
+            task_logs_snapshot(&temp.path().join(".git/ewtm/task-logs")),
+            logs
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_task_restart_is_already_applied_and_private_journal_is_redacted() {
+        let (temp, plan, destination) = generated_task_plan(
+            true,
+            vec![(
+                "first".into(),
+                "printf durable > \"$1\"; printf '%s' \"$$\"; printf '%s' \"$PPID\" >&2".into(),
+            )],
+        );
+        let operation = *plan.operation_id();
+        let mut engine = ExecutionEngine::new(ProductionBackend::new(temp.path().to_owned()));
+        assert!(matches!(
+            engine.execute(plan.clone()).unwrap(),
+            ExecutionOutcome::Applied { .. }
+        ));
+        let before = task_logs_snapshot(&temp.path().join(".git/ewtm/task-logs"));
+        let journal_path = temp
+            .path()
+            .join(".git/ewtm/journal")
+            .join(format!("{operation}.json"));
+        let wire = fs::read(&journal_path).unwrap();
+        let text = String::from_utf8_lossy(&wire);
+        assert!(
+            !text.contains("task-logs")
+                && !text.contains(
+                    temp.path()
+                        .join(".git/ewtm/task-logs")
+                        .to_string_lossy()
+                        .as_ref()
+                )
+        );
+        assert!(matches!(
+            ExecutionEngine::new(ProductionBackend::new(temp.path().to_owned()))
+                .execute(plan)
+                .unwrap(),
+            ExecutionOutcome::AlreadyApplied { .. }
+        ));
+        assert_eq!(
+            task_logs_snapshot(&temp.path().join(".git/ewtm/task-logs")),
+            before
+        );
+        assert_eq!(fs::read(destination.join("marker")).unwrap(), b"durable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_tasks_run_in_order_and_finish_applied() {
+        let (temp, plan, destination) = generated_task_plan(
+            false,
+            vec![
+                (
+                    "first".into(),
+                    "printf first > \"$1\"; printf first-output".into(),
+                ),
+                (
+                    "second".into(),
+                    "printf second > \"second\"; printf second-output".into(),
+                ),
+            ],
+        );
+        let operation = *plan.operation_id();
+        let mut backend = ProductionBackend::new(temp.path().to_owned());
+        let task = plan
+            .steps()
+            .iter()
+            .find(|step| matches!(step.action(), StepAction::RunTask { .. }))
+            .unwrap();
+        assert!(backend.supports_action(&crate::execution::StepExecutionContext::new(&plan, task)));
+        let context = crate::execution::StepExecutionContext::new(&plan, task);
+        assert_eq!(
+            backend
+                .probe(
+                    &context,
+                    ProbeContext::AfterAttempt {
+                        executor_succeeded: true
+                    }
+                )
+                .unwrap(),
+            ProbeVerdict::Applied
+        );
+        assert_eq!(
+            backend
+                .probe(
+                    &context,
+                    ProbeContext::AfterAttempt {
+                        executor_succeeded: false
+                    }
+                )
+                .unwrap(),
+            ProbeVerdict::Unknown
+        );
+        assert_eq!(
+            backend
+                .probe(&context, ProbeContext::StartupReconciliation)
+                .unwrap(),
+            ProbeVerdict::Unknown
+        );
+        let outcome = ExecutionEngine::new(ProductionBackend::new(temp.path().to_owned()))
+            .execute(plan.clone())
+            .unwrap();
+        assert!(matches!(outcome, ExecutionOutcome::Applied { .. }));
+        assert_eq!(
+            fs::read_to_string(destination.join("marker")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("second")).unwrap(),
+            "second"
+        );
+        let journal = crate::journal_store::JournalStore::new(&temp.path().join(".git"))
+            .read(&operation)
+            .unwrap();
+        assert_eq!(journal.status(), crate::journal::OperationStatus::Applied);
+        for step in plan
+            .steps()
+            .iter()
+            .filter(|step| matches!(step.action(), StepAction::RunTask { .. }))
+        {
+            let mut hash = sha2::Sha256::new();
+            hash.update(b"ewtm-task-log-v1\0");
+            hash.update(operation.as_uuid().as_bytes());
+            hash.update([0]);
+            hash.update(step.id().as_str().as_bytes());
+            let log_dir = temp
+                .path()
+                .join(".git/ewtm/task-logs/v1")
+                .join(operation.to_string())
+                .join(format!("{:x}", hash.finalize()));
+            assert!(log_dir.join("stdout.log").is_file());
+            assert!(log_dir.join("stderr.log").is_file());
+            assert!(log_dir.join("result.json").is_file());
+            assert!(!log_dir.to_string_lossy().contains("first"));
+            assert!(!log_dir.to_string_lossy().contains("second"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_task_failures_pause_without_running_later_tasks() {
+        for (required, command, expected) in [
+            (true, "exit 7", "nonzero"),
+            (false, "exit 8", "nonzero"),
+            (true, "__spawn_failure__", "spawn_failed"),
+            (false, "kill -TERM $$", "signaled"),
+        ] {
+            let (temp, plan, destination) = generated_task_plan(
+                required,
+                vec![
+                    ("first".into(), command.into()),
+                    ("later".into(), "printf later > \"later\"".into()),
+                ],
+            );
+            let outcome = ExecutionEngine::new(ProductionBackend::new(temp.path().to_owned()))
+                .execute(plan)
+                .unwrap();
+            assert!(matches!(outcome, ExecutionOutcome::NeedsAttention { .. }));
+            assert!(!destination.join("later").exists());
+            let result = fs::read_dir(temp.path().join(".git/ewtm/task-logs/v1"))
+                .unwrap()
+                .flat_map(|operation| fs::read_dir(operation.unwrap().path()).unwrap())
+                .flat_map(|step| fs::read_dir(step.unwrap().path()).unwrap())
+                .find(|entry| entry.as_ref().unwrap().path().ends_with("result.json"))
+                .unwrap()
+                .unwrap()
+                .path();
+            let metadata: serde_json::Value =
+                serde_json::from_slice(&fs::read(result).unwrap()).unwrap();
+            assert_eq!(metadata["outcome"], expected);
+            assert!(!metadata.to_string().contains("ewtm-command"));
+            assert!(!metadata.to_string().contains("later"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_task_cancellation_contains_child_and_finishes_attention() {
+        use std::{
+            thread,
+            time::{Duration, Instant},
+        };
+        let (temp, plan, destination) = generated_task_plan(
+            false,
+            vec![
+                (
+                    "first".into(),
+                    "(/bin/sleep 30) & child=$!; printf '%s %s' \"$$\" \"$child\" > \"$1\"; wait"
+                        .into(),
+                ),
+                ("later".into(), "printf later > \"later\"".into()),
+            ],
+        );
+        let backend = ProductionBackend::with_runtime(
+            temp.path().to_owned(),
+            CancellationToken::default(),
+            crate::task_runtime::TimingPolicy {
+                poll: Duration::from_millis(2),
+                term_grace: Duration::from_millis(40),
+                drain_grace: Duration::from_millis(40),
+            },
+        );
+        let token = backend.cancellation_token();
+        let marker = destination.join("marker");
+        let worker = thread::spawn(move || ExecutionEngine::new(backend).execute(plan));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let pids = loop {
+            if let Ok(contents) = fs::read_to_string(&marker) {
+                let parsed: Vec<u32> = contents
+                    .split_whitespace()
+                    .filter_map(|value| value.parse().ok())
+                    .collect();
+                if parsed.len() == 2 {
+                    break parsed;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "task readiness marker was not written"
+            );
+            thread::sleep(Duration::from_millis(2));
+        };
+        token.cancel();
+        let outcome = worker.join().unwrap().unwrap();
+        assert!(matches!(outcome, ExecutionOutcome::NeedsAttention { .. }));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pids.iter().any(|pid| {
+            Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .is_ok_and(|status| status.success())
+        }) {
+            assert!(Instant::now() < deadline, "cancelled task child survived");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!destination.join("later").exists());
+        let result = fs::read_dir(temp.path().join(".git/ewtm/task-logs/v1"))
+            .unwrap()
+            .flat_map(|operation| fs::read_dir(operation.unwrap().path()).unwrap())
+            .flat_map(|step| fs::read_dir(step.unwrap().path()).unwrap())
+            .find(|entry| entry.as_ref().unwrap().path().ends_with("result.json"))
+            .unwrap()
+            .unwrap()
+            .path();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(result).unwrap()).unwrap();
+        assert_eq!(metadata["outcome"], "cancelled");
+        assert_eq!(metadata["cancellation_phase"], "during_run");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_task_support_boundary_rejects_contract_and_shape_mutations_before_state() {
+        let mutations: Vec<fn(&mut PlanStep, &Path)> = vec![
+            |step, _| {
+                if let StepAction::RunTask { name, .. } = step.action_mut() {
+                    *name = "wrong-name".into();
+                }
+            },
+            |step, _| {
+                if let StepAction::RunTask { argv, .. } = step.action_mut() {
+                    *argv = crate::lifecycle::CommandArgv::new(vec!["/bin/false".into()]).unwrap();
+                }
+            },
+            |step, _| {
+                if let StepAction::RunTask { cwd, .. } = step.action_mut() {
+                    *cwd = stored("/tmp/outside-ewtm-task");
+                }
+            },
+            |step, _| {
+                if let StepAction::RunTask { required, .. } = step.action_mut() {
+                    *required = !*required;
+                }
+            },
+            |step, _| {
+                if let StepAction::RunTask {
+                    environment_allowlist,
+                    ..
+                } = step.action_mut()
+                {
+                    environment_allowlist
+                        .push(crate::lifecycle::EnvironmentName::new("HOME").unwrap());
+                }
+            },
+            |step, _| {
+                *step = PlanStep::new(
+                    step.id().clone(),
+                    step.name().to_owned(),
+                    step.action().clone(),
+                    step.preconditions().to_vec(),
+                    step.postconditions().to_vec(),
+                    Some(crate::lifecycle::Compensation::RemoveCreatedArtifact(
+                        crate::lifecycle::CreatedArtifact {
+                            path: stored("/tmp/compensation"),
+                            fingerprint: ObjectId::new("0000000000000000000000000000000000000000")
+                                .unwrap(),
+                        },
+                    )),
+                    false,
+                )
+                .unwrap();
+            },
+            |step, _| {
+                *step.action_mut() = StepAction::RemoveWorktree {
+                    path: stored("/tmp/unsupported-action"),
+                };
+            },
+        ];
+        for mutate in mutations {
+            let (temp, mut plan, destination) = generated_task_plan(
+                false,
+                vec![("first".into(), "printf never > \"$1\"".into())],
+            );
+            let task = plan
+                .steps_mut()
+                .iter_mut()
+                .find(|step| matches!(step.action(), StepAction::RunTask { .. }))
+                .unwrap();
+            mutate(task, &destination);
+            assert!(plan.validate_executable_plan().is_err());
+            assert!(matches!(
+                ExecutionEngine::new(ProductionBackend::new(temp.path().to_owned())).execute(plan),
+                Err(crate::execution::ExecutionError::UnsupportedPlan(_))
+            ));
+            assert!(!temp.path().join(".git/ewtm").exists());
+            assert!(!destination.exists());
+        }
+        for (field, value) in [
+            (
+                "postconditions",
+                serde_json::json!([{ "BranchDeleted": "later" }]),
+            ),
+            (
+                "compensation",
+                serde_json::json!({ "RemoveCreatedArtifact": null }),
+            ),
+            ("required_consents", serde_json::json!([])),
+        ] {
+            let (temp, plan, destination) = generated_task_plan(
+                false,
+                vec![("first".into(), "printf never > \"$1\"".into())],
+            );
+            let mut wire = serde_json::to_value(plan).unwrap();
+            let task = wire["steps"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|step| step["action"].get("RunTask").is_some())
+                .unwrap();
+            if field == "required_consents" {
+                wire[field] = value;
+            } else {
+                task[field] = value;
+            }
+            if let Ok(restored) = serde_json::from_value::<crate::lifecycle::OperationPlan>(wire) {
+                if restored.validate_executable_plan().is_ok() {
+                    let task = restored
+                        .steps()
+                        .iter()
+                        .find(|step| matches!(step.action(), StepAction::RunTask { .. }))
+                        .unwrap();
+                    if field == "postconditions" {
+                        assert!(!task.postconditions().is_empty(), "{field}");
+                    }
+                    let backend = ProductionBackend::new(temp.path().to_owned());
+                    assert!(!backend.supports_action(
+                        &crate::execution::StepExecutionContext::new(&restored, task)
+                    ));
+                }
+            }
+            assert!(!temp.path().join(".git/ewtm").exists());
+            assert!(!destination.exists());
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_rejects_run_task_before_state() {
+        let temp = TempDir::new().unwrap();
+        let mut plan = crate::lifecycle::test_plan(1);
+        *plan.steps_mut()[0].action_mut() = StepAction::RunTask {
+            name: "task".into(),
+            argv: crate::lifecycle::CommandArgv::new(vec!["tool".into()]).unwrap(),
+            cwd: stored(temp.path()),
+            required: false,
+            environment_allowlist: vec![],
+        };
+        let context = crate::execution::StepExecutionContext::new(&plan, &plan.steps()[0]);
+        assert!(!ProductionBackend::new(temp.path().to_owned()).supports_action(&context));
+        assert!(!temp.path().join("ewtm").exists());
     }
 
     #[test]
@@ -3443,6 +4255,29 @@ mod tests {
                 .probe(
                     &crate::execution::StepExecutionContext::new(&run_plan, &run_plan.steps()[0]),
                     ProbeContext::StartupReconciliation,
+                )
+                .unwrap(),
+            ProbeVerdict::Unknown
+        );
+        let context = crate::execution::StepExecutionContext::new(&run_plan, &run_plan.steps()[0]);
+        assert_eq!(
+            ProductionBackend::new(temp.path().to_owned())
+                .probe(
+                    &context,
+                    ProbeContext::AfterAttempt {
+                        executor_succeeded: true,
+                    },
+                )
+                .unwrap(),
+            ProbeVerdict::Applied
+        );
+        assert_eq!(
+            ProductionBackend::new(temp.path().to_owned())
+                .probe(
+                    &context,
+                    ProbeContext::AfterAttempt {
+                        executor_succeeded: false,
+                    },
                 )
                 .unwrap(),
             ProbeVerdict::Unknown

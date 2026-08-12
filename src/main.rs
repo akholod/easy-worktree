@@ -11,6 +11,7 @@ mod output;
 pub mod planner;
 pub mod production_backend;
 mod system;
+mod task_runtime;
 mod tui;
 mod worktreerc;
 
