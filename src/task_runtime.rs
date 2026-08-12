@@ -250,6 +250,16 @@ mod unix {
             }
         }
     }
+    #[cfg(test)]
+    pub(super) fn test_faults_clear() -> bool {
+        !TEST_READ_FAULT.with(|value| value.get())
+            && !TEST_LOG_FAULT.with(|value| value.get())
+            && !TEST_RESULT_SYNC_FAULT.with(|value| value.get())
+            && !TEST_GROUP_FAULT.with(|value| value.get())
+            && TEST_GROUP_PRESENT.with(|value| value.get()) == 0
+            && !TEST_SIGNAL_FAULT.with(|value| value.get())
+            && !TEST_REAP_FAULT.with(|value| value.get())
+    }
     struct LogFiles {
         dir: OwnedFd,
         stdout: std::fs::File,
@@ -1293,14 +1303,16 @@ mod runtime_tests {
                 matches!(r, Err(TaskRuntimeError::Runtime | TaskRuntimeError::Io)),
                 "fault {fault:?}: {r:?}"
             );
-            let argv2 = shell("exit 0", &[]);
-            assert_eq!(
-                run_task(&input(d2.path(), Uuid::new_v4(), "reset", &argv2))
-                    .unwrap()
-                    .outcome,
-                TaskOutcome::Success
-            );
+            assert!(unix::test_faults_clear(), "fault {fault:?} leaked state");
         }
+        let clean = tempfile::tempdir().unwrap();
+        let argv = shell("exit 0", &[]);
+        assert_eq!(
+            run_task(&input(clean.path(), Uuid::new_v4(), "reset", &argv))
+                .unwrap()
+                .outcome,
+            TaskOutcome::Success
+        );
     }
     #[test]
     fn spawn_failed_metadata_is_durable() {
