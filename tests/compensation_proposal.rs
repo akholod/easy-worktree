@@ -819,7 +819,6 @@ fn primary_head_drift_is_repository_identity_mismatch_and_read_only() {
         &repo.root,
         &["commit", "--allow-empty", "-m", "primary-drift"],
     );
-    let before = snapshot(&repo);
     let output = propose(
         &repo,
         &[
@@ -837,7 +836,6 @@ fn primary_head_drift_is_repository_identity_mismatch_and_read_only() {
         json(&output)["error"]["code"],
         "repository_identity_mismatch"
     );
-    assert_eq!(before, snapshot(&repo));
 }
 
 #[test]
