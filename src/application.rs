@@ -550,12 +550,10 @@ where
         if let Ok(journal) = self.repository.recover_show(
             plan.repository().primary_root.as_path(),
             plan.operation_id(),
-        ) {
-            if journal.status() == crate::journal::OperationStatus::Applied
-                && journal.plan() == plan
-            {
-                return Ok(plan.clone());
-            }
+        ) && journal.status() == crate::journal::OperationStatus::Applied
+            && journal.plan() == plan
+        {
+            return Ok(plan.clone());
         }
         let outcome = match plan.intent() {
             crate::lifecycle::OperationIntent::Create(intent) => {
