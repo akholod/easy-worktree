@@ -1167,10 +1167,8 @@ mod runtime_tests {
         fs::create_dir(&common).unwrap();
         fs::create_dir(&cwd).unwrap();
         let marker = base.path().join("ready");
-        let sleep = utility(&["/bin/sleep", "/usr/bin/sleep"]);
-        let touch = utility(&["/usr/bin/touch", "/bin/touch"]);
         let argv = shell(
-            &format!("{} '{}'\n{} 30", touch, marker.display(), sleep),
+            &format!(": > '{}'\nwhile :; do :; done", marker.display()),
             &[],
         );
         let token = CancellationToken::default();
