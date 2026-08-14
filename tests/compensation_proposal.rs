@@ -140,15 +140,14 @@ fn append_snapshot(out: &mut Vec<u8>, root: &Path, path: &Path) {
 }
 
 fn snapshot(repo: &Repo) -> Vec<u8> {
+    let refs = git_output(&repo.root, &["show-ref"]);
+    let worktrees = git_output(&repo.root, &["worktree", "list", "--porcelain", "-z"]);
     let mut out = Vec::new();
     append_snapshot(&mut out, repo.temp.path(), repo.temp.path());
     out.extend_from_slice(b"git:refs\0");
-    out.extend_from_slice(&git_output(&repo.root, &["show-ref"]));
+    out.extend_from_slice(&refs);
     out.extend_from_slice(b"git:worktrees\0");
-    out.extend_from_slice(&git_output(
-        &repo.root,
-        &["worktree", "list", "--porcelain", "-z"],
-    ));
+    out.extend_from_slice(&worktrees);
     for marker in [
         ".git/ewtm/compensation",
         ".git/ewtm/staging",
@@ -165,6 +164,7 @@ fn snapshot(repo: &Repo) -> Vec<u8> {
 fn git_output(cwd: &Path, args: &[&str]) -> Vec<u8> {
     let output = Command::new("git")
         .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
