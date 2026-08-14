@@ -1858,8 +1858,29 @@ mod tests {
             .path();
         let metadata: serde_json::Value =
             serde_json::from_slice(&fs::read(result).unwrap()).unwrap();
-        assert_eq!(metadata["outcome"], "cancelled");
         assert_eq!(metadata["cancellation_phase"], "during_run");
+        match metadata["outcome"].as_str() {
+            Some("cancelled") => {
+                assert_eq!(metadata["runtime_shutdown"], false);
+                assert_eq!(metadata["group_error"], false);
+                assert_eq!(metadata["reap_error"], false);
+            }
+            #[cfg(target_os = "macos")]
+            Some("runtime_failed") => {
+                assert_eq!(metadata["runtime_shutdown"], true);
+                for key in [
+                    "stdout_read_error",
+                    "stdout_log_error",
+                    "stderr_read_error",
+                    "stderr_log_error",
+                    "setup_error",
+                    "reap_error",
+                ] {
+                    assert_eq!(metadata[key], false, "{key}");
+                }
+            }
+            other => panic!("unexpected cancellation metadata outcome: {other:?}"),
+        }
     }
 
     #[cfg(unix)]
