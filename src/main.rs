@@ -8,6 +8,7 @@ pub mod journal;
 pub mod journal_store;
 pub mod lifecycle;
 mod output;
+pub mod plan_authority;
 pub mod planner;
 pub mod production_backend;
 mod system;

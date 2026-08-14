@@ -94,6 +94,40 @@ pub struct PlanningError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanPreparationError {
+    DigestInvalid,
+    DigestMismatch,
+    TooLarge,
+    JsonInvalid,
+    NonCanonical,
+    NotExecutable,
+    RegenerationFailed,
+    RegenerationMismatch,
+}
+impl PlanPreparationError {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::DigestInvalid => "plan_digest_invalid",
+            Self::DigestMismatch => "plan_digest_mismatch",
+            Self::TooLarge => "plan_file_too_large",
+            Self::JsonInvalid => "plan_json_invalid",
+            Self::NonCanonical => "plan_noncanonical",
+            Self::NotExecutable => "plan_not_executable",
+            Self::RegenerationFailed => "plan_regeneration_failed",
+            Self::RegenerationMismatch => "plan_regeneration_mismatch",
+        }
+    }
+}
+
+impl std::fmt::Display for PlanPreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+impl std::error::Error for PlanPreparationError {}
+
 pub struct CreatePlanningFacts {
     pub repository: crate::lifecycle::RepositoryIdentity,
     pub source: crate::lifecycle::CreateSource,
@@ -295,11 +329,128 @@ where
             Request::ConfigImport { repo, file } => self.import(&repo, file.as_deref()),
             Request::ConfigEdit { repo, scope } => self.edit(&repo, &scope),
             Request::Doctor { path } => self.doctor(&path),
-            Request::CreatePlan(request) => self.create_plan(request),
-            Request::RemovePlan(request) => self.remove_plan(request),
+            Request::CreatePlan(request) => self.create_plan(request, None),
+            Request::RemovePlan(request) => self.remove_plan(request, None),
             Request::RecoverList { repo } => self.recover_list(&repo),
             Request::RecoverShow { repo, operation_id } => self.recover_show(&repo, &operation_id),
         }
+    }
+
+    /// Reconstruct a request from persisted intent and run the normal read-only
+    /// facts/config/manifest/planner path with the persisted operation ID.
+    pub fn prepare_confirmed_plan(
+        &self,
+        confirmed: &crate::plan_authority::ConfirmedPlan,
+    ) -> Result<crate::lifecycle::OperationPlan, PlanPreparationError> {
+        let plan = confirmed.plan();
+        let outcome = match plan.intent() {
+            crate::lifecycle::OperationIntent::Create(intent) => {
+                let destination = intent
+                    .destination
+                    .as_ref()
+                    .ok_or(PlanPreparationError::RegenerationFailed)?;
+                let current_worktree_root = intent
+                    .current_worktree_root
+                    .as_ref()
+                    .ok_or(PlanPreparationError::RegenerationFailed)?;
+                if !destination.as_path().is_absolute() {
+                    return Err(PlanPreparationError::RegenerationFailed);
+                }
+                let source = match &intent.source {
+                    crate::lifecycle::CreateSource::NewBranch { branch, base } => {
+                        CreateSourceRequest::New {
+                            branch: branch.as_str().into(),
+                            base: base.as_ref().map(ToString::to_string),
+                        }
+                    }
+                    crate::lifecycle::CreateSource::ExistingLocal { branch } => {
+                        CreateSourceRequest::ExistingLocal {
+                            branch: branch.as_str().into(),
+                        }
+                    }
+                    crate::lifecycle::CreateSource::RemoteTracking {
+                        remote,
+                        remote_branch,
+                        local_branch,
+                    } => CreateSourceRequest::RemoteTracking {
+                        remote: remote.as_str().into(),
+                        remote_branch: remote_branch.as_str().into(),
+                        local_branch: local_branch.as_str().into(),
+                    },
+                };
+                self.create_plan(
+                    CreatePlanRequest {
+                        repo: current_worktree_root.as_path().to_owned(),
+                        invocation_cwd: current_worktree_root.as_path().to_owned(),
+                        source,
+                        custom_path: Some(destination.as_path().to_owned()),
+                        selected_tasks: intent.selected_tasks.clone(),
+                        skipped_rules: intent.skipped_rules.clone(),
+                        granted_consents: plan.granted_consents().clone(),
+                    },
+                    Some(*plan.operation_id()),
+                )
+            }
+            crate::lifecycle::OperationIntent::Remove(intent) => {
+                let root = intent.repository.primary_root.as_path().to_owned();
+                self.remove_plan(
+                    RemovePlanRequest {
+                        repo: root.clone(),
+                        invocation_cwd: root,
+                        target: intent.worktree.as_path().to_owned(),
+                        allow_dirty_removal: intent.allow_dirty_removal,
+                        delete_local_branch: intent.delete_local_branch,
+                        force_delete_local_branch: intent.force_delete_local_branch,
+                        delete_remote_branch: intent.delete_remote_branch.clone(),
+                        granted_consents: plan.granted_consents().clone(),
+                    },
+                    Some(*plan.operation_id()),
+                )
+            }
+        };
+        let ResponseData::OperationPlan(regenerated) = outcome
+            .result
+            .map_err(|_| PlanPreparationError::RegenerationFailed)?
+        else {
+            return Err(PlanPreparationError::RegenerationFailed);
+        };
+        if regenerated == *plan {
+            Ok(plan.clone())
+        } else {
+            Err(PlanPreparationError::RegenerationMismatch)
+        }
+    }
+
+    /// D5.1's application-facing preparation boundary. File acquisition stays
+    /// outside this method; the reader supplies the one read byte slice.
+    pub fn prepare_plan_bytes(
+        &self,
+        raw: &[u8],
+        expected_digest: &str,
+    ) -> Result<crate::lifecycle::OperationPlan, PlanPreparationError> {
+        let confirmed = crate::plan_authority::confirm_plan(raw, expected_digest).map_err(
+            |error| match error {
+                crate::plan_authority::PlanAuthorityError::DigestInvalid => {
+                    PlanPreparationError::DigestInvalid
+                }
+                crate::plan_authority::PlanAuthorityError::DigestMismatch => {
+                    PlanPreparationError::DigestMismatch
+                }
+                crate::plan_authority::PlanAuthorityError::TooLarge => {
+                    PlanPreparationError::TooLarge
+                }
+                crate::plan_authority::PlanAuthorityError::JsonInvalid => {
+                    PlanPreparationError::JsonInvalid
+                }
+                crate::plan_authority::PlanAuthorityError::NonCanonical => {
+                    PlanPreparationError::NonCanonical
+                }
+                crate::plan_authority::PlanAuthorityError::NotExecutable => {
+                    PlanPreparationError::NotExecutable
+                }
+            },
+        )?;
+        self.prepare_confirmed_plan(&confirmed)
     }
 
     fn recover_list(&self, repo: &Path) -> AppOutcome {
@@ -349,7 +500,11 @@ where
         }
     }
 
-    fn create_plan(&self, request: CreatePlanRequest) -> AppOutcome {
+    fn create_plan(
+        &self,
+        request: CreatePlanRequest,
+        operation_id: Option<crate::lifecycle::OperationId>,
+    ) -> AppOutcome {
         let loaded = match self.loaded(&request.repo, &ConfigOverrides::default()) {
             Ok(value) => value,
             Err(error) => return AppOutcome::fail("create", *error),
@@ -488,7 +643,7 @@ where
             artifact_rule_contracts: BTreeMap::new(),
         };
         let input = CreatePlanInput {
-            operation_id: crate::planner::new_operation_id(),
+            operation_id: operation_id.unwrap_or_else(crate::planner::new_operation_id),
             repository: facts.repository,
             intent,
             bare: facts.bare,
@@ -521,7 +676,11 @@ where
         }
     }
 
-    fn remove_plan(&self, request: RemovePlanRequest) -> AppOutcome {
+    fn remove_plan(
+        &self,
+        request: RemovePlanRequest,
+        operation_id: Option<crate::lifecycle::OperationId>,
+    ) -> AppOutcome {
         if let Err(error) = self.loaded(&request.repo, &ConfigOverrides::default()) {
             return AppOutcome::fail("remove", *error);
         }
@@ -552,7 +711,7 @@ where
             }
         };
         match crate::planner::plan_remove(RemovePlanInput {
-            operation_id: crate::planner::new_operation_id(),
+            operation_id: operation_id.unwrap_or_else(crate::planner::new_operation_id),
             intent,
             facts: facts.facts,
         }) {
@@ -812,7 +971,8 @@ fn import_warning(item: &Diagnostic, source: &Path) -> DiagnosticDto {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::RefCell, io, rc::Rc};
+    use sha2::{Digest, Sha256};
+    use std::{cell::RefCell, fs, io, path::PathBuf, rc::Rc};
 
     struct FakeRepository;
     impl RepositoryPort for FakeRepository {
@@ -1023,5 +1183,892 @@ mod tests {
         });
         assert_eq!(outcome.command, "config_import");
         assert_eq!(outcome.result.unwrap_err().diagnostic.code, "import_io");
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CreateSnapshot {
+        repo: PathBuf,
+        invocation_cwd: PathBuf,
+        custom_path: Option<PathBuf>,
+        source: String,
+        selected_tasks: BTreeSet<String>,
+        skipped_rules: BTreeSet<String>,
+        grants: BTreeSet<crate::lifecycle::ConsentId>,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RemoveSnapshot {
+        repo: PathBuf,
+        invocation_cwd: PathBuf,
+        target: PathBuf,
+        allow_dirty_removal: bool,
+        delete_local_branch: bool,
+        force_delete_local_branch: bool,
+        delete_remote_branch: Option<RemoteBranch>,
+        grants: BTreeSet<crate::lifecycle::ConsentId>,
+    }
+    #[derive(Default)]
+    struct Trace {
+        creates: Vec<CreateSnapshot>,
+        removes: Vec<RemoveSnapshot>,
+        locations: Vec<PathBuf>,
+        reads: usize,
+        manifests: usize,
+    }
+    struct PlanningFixture {
+        _tempdir: tempfile::TempDir,
+        repository: FakeRepository,
+        trace: Rc<RefCell<Trace>>,
+        create: CreatePlanningFacts,
+        remove: RemovePlanningFacts,
+        layers: Vec<LayerContents>,
+        manifests: Vec<crate::planner::FileActionManifest>,
+    }
+
+    fn id(value: &str) -> crate::lifecycle::ObjectId {
+        crate::lifecycle::ObjectId::new(value).unwrap()
+    }
+    fn branch(value: &str) -> crate::lifecycle::BranchName {
+        crate::lifecycle::BranchName::new(value).unwrap()
+    }
+    fn reference(value: &str) -> crate::lifecycle::RefName {
+        crate::lifecycle::RefName::new(value).unwrap()
+    }
+    fn remote(value: &str) -> crate::lifecycle::RemoteName {
+        crate::lifecycle::RemoteName::new(value).unwrap()
+    }
+    fn path(value: PathBuf) -> crate::domain::StoredPath {
+        crate::domain::StoredPath::from(value)
+    }
+    fn consent(value: &str) -> crate::lifecycle::ConsentId {
+        crate::lifecycle::ConsentId::new(value).unwrap()
+    }
+
+    impl PlanningFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let root_path = fs::canonicalize(root.path()).unwrap();
+            let primary = root_path.join("primary");
+            let current = root_path.join("current");
+            let target = root_path.join("remove-target");
+            let common = root_path.join("common");
+            for item in [&primary, &current, &target, &common] {
+                fs::create_dir_all(item).unwrap();
+            }
+            let destination = root_path.join("custom-destination");
+            fs::create_dir_all(destination.join(".git/ewtm")).unwrap();
+            fs::create_dir_all(common.join(".git/ewtm")).unwrap();
+            fs::write(current.join("asset"), b"asset").unwrap();
+            fs::write(primary.join(".git-sentinel"), b"primary").unwrap();
+            fs::write(common.join(".git/sentinel"), b"git").unwrap();
+            fs::write(common.join(".git/ewtm/task.log"), b"task-log").unwrap();
+            fs::write(destination.join("sentinel"), b"destination").unwrap();
+            let repository = crate::lifecycle::RepositoryIdentity {
+                common_dir: path(common.clone()),
+                primary_root: path(primary.clone()),
+                repository_oid: id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            };
+            let source = crate::lifecycle::CreateSource::NewBranch {
+                branch: branch("feature/pass-a"),
+                base: Some(reference("refs/heads/main")),
+            };
+            let create = CreatePlanningFacts {
+                repository: repository.clone(),
+                source,
+                source_facts: CreateSourceFacts::NewBranch {
+                    branch: branch("feature/pass-a"),
+                    base_ref: reference("refs/heads/main"),
+                    base_oid: id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                    branch_absent: true,
+                },
+                bare: false,
+                primary_count: 1,
+                invocation_cwd: current.clone(),
+                primary_root: path(primary.clone()),
+                current_worktree_root: path(current.clone()),
+                destination: DestinationFacts {
+                    path: path(destination.clone()),
+                    state: crate::planner::DestinationState::Absent,
+                    parent: path(root_path.clone()),
+                    parent_safe: true,
+                },
+                branch_checked_out: false,
+                branch_collision: false,
+            };
+            let artifact_digest = id("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+            let artifact = crate::planner::FileArtifact {
+                kind: crate::planner::FileArtifactKind::CopyFile,
+                source: path(current.join("asset")),
+                destination: path(destination.join("asset")),
+                bytes: 5,
+                digest: artifact_digest.clone(),
+                source_expectation: crate::lifecycle::ArtifactSourceExpectationV3::Regular(
+                    crate::lifecycle::RegularFileStateV3 {
+                        bytes: 5,
+                        digest: artifact_digest.clone(),
+                        mode: 0o644,
+                    },
+                ),
+                fingerprint: artifact_digest.clone(),
+                link_target: None,
+                sensitive: false,
+                mode_policy: crate::planner::FileModePolicy::PreserveSafe,
+                confirm: false,
+                conflict: false,
+                overlap: false,
+                replace_symlink: false,
+                compensation: None,
+                relink_facts: None,
+            };
+            let manifest_digest = crate::planner::canonical_manifest_digest(
+                &[crate::planner::ManifestDigestArtifact {
+                    source_root: path(current.clone()),
+                    source: path(current.join("asset")),
+                    destination: path(destination.join("asset")),
+                    kind: crate::planner::FileArtifactKind::CopyFile,
+                    bytes: 5,
+                    digest: artifact_digest.clone(),
+                    fingerprint: artifact_digest.clone(),
+                    link_target: None,
+                    sensitive: false,
+                    confirm: false,
+                    mode_policy: crate::planner::FileModePolicy::PreserveSafe,
+                }],
+                &destination,
+            );
+            let manifests = vec![crate::planner::FileActionManifest {
+                rule: "asset".into(),
+                source_root: path(current.clone()),
+                artifacts: vec![artifact],
+                digest: manifest_digest,
+            }];
+            let remote_branch = RemoteBranch {
+                remote: remote("origin"),
+                branch: branch("feature/pass-a"),
+            };
+            let remove = RemovePlanningFacts {
+                repository: repository.clone(),
+                facts: RemoveFacts {
+                    repository,
+                    class: crate::domain::WorktreeClass::Linked,
+                    locked: false,
+                    prunable: false,
+                    ongoing: false,
+                    oid_matches: true,
+                    branch_elsewhere: false,
+                    dirty: true,
+                    local_branch_safe_to_delete: false,
+                    safe_target_ref: reference("refs/heads/main"),
+                    safe_target: id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                    merge_provenance: crate::lifecycle::MergeTargetProvenance::LegacyUnspecified,
+                    branch: branch("feature/pass-a"),
+                    branch_oid: id("cccccccccccccccccccccccccccccccccccccccc"),
+                    worktree_oid: id("cccccccccccccccccccccccccccccccccccccccc"),
+                    remote_branch: Some(remote_branch.clone()),
+                    remote_branch_oid: Some(id("dddddddddddddddddddddddddddddddddddddddd")),
+                    remote_is_default: false,
+                    path: path(target),
+                },
+            };
+            let layers = vec![LayerContents {
+                path: root_path.join("project.toml"),
+                contents: Some("schema = 1\n[file_rules.asset]\nkind = \"copy\"\nsource = \"asset\"\ndestination = \"asset\"\nsource_root = \"current_worktree\"\n[tasks.build]\nphase = \"post_create\"\nargv = [\"build\"]\nrequired = true\nenabled = true\n[tasks.unselected]\nphase = \"post_create\"\nargv = [\"unused\"]\nenabled = false\n".into()),
+                source: config::LayerSource::Project,
+            }];
+            Self {
+                _tempdir: root,
+                repository: FakeRepository,
+                trace: Rc::new(RefCell::new(Trace::default())),
+                create,
+                remove,
+                layers,
+                manifests,
+            }
+        }
+        fn run(&self, request: Request) -> AppOutcome {
+            let system = PlanningSystem { fixture: self };
+            Application {
+                repository: &self.repository,
+                system: &system,
+            }
+            .execute(request)
+        }
+        fn create_request(&self) -> CreatePlanRequest {
+            let current = self.create.current_worktree_root.as_path().to_owned();
+            CreatePlanRequest {
+                repo: self.create.primary_root.as_path().to_owned(),
+                invocation_cwd: current,
+                source: CreateSourceRequest::New {
+                    branch: "feature/pass-a".into(),
+                    base: Some("refs/heads/main".into()),
+                },
+                custom_path: Some(self.create.destination.path.as_path().to_owned()),
+                selected_tasks: ["build".into()].into_iter().collect(),
+                skipped_rules: BTreeSet::new(),
+                granted_consents: [consent("task:build")].into_iter().collect(),
+            }
+        }
+        fn remove_request(&self) -> RemovePlanRequest {
+            let f = &self.remove.facts;
+            RemovePlanRequest {
+                repo: f.repository.primary_root.as_path().to_owned(),
+                invocation_cwd: f.repository.primary_root.as_path().to_owned(),
+                target: f.path.as_path().to_owned(),
+                allow_dirty_removal: true,
+                delete_local_branch: true,
+                force_delete_local_branch: true,
+                delete_remote_branch: f.remote_branch.clone(),
+                granted_consents: [
+                    "remove:worktree",
+                    "remove:dirty",
+                    "remove:local-branch",
+                    "remove:force-local-branch",
+                    "remove:remote:origin/feature/pass-a",
+                ]
+                .into_iter()
+                .map(consent)
+                .collect(),
+            }
+        }
+    }
+
+    struct PlanningSystem<'a> {
+        fixture: &'a PlanningFixture,
+    }
+    impl ConfigLocationPort for PlanningSystem<'_> {
+        fn locations(&self, repo: &Path) -> Result<ConfigLocations, String> {
+            self.fixture
+                .trace
+                .borrow_mut()
+                .locations
+                .push(repo.to_owned());
+            Ok(ConfigLocations {
+                user: None,
+                project: self.fixture.layers[0].path.clone(),
+                local: repo.join(".ewtm.toml"),
+            })
+        }
+    }
+    impl ConfigFilePort for PlanningSystem<'_> {
+        fn read_layers(&self, _: &ConfigLocations) -> Result<Vec<LayerContents>, String> {
+            self.fixture.trace.borrow_mut().reads += 1;
+            Ok(self.fixture.layers.clone())
+        }
+        fn read_import(&self, _: &Path) -> Result<String, String> {
+            Ok(String::new())
+        }
+    }
+    impl EditorPort for PlanningSystem<'_> {
+        fn prepare(&self, _: &Path) -> Result<(), String> {
+            Ok(())
+        }
+        fn execute(&self, _: &str, _: &Path) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    impl EnvironmentPort for PlanningSystem<'_> {
+        fn editor(&self) -> Result<String, String> {
+            Ok("vi".into())
+        }
+        fn git_available(&self) -> bool {
+            true
+        }
+    }
+    impl ProcessPort for PlanningSystem<'_> {
+        fn import(&self, source: &str, path: &Path) -> Result<ImportResult, Vec<Diagnostic>> {
+            crate::worktreerc::import_source(source, path)
+        }
+    }
+    impl LifecyclePlanningPort for PlanningSystem<'_> {
+        fn create_facts(
+            &self,
+            request: &CreatePlanRequest,
+            _: Option<&str>,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<CreatePlanningFacts, PlanningError> {
+            self.fixture
+                .trace
+                .borrow_mut()
+                .creates
+                .push(CreateSnapshot {
+                    repo: request.repo.clone(),
+                    invocation_cwd: request.invocation_cwd.clone(),
+                    custom_path: request.custom_path.clone(),
+                    source: format!("{:?}", request.source),
+                    selected_tasks: request.selected_tasks.clone(),
+                    skipped_rules: request.skipped_rules.clone(),
+                    grants: request.granted_consents.clone(),
+                });
+            let f = &self.fixture.create;
+            Ok(CreatePlanningFacts {
+                repository: f.repository.clone(),
+                source: f.source.clone(),
+                source_facts: f.source_facts.clone(),
+                bare: f.bare,
+                primary_count: f.primary_count,
+                invocation_cwd: f.invocation_cwd.clone(),
+                primary_root: f.primary_root.clone(),
+                current_worktree_root: f.current_worktree_root.clone(),
+                destination: f.destination.clone(),
+                branch_checked_out: f.branch_checked_out,
+                branch_collision: f.branch_collision,
+            })
+        }
+        fn remove_facts(
+            &self,
+            request: &RemovePlanRequest,
+        ) -> Result<RemovePlanningFacts, PlanningError> {
+            self.fixture
+                .trace
+                .borrow_mut()
+                .removes
+                .push(RemoveSnapshot {
+                    repo: request.repo.clone(),
+                    invocation_cwd: request.invocation_cwd.clone(),
+                    target: request.target.clone(),
+                    allow_dirty_removal: request.allow_dirty_removal,
+                    delete_local_branch: request.delete_local_branch,
+                    force_delete_local_branch: request.force_delete_local_branch,
+                    delete_remote_branch: request.delete_remote_branch.clone(),
+                    grants: request.granted_consents.clone(),
+                });
+            Ok(RemovePlanningFacts {
+                repository: self.fixture.remove.repository.clone(),
+                facts: self.fixture.remove.facts.clone(),
+            })
+        }
+    }
+    impl ManifestPlanningPort for PlanningSystem<'_> {
+        fn plan_manifests(
+            &self,
+            _: &CreatePlanRequest,
+            _: &CreatePlanningFacts,
+            _: Vec<ManifestRuleSpec>,
+        ) -> Result<Vec<crate::planner::FileActionManifest>, PlanningError> {
+            self.fixture.trace.borrow_mut().manifests += 1;
+            Ok(self.fixture.manifests.clone())
+        }
+    }
+
+    fn plan(outcome: AppOutcome) -> crate::lifecycle::OperationPlan {
+        match outcome.result.unwrap() {
+            ResponseData::OperationPlan(plan) => plan,
+            _ => panic!("not a plan"),
+        }
+    }
+    fn digest(raw: &[u8]) -> String {
+        Sha256::digest(raw)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+    fn create_plan_and_raw(
+        fixture: &PlanningFixture,
+    ) -> (crate::lifecycle::OperationPlan, Vec<u8>) {
+        let plan = plan(fixture.run(Request::CreatePlan(fixture.create_request())));
+        let raw = serde_json::to_vec(&plan).unwrap();
+        (plan, raw)
+    }
+    fn prepare(
+        fixture: &PlanningFixture,
+        raw: &[u8],
+    ) -> Result<crate::lifecycle::OperationPlan, PlanPreparationError> {
+        Application {
+            repository: &fixture.repository,
+            system: &PlanningSystem { fixture },
+        }
+        .prepare_plan_bytes(raw, &digest(raw))
+    }
+    fn replace_once(raw: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+        let position = raw
+            .windows(from.len())
+            .position(|window| window == from)
+            .unwrap();
+        let mut changed = raw.to_vec();
+        changed.splice(position..position + from.len(), to.iter().copied());
+        changed
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TreeEntry {
+        relative: PathBuf,
+        kind: &'static str,
+        bytes: Vec<u8>,
+        #[cfg(unix)]
+        mode: u32,
+    }
+    fn snapshot_tree(root: &Path) -> Vec<TreeEntry> {
+        fn visit(root: &Path, current: &Path, output: &mut Vec<TreeEntry>) {
+            let mut entries: Vec<_> = fs::read_dir(current)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                let relative = path.strip_prefix(root).unwrap().to_owned();
+                #[cfg(unix)]
+                let mode = std::os::unix::fs::MetadataExt::mode(&metadata);
+                if metadata.is_dir() {
+                    output.push(TreeEntry {
+                        relative: relative.clone(),
+                        kind: "dir",
+                        bytes: Vec::new(),
+                        #[cfg(unix)]
+                        mode,
+                    });
+                    visit(root, &path, output);
+                } else if metadata.is_file() {
+                    output.push(TreeEntry {
+                        relative,
+                        kind: "file",
+                        bytes: fs::read(&path).unwrap(),
+                        #[cfg(unix)]
+                        mode,
+                    });
+                } else if metadata.file_type().is_symlink() {
+                    output.push(TreeEntry {
+                        relative,
+                        kind: "symlink",
+                        bytes: fs::read_link(&path)
+                            .unwrap()
+                            .as_os_str()
+                            .as_encoded_bytes()
+                            .to_vec(),
+                        #[cfg(unix)]
+                        mode,
+                    });
+                }
+            }
+        }
+        let mut output = Vec::new();
+        visit(root, root, &mut output);
+        output
+    }
+
+    #[test]
+    fn pass_a_create_prepare_round_trip_preserves_id_and_grants() {
+        let fixture = PlanningFixture::new();
+        let original = plan(fixture.run(Request::CreatePlan(fixture.create_request())));
+        assert!(!original.steps().is_empty());
+        let raw = serde_json::to_vec(&original).unwrap();
+        let returned = fixture.run(Request::CreatePlan(fixture.create_request()));
+        let prepared = Application {
+            repository: &fixture.repository,
+            system: &PlanningSystem { fixture: &fixture },
+        }
+        .prepare_plan_bytes(&raw, &digest(&raw))
+        .unwrap();
+        assert_eq!(prepared, original);
+        assert_eq!(prepared.operation_id(), original.operation_id());
+        assert_eq!(prepared.granted_consents(), original.granted_consents());
+        assert!(returned.is_success());
+    }
+
+    #[test]
+    fn pass_a_remove_prepare_round_trip_preserves_destructive_intent() {
+        let fixture = PlanningFixture::new();
+        let original = plan(fixture.run(Request::RemovePlan(fixture.remove_request())));
+        let raw = serde_json::to_vec(&original).unwrap();
+        let prepared = Application {
+            repository: &fixture.repository,
+            system: &PlanningSystem { fixture: &fixture },
+        }
+        .prepare_plan_bytes(&raw, &digest(&raw))
+        .unwrap();
+        assert_eq!(prepared, original);
+        let crate::lifecycle::OperationIntent::Remove(intent) = prepared.intent() else {
+            panic!("wrong intent")
+        };
+        assert!(
+            intent.allow_dirty_removal
+                && intent.delete_local_branch
+                && intent.force_delete_local_branch
+        );
+        assert!(intent.delete_remote_branch.is_some());
+        assert_eq!(prepared.granted_consents(), original.granted_consents());
+    }
+
+    #[test]
+    fn pass_a_ordinary_calls_allocate_distinct_fresh_ids() {
+        let fixture = PlanningFixture::new();
+        let a = plan(fixture.run(Request::CreatePlan(fixture.create_request())));
+        let b = plan(fixture.run(Request::CreatePlan(fixture.create_request())));
+        assert_ne!(a.operation_id(), b.operation_id());
+        let a = plan(fixture.run(Request::RemovePlan(fixture.remove_request())));
+        let b = plan(fixture.run(Request::RemovePlan(fixture.remove_request())));
+        assert_ne!(a.operation_id(), b.operation_id());
+    }
+
+    #[test]
+    fn pass_a_create_regeneration_records_persisted_anchors_not_common_dir() {
+        let fixture = PlanningFixture::new();
+        let original = plan(fixture.run(Request::CreatePlan(fixture.create_request())));
+        let raw = serde_json::to_vec(&original).unwrap();
+        let system = PlanningSystem { fixture: &fixture };
+        Application {
+            repository: &fixture.repository,
+            system: &system,
+        }
+        .prepare_plan_bytes(&raw, &digest(&raw))
+        .unwrap();
+        let trace = fixture.trace.borrow();
+        let snapshot = trace.creates.last().unwrap();
+        assert_eq!(
+            snapshot.repo,
+            fixture.create.current_worktree_root.as_path()
+        );
+        assert_eq!(
+            snapshot.invocation_cwd,
+            fixture.create.current_worktree_root.as_path()
+        );
+        assert_eq!(
+            snapshot.custom_path,
+            Some(fixture.create.destination.path.as_path().to_owned())
+        );
+        assert_eq!(
+            snapshot.source,
+            format!("{:?}", fixture.create_request().source)
+        );
+        assert_eq!(
+            snapshot.selected_tasks,
+            fixture.create_request().selected_tasks
+        );
+        assert_eq!(
+            snapshot.skipped_rules,
+            fixture.create_request().skipped_rules
+        );
+        assert_eq!(snapshot.grants, fixture.create_request().granted_consents);
+        assert_ne!(
+            snapshot.repo,
+            fixture.create.repository.common_dir.as_path()
+        );
+    }
+
+    #[test]
+    fn pass_a_remove_regeneration_records_primary_anchor_target_flags_and_grants() {
+        let fixture = PlanningFixture::new();
+        let original = plan(fixture.run(Request::RemovePlan(fixture.remove_request())));
+        let raw = serde_json::to_vec(&original).unwrap();
+        let system = PlanningSystem { fixture: &fixture };
+        Application {
+            repository: &fixture.repository,
+            system: &system,
+        }
+        .prepare_plan_bytes(&raw, &digest(&raw))
+        .unwrap();
+        let trace = fixture.trace.borrow();
+        let snapshot = trace.removes.last().unwrap();
+        assert_eq!(
+            snapshot.repo,
+            fixture.remove.facts.repository.primary_root.as_path()
+        );
+        assert_eq!(
+            snapshot.invocation_cwd,
+            fixture.remove.facts.repository.primary_root.as_path()
+        );
+        assert_eq!(snapshot.target, fixture.remove.facts.path.as_path());
+        assert!(
+            snapshot.allow_dirty_removal
+                && snapshot.delete_local_branch
+                && snapshot.force_delete_local_branch
+        );
+        assert_eq!(
+            snapshot.delete_remote_branch,
+            fixture.remove.facts.remote_branch
+        );
+        assert_eq!(snapshot.grants, fixture.remove_request().granted_consents);
+    }
+
+    #[test]
+    fn pass_a_return_is_decoded_canonical_plan_not_regenerated_substitute() {
+        let fixture = PlanningFixture::new();
+        let original = plan(fixture.run(Request::CreatePlan(fixture.create_request())));
+        let raw = serde_json::to_vec(&original).unwrap();
+        let confirmed = crate::plan_authority::confirm_plan(&raw, &digest(&raw)).unwrap();
+        let system = PlanningSystem { fixture: &fixture };
+        let returned = Application {
+            repository: &fixture.repository,
+            system: &system,
+        }
+        .prepare_plan_bytes(&raw, &digest(&raw))
+        .unwrap();
+        assert_eq!(confirmed.plan(), &returned);
+        assert_eq!(
+            serde_json::to_vec(confirmed.plan()).unwrap(),
+            serde_json::to_vec(&returned).unwrap()
+        );
+        assert_eq!(confirmed.plan().operation_id(), returned.operation_id());
+    }
+
+    #[test]
+    fn pass_a_preparation_errors_are_fixed_and_do_not_leak_fixture_secrets() {
+        let fixture = PlanningFixture::new();
+        let error = Application {
+            repository: &fixture.repository,
+            system: &PlanningSystem { fixture: &fixture },
+        }
+        .prepare_plan_bytes(b"fixture-secret", &"0".repeat(64))
+        .unwrap_err();
+        assert_eq!(error.code(), "plan_digest_mismatch");
+        assert_eq!(error.to_string(), "plan_digest_mismatch");
+        assert!(!error.to_string().contains("fixture-secret"));
+    }
+
+    #[test]
+    fn pass_b_repository_and_source_facts_drift_mismatch_with_persisted_id() {
+        let mut fixture = PlanningFixture::new();
+        let (original, raw) = create_plan_and_raw(&fixture);
+        let persisted_id = *original.operation_id();
+        fixture.create.repository.repository_oid = id("1111111111111111111111111111111111111111");
+        fixture.create.source_facts = CreateSourceFacts::NewBranch {
+            branch: branch("feature/pass-a"),
+            base_ref: reference("refs/heads/main"),
+            base_oid: id("1212121212121212121212121212121212121212"),
+            branch_absent: true,
+        };
+        let error = prepare(&fixture, &raw).unwrap_err();
+        assert_eq!(error, PlanPreparationError::RegenerationMismatch);
+        assert_eq!(error.code(), "plan_regeneration_mismatch");
+        assert_eq!(persisted_id, original.operation_id().to_owned());
+    }
+
+    #[test]
+    fn pass_b_task_drift_fails_or_mismatches_and_unselected_drift_is_irrelevant() {
+        let mut fixture = PlanningFixture::new();
+        let (_, raw) = create_plan_and_raw(&fixture);
+        let contents = fixture.layers[0].contents.as_mut().unwrap();
+        *contents = contents.replace("[\"build\"]", "[\"changed\"]");
+        let error = prepare(&fixture, &raw).unwrap_err();
+        assert!(matches!(
+            error,
+            PlanPreparationError::RegenerationMismatch | PlanPreparationError::RegenerationFailed
+        ));
+        assert!(matches!(
+            error.code(),
+            "plan_regeneration_mismatch" | "plan_regeneration_failed"
+        ));
+        assert!(matches!(
+            error.code(),
+            "plan_regeneration_mismatch" | "plan_regeneration_failed"
+        ));
+
+        let mut fixture = PlanningFixture::new();
+        let (_, raw) = create_plan_and_raw(&fixture);
+        let contents = fixture.layers[0].contents.as_mut().unwrap();
+        *contents = contents.replace("[\"unused\"]", "[\"changed-unused\"]");
+        assert_eq!(
+            prepare(&fixture, &raw).unwrap(),
+            crate::plan_authority::confirm_plan(&raw, &digest(&raw))
+                .unwrap()
+                .into_plan()
+        );
+
+        let mut fixture = PlanningFixture::new();
+        let (_, raw) = create_plan_and_raw(&fixture);
+        let contents = fixture.layers[0].contents.as_mut().unwrap();
+        *contents = contents.replace("enabled = true", "enabled = false");
+        let error = prepare(&fixture, &raw).unwrap_err();
+        assert_eq!(error, PlanPreparationError::RegenerationFailed);
+        assert_eq!(error.code(), "plan_regeneration_failed");
+    }
+
+    #[test]
+    fn pass_b_file_rule_and_manifest_drift_refuses_without_changing_raw_authority() {
+        let mut fixture = PlanningFixture::new();
+        let (_, raw) = create_plan_and_raw(&fixture);
+        let original_digest = digest(&raw);
+        fixture.manifests[0].artifacts[0].digest = id("2323232323232323232323232323232323232323");
+        let error = prepare(&fixture, &raw).unwrap_err();
+        assert!(matches!(
+            error,
+            PlanPreparationError::RegenerationMismatch | PlanPreparationError::RegenerationFailed
+        ));
+        assert_eq!(digest(&raw), original_digest);
+
+        let mut fixture = PlanningFixture::new();
+        let (_, raw) = create_plan_and_raw(&fixture);
+        let contents = fixture.layers[0].contents.as_mut().unwrap();
+        *contents = contents.replace("enabled = true", "enabled = false");
+        let error = prepare(&fixture, &raw).unwrap_err();
+        assert!(matches!(
+            error,
+            PlanPreparationError::RegenerationMismatch | PlanPreparationError::RegenerationFailed
+        ));
+
+        let mut fixture = PlanningFixture::new();
+        let (_, raw) = create_plan_and_raw(&fixture);
+        fixture.layers[0]
+            .contents
+            .as_mut()
+            .unwrap()
+            .push_str("\n[git]\nremote = \"upstream\"\n");
+        fixture.create.source = crate::lifecycle::CreateSource::RemoteTracking {
+            remote: remote("upstream"),
+            remote_branch: branch("feature/pass-a"),
+            local_branch: branch("feature/pass-a"),
+        };
+        fixture.create.source_facts = CreateSourceFacts::RemoteTracking {
+            remote: remote("upstream"),
+            remote_branch: branch("feature/pass-a"),
+            remote_oid: id("6767676767676767676767676767676767676767"),
+            local_branch: branch("feature/pass-a"),
+            local_absent: true,
+        };
+        let error = prepare(&fixture, &raw).unwrap_err();
+        assert!(matches!(
+            error,
+            PlanPreparationError::RegenerationMismatch | PlanPreparationError::RegenerationFailed
+        ));
+    }
+
+    #[test]
+    fn pass_b_relevant_config_and_anchor_drift_refuse_irrelevant_layer_is_accepted() {
+        let mut fixture = PlanningFixture::new();
+        let (_, raw) = create_plan_and_raw(&fixture);
+        fixture.create.destination.path = path(
+            fixture
+                .create
+                .destination
+                .path
+                .as_path()
+                .with_file_name("other-destination"),
+        );
+        let error = prepare(&fixture, &raw).unwrap_err();
+        assert!(matches!(
+            error,
+            PlanPreparationError::RegenerationMismatch | PlanPreparationError::RegenerationFailed
+        ));
+
+        let mut fixture = PlanningFixture::new();
+        let (_, raw) = create_plan_and_raw(&fixture);
+        fixture.layers[0]
+            .contents
+            .as_mut()
+            .unwrap()
+            .push_str("\n[create]\nslug_max_bytes = 60\n");
+        assert!(prepare(&fixture, &raw).is_ok());
+
+        let mut fixture = PlanningFixture::new();
+        let (_, raw) = create_plan_and_raw(&fixture);
+        fixture.layers[0]
+            .contents
+            .as_mut()
+            .unwrap()
+            .push_str("\n[create]\ndefault_base = \"refs/heads/other\"\n");
+        fixture.create.source = crate::lifecycle::CreateSource::NewBranch {
+            branch: branch("feature/pass-a"),
+            base: Some(reference("refs/heads/other")),
+        };
+        fixture.create.source_facts = CreateSourceFacts::NewBranch {
+            branch: branch("feature/pass-a"),
+            base_ref: reference("refs/heads/other"),
+            base_oid: id("3434343434343434343434343434343434343434"),
+            branch_absent: true,
+        };
+        let error = prepare(&fixture, &raw).unwrap_err();
+        assert!(matches!(
+            error,
+            PlanPreparationError::RegenerationMismatch | PlanPreparationError::RegenerationFailed
+        ));
+    }
+
+    #[test]
+    fn pass_b_remove_target_class_oid_and_raw_flags_refuse() {
+        let mut fixture = PlanningFixture::new();
+        let original = plan(fixture.run(Request::RemovePlan(fixture.remove_request())));
+        let raw = serde_json::to_vec(&original).unwrap();
+        fixture.remove.facts.path = path(
+            fixture
+                .remove
+                .facts
+                .path
+                .as_path()
+                .with_file_name("other-target"),
+        );
+        let error = prepare(&fixture, &raw).unwrap_err();
+        assert!(matches!(
+            error,
+            PlanPreparationError::RegenerationMismatch | PlanPreparationError::RegenerationFailed
+        ));
+
+        let mut fixture = PlanningFixture::new();
+        let original = plan(fixture.run(Request::RemovePlan(fixture.remove_request())));
+        let raw = serde_json::to_vec(&original).unwrap();
+        fixture.remove.facts.class = crate::domain::WorktreeClass::Primary;
+        assert!(matches!(
+            prepare(&fixture, &raw),
+            Err(PlanPreparationError::RegenerationFailed
+                | PlanPreparationError::RegenerationMismatch)
+        ));
+
+        let mut fixture = PlanningFixture::new();
+        let original = plan(fixture.run(Request::RemovePlan(fixture.remove_request())));
+        let raw = serde_json::to_vec(&original).unwrap();
+        fixture.remove.facts.worktree_oid = id("4545454545454545454545454545454545454545");
+        assert!(matches!(
+            prepare(&fixture, &raw),
+            Err(PlanPreparationError::RegenerationFailed
+                | PlanPreparationError::RegenerationMismatch)
+        ));
+
+        let raw = replace_once(
+            &raw,
+            b"\"allow_dirty_removal\":true",
+            b"\"allow_dirty_removal\":false",
+        );
+        let error = prepare(&PlanningFixture::new(), &raw).unwrap_err();
+        assert!(matches!(
+            error,
+            PlanPreparationError::RegenerationMismatch
+                | PlanPreparationError::RegenerationFailed
+                | PlanPreparationError::NotExecutable
+        ));
+        assert!(matches!(
+            error.code(),
+            "plan_regeneration_mismatch" | "plan_regeneration_failed" | "plan_not_executable"
+        ));
+    }
+
+    #[test]
+    fn pass_b_grant_mutation_is_not_added_by_application() {
+        let fixture = PlanningFixture::new();
+        let (_, raw) = create_plan_and_raw(&fixture);
+        let changed = replace_once(&raw, b"[\"task:build\"]", b"[]");
+        let error = prepare(&fixture, &changed).unwrap_err();
+        assert_eq!(error, PlanPreparationError::NotExecutable);
+        assert_eq!(error.code(), "plan_not_executable");
+    }
+
+    #[test]
+    fn pass_b_preparation_errors_are_redacted_and_debug_is_stable() {
+        let fixture = PlanningFixture::new();
+        let error = prepare(&fixture, b"fixture-secret-source-bytes").unwrap_err();
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert_eq!(display, "plan_json_invalid");
+        assert_eq!(error.code(), "plan_json_invalid");
+        assert!(!display.contains("fixture-secret"));
+        assert!(!debug.contains("fixture-secret"));
+    }
+
+    #[test]
+    fn pass_b_success_and_mismatch_are_filesystem_read_only() {
+        let fixture = PlanningFixture::new();
+        let before = snapshot_tree(fixture.create.primary_root.as_path().parent().unwrap());
+        let (_, raw) = create_plan_and_raw(&fixture);
+        assert!(prepare(&fixture, &raw).is_ok());
+        let after_success = snapshot_tree(fixture.create.primary_root.as_path().parent().unwrap());
+        assert_eq!(before, after_success);
+
+        let mut fixture = PlanningFixture::new();
+        let before = snapshot_tree(fixture.create.primary_root.as_path().parent().unwrap());
+        let (_, raw) = create_plan_and_raw(&fixture);
+        fixture.create.repository.repository_oid = id("5656565656565656565656565656565656565656");
+        assert!(prepare(&fixture, &raw).is_err());
+        let after_failure = snapshot_tree(fixture.create.primary_root.as_path().parent().unwrap());
+        assert_eq!(before, after_failure);
     }
 }

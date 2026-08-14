@@ -1694,7 +1694,7 @@ pub fn plan_remove(input: RemovePlanInput) -> Result<OperationPlan, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
     use std::{collections::BTreeSet, path::PathBuf};
@@ -3441,18 +3441,36 @@ mod tests {
     fn granted_create_and_remove_plans_roundtrip_executable() {
         let mut create =
             executable_artifact_input(FileArtifactKind::CopyFile, true, false, false, false);
+        let create_id = OperationId::new(Uuid::from_u128(1));
+        create.operation_id = create_id;
         create
             .intent
             .granted_consents
             .insert(ConsentId::new("file-rule:config").unwrap());
         let create_plan = plan_create(create).unwrap();
+        assert_eq!(*create_plan.operation_id(), create_id);
         assert!(create_plan.validate_executable_plan().is_ok());
         let mut remove_intent = remove_intent();
         remove_intent
             .granted_consents
             .insert(ConsentId::new("remove:worktree").unwrap());
-        let remove_plan = plan_remove(remove_input(remove_intent)).unwrap();
+        let mut remove_input = remove_input(remove_intent);
+        let remove_id = OperationId::new(Uuid::from_u128(2));
+        remove_input.operation_id = remove_id;
+        let remove_plan = plan_remove(remove_input).unwrap();
+        assert_eq!(*remove_plan.operation_id(), remove_id);
         assert!(remove_plan.validate_executable_plan().is_ok());
+    }
+
+    pub(crate) fn authority_fixture() -> OperationPlan {
+        plan_create(executable_artifact_input(
+            FileArtifactKind::CopyFile,
+            false,
+            false,
+            false,
+            false,
+        ))
+        .unwrap()
     }
 
     #[test]
