@@ -1,5 +1,6 @@
 pub mod application;
 pub mod cli;
+pub mod compensation;
 pub mod config;
 pub mod domain;
 pub mod execution;
@@ -124,6 +125,9 @@ fn main() -> ExitCode {
                     json,
                 )
             }
+            cli::RecoverAction::ProposeCompensation(args) => {
+                return propose_compensation(args, invocation_cwd);
+            }
         },
         cli::Action::Config { action } => match action {
             cli::ConfigAction::Show {
@@ -189,6 +193,64 @@ fn main() -> ExitCode {
         }
     }
     if outcome.is_success() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+fn propose_compensation(args: cli::ProposeCompensationArgs, cwd: PathBuf) -> ExitCode {
+    let id = match args.forward_id.parse::<crate::lifecycle::OperationId>() {
+        Ok(value) if value.to_string() == args.forward_id => value,
+        Err(_) | Ok(_) => {
+            return unavailable(
+                "recover_propose_compensation",
+                true,
+                args.json,
+                "invalid_operation_id",
+                "invalid operation id".into(),
+            );
+        }
+    };
+    let anchor = args.repo.clone().unwrap_or(cwd);
+    let service = compensation::CompensationProposalService {
+        evidence: journal_store::JournalEvidencePort,
+        observer: infrastructure::InfrastructureCompensationObserver,
+        next_id: compensation::ProposalId::new_v4,
+    };
+    let outcome = match service.propose(&anchor, &id, &args.allowances()) {
+        Ok(proposal) => application::AppOutcome::ok(
+            "recover_propose_compensation",
+            application::ResponseData::CompensationProposal(proposal),
+            Vec::new(),
+        ),
+        Err(error) => application::AppOutcome::fail(
+            "recover_propose_compensation",
+            application::DiagnosticDto {
+                code: error.code().into(),
+                message: error.message().into(),
+                path: None,
+                line: None,
+                column: None,
+            },
+        ),
+    };
+    let mut rendered = true;
+    if args.json {
+        match output::render_json(&outcome) {
+            Ok(text) => println!("{text}"),
+            Err(_) => {
+                rendered = false;
+                eprintln!("recover_propose_compensation: response serialization failed");
+            }
+        }
+    } else {
+        match output::render_text(&outcome) {
+            Ok(text) if outcome.is_success() => print!("{text}"),
+            Ok(text) | Err(text) => eprintln!("{text}"),
+        }
+    }
+    if rendered && outcome.is_success() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)

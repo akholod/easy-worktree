@@ -30,6 +30,130 @@ use crate::{
     },
 };
 
+/// The compensation observer is deliberately separate from the execution
+/// backend: it has no mutation surface and only exposes exact, bounded facts.
+pub struct InfrastructureCompensationObserver;
+
+impl crate::compensation::CompensationObservationPort for InfrastructureCompensationObserver {
+    type Error = GitError;
+
+    fn discover_repository(&self, anchor: &Path) -> Result<RepositoryIdentity, Self::Error> {
+        readonly_repository_identity(anchor)
+    }
+
+    fn observe_artifact(
+        &self,
+        path: &Path,
+        expected: &crate::lifecycle::ArtifactStateV3,
+    ) -> Result<crate::compensation::ObservedArtifactState, Self::Error> {
+        readonly_observe_artifact(path, expected)
+    }
+
+    fn observe_absence(&self, path: &Path) -> Result<bool, Self::Error> {
+        readonly_final_absent(path)
+    }
+
+    fn observe_worktree(
+        &self,
+        anchor: &Path,
+        path: &Path,
+    ) -> Result<Option<crate::compensation::ObservedWorktree>, Self::Error> {
+        readonly_observe_registered_worktree(anchor, path)
+    }
+
+    fn observe_local_ref(
+        &self,
+        anchor: &Path,
+        branch: &BranchName,
+    ) -> Result<Option<ObjectId>, Self::Error> {
+        let value = branch.as_str();
+        if value.is_empty()
+            || value.starts_with('/')
+            || value.ends_with('/')
+            || value.contains("..")
+            || value.contains("@{")
+            || value.contains('\\')
+            || value
+                .split('/')
+                .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with('.'))
+        {
+            return Err(GitError::Parse("invalid local branch reference".into()));
+        }
+        readonly_ref_oid(anchor, &format!("refs/heads/{branch}"))
+    }
+}
+
+pub(crate) fn readonly_observe_registered_worktree(
+    anchor: &Path,
+    path: &Path,
+) -> Result<Option<crate::compensation::ObservedWorktree>, GitError> {
+    let listing = readonly_list(anchor)?;
+    let matches = listing
+        .data
+        .worktrees
+        .iter()
+        .filter(|item| readonly_same_path(&item.path, path))
+        .collect::<Vec<_>>();
+    let [item] = matches.as_slice() else {
+        return if matches.is_empty() {
+            Ok(None)
+        } else {
+            Err(GitError::Parse("duplicate worktree observation".into()))
+        };
+    };
+    let Some(branch) = item.branch.as_deref() else {
+        return Err(GitError::Parse("incomplete worktree observation".into()));
+    };
+    let Some(head_oid) = item.head_oid.as_deref() else {
+        return Err(GitError::Parse("incomplete worktree observation".into()));
+    };
+    if item.classification == WorktreeClass::Unknown {
+        return Err(GitError::Parse("incomplete worktree observation".into()));
+    }
+    Ok(Some(crate::compensation::ObservedWorktree {
+        path: StoredPath::from(item.path.clone()),
+        branch: BranchName::new(branch.to_owned()).map_err(GitError::Parse)?,
+        head_oid: ObjectId::new(head_oid.to_owned()).map_err(GitError::Parse)?,
+        classification: item.classification,
+    }))
+}
+
+pub(crate) fn readonly_repository_identity(anchor: &Path) -> Result<RepositoryIdentity, GitError> {
+    let data = readonly_list(anchor)?.data;
+    if data.repository.bare {
+        return Err(GitError::Discovery("bare repository".into()));
+    }
+    let primaries = data
+        .worktrees
+        .iter()
+        .filter(|w| w.classification == WorktreeClass::Primary)
+        .collect::<Vec<_>>();
+    let primary = primaries
+        .first()
+        .ok_or_else(|| GitError::Discovery("no primary worktree".into()))?;
+    if primaries.len() != 1 {
+        return Err(GitError::Discovery("multiple primary worktrees".into()));
+    }
+    let oid = primary
+        .head_oid
+        .as_deref()
+        .ok_or_else(|| GitError::Discovery("unborn primary".into()))?;
+    Ok(RepositoryIdentity {
+        common_dir: data
+            .repository
+            .common_dir
+            .canonicalize()
+            .map_err(|e| GitError::Discovery(e.to_string()))?
+            .into(),
+        primary_root: primary
+            .path
+            .canonicalize()
+            .map_err(|e| GitError::Discovery(e.to_string()))?
+            .into(),
+        repository_oid: ObjectId::new(oid.to_owned()).map_err(GitError::Parse)?,
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum GitError {
     #[error("git discovery failed: {0}")]
@@ -2279,6 +2403,148 @@ pub(crate) fn readonly_observe_absolute_node(
     readonly_observe_node(&root, &path)
 }
 
+pub(crate) fn readonly_observe_artifact(
+    path: &Path,
+    expected: &crate::lifecycle::ArtifactStateV3,
+) -> Result<crate::compensation::ObservedArtifactState, GitError> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{
+            AtFlags, FileType, Mode, OFlags, fstat, open, openat, readlinkat, statat,
+        };
+        use sha2::Digest;
+        use std::{fs::File, io::Read};
+
+        let path = planner::normalize_lexical(path.to_owned());
+        if !path.is_absolute() {
+            return Err(GitError::Parse(
+                "absolute observation requires an absolute path".into(),
+            ));
+        }
+        let root = platform_alias_root(&path);
+        let relative = path
+            .strip_prefix(&root)
+            .map_err(|_| GitError::Parse("path is outside trusted root".into()))?;
+        let canonical = root
+            .canonicalize()
+            .map_err(|error| GitError::Discovery(error.to_string()))?;
+        let mut parent = open(
+            &canonical,
+            OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| GitError::Command(error.to_string()))?;
+        let components: Vec<_> = relative.components().collect();
+        let Some(std::path::Component::Normal(name)) = components.last() else {
+            return Ok(crate::compensation::ObservedArtifactState::Other);
+        };
+        for component in components.iter().take(components.len() - 1) {
+            let std::path::Component::Normal(component) = component else {
+                return Ok(crate::compensation::ObservedArtifactState::Other);
+            };
+            parent = match openat(
+                &parent,
+                *component,
+                OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(error) if observation_mismatch(error) => {
+                    return Ok(crate::compensation::ObservedArtifactState::Absent);
+                }
+                Err(error) => return Err(GitError::Command(error.to_string())),
+            };
+        }
+        let stat = match statat(&parent, *name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(error) if observation_mismatch(error) => {
+                return Ok(crate::compensation::ObservedArtifactState::Absent);
+            }
+            Err(error) => return Err(GitError::Command(error.to_string())),
+        };
+        let file_type = FileType::from_raw_mode(stat.st_mode);
+        if file_type.is_symlink() {
+            if !matches!(expected, crate::lifecycle::ArtifactStateV3::Symlink(_)) {
+                return Ok(crate::compensation::ObservedArtifactState::Other);
+            }
+            let target = readlinkat(&parent, *name, Vec::new())
+                .map_err(|error| GitError::Command(error.to_string()))?
+                .into_bytes();
+            let target = PathBuf::from(std::ffi::OsString::from_vec(target));
+            return Ok(crate::compensation::ObservedArtifactState::Symlink {
+                target: StoredPath::from(target.clone()),
+                target_digest: crate::planner::artifact_digest(
+                    target.as_os_str().as_encoded_bytes(),
+                ),
+            });
+        }
+        let crate::lifecycle::ArtifactStateV3::Regular(wanted) = expected else {
+            return Ok(crate::compensation::ObservedArtifactState::Other);
+        };
+        let fd = match openat(
+            &parent,
+            *name,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(error) if observation_mismatch(error) => {
+                return Ok(crate::compensation::ObservedArtifactState::Absent);
+            }
+            Err(error) => return Err(GitError::Command(error.to_string())),
+        };
+        let held = fstat(&fd).map_err(|error| GitError::Command(error.to_string()))?;
+        let held_type = FileType::from_raw_mode(held.st_mode);
+        if !held_type.is_file() || held.st_size < 0 {
+            return Ok(crate::compensation::ObservedArtifactState::Other);
+        }
+        #[cfg(target_os = "macos")]
+        let mode = u32::from(held.st_mode & 0o7777);
+        #[cfg(not(target_os = "macos"))]
+        let mode = held.st_mode & 0o7777;
+        let size = held.st_size as u64;
+        if size != wanted.bytes {
+            return Ok(crate::compensation::ObservedArtifactState::Other);
+        }
+        let mut file = File::from(fd);
+        let mut hash = sha2::Sha256::new();
+        let mut remaining = size;
+        let mut buffer = [0u8; 8192];
+        while remaining != 0 {
+            let limit = remaining.min(buffer.len() as u64) as usize;
+            let count = file
+                .read(&mut buffer[..limit])
+                .map_err(|error| GitError::Command(error.to_string()))?;
+            if count == 0 {
+                return Ok(crate::compensation::ObservedArtifactState::Other);
+            }
+            hash.update(&buffer[..count]);
+            remaining -= count as u64;
+        }
+        let mut extra = [0u8; 1];
+        if file
+            .read(&mut extra)
+            .map_err(|error| GitError::Command(error.to_string()))?
+            != 0
+        {
+            return Ok(crate::compensation::ObservedArtifactState::Other);
+        }
+        let digest = ObjectId::new(format!("{:x}", hash.finalize())).map_err(GitError::Parse)?;
+        Ok(crate::compensation::ObservedArtifactState::Regular {
+            bytes: size,
+            digest,
+            mode,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, expected);
+        Err(GitError::Parse(
+            "descriptor-relative observations unsupported on this platform".into(),
+        ))
+    }
+}
+
 #[cfg(unix)]
 pub(crate) fn readonly_final_absent(path: &Path) -> Result<bool, GitError> {
     use rustix::fs::{AtFlags, Mode, OFlags, open, openat, statat};
@@ -3308,6 +3574,7 @@ fn truncate_slug(value: &str, cap: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compensation::CompensationObservationPort;
     use std::collections::BTreeSet;
     use std::process::Command;
     use tempfile::TempDir;
@@ -5033,6 +5300,172 @@ mod tests {
             assert_eq!(
                 artifact_fault_invocation_count(ArtifactFaultPoint::Write),
                 0
+            );
+        }
+
+        #[cfg(unix)]
+        fn test_git(cwd: &std::path::Path, args: &[&str]) {
+            let output = Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        #[cfg(unix)]
+        fn test_oid(bytes: &[u8]) -> ObjectId {
+            crate::planner::artifact_digest(bytes)
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn compensation_observer_hashes_exact_regular_and_rejects_drift_without_unbounded_read() {
+            let temp = TempDir::new().unwrap();
+            let path = temp.path().join("artifact");
+            std::fs::write(&path, b"payload").unwrap();
+            let expected =
+                crate::lifecycle::ArtifactStateV3::Regular(crate::lifecycle::RegularFileStateV3 {
+                    bytes: 7,
+                    digest: test_oid(b"payload"),
+                    mode: 0o644,
+                });
+            let observed = readonly_observe_artifact(&path, &expected).unwrap();
+            assert!(matches!(
+                observed,
+                crate::compensation::ObservedArtifactState::Regular { bytes: 7, .. }
+            ));
+            let mut wrong_digest = expected.clone();
+            if let crate::lifecycle::ArtifactStateV3::Regular(state) = &mut wrong_digest {
+                state.digest = test_oid(b"payload!");
+            }
+            assert!(matches!(
+                readonly_observe_artifact(&path, &wrong_digest).unwrap(),
+                crate::compensation::ObservedArtifactState::Regular { .. }
+            ));
+            let mut wrong_mode = expected.clone();
+            if let crate::lifecycle::ArtifactStateV3::Regular(state) = &mut wrong_mode {
+                state.mode = 0o600;
+            }
+            assert!(matches!(
+                readonly_observe_artifact(&path, &wrong_mode).unwrap(),
+                crate::compensation::ObservedArtifactState::Regular { mode, .. } if mode != 0o600
+            ));
+            std::fs::write(&path, b"different").unwrap();
+            assert!(matches!(
+                readonly_observe_artifact(&path, &expected).unwrap(),
+                crate::compensation::ObservedArtifactState::Other
+            ));
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o600);
+            std::fs::set_permissions(&path, permissions).unwrap();
+            assert!(matches!(
+                readonly_observe_artifact(&path, &expected).unwrap(),
+                crate::compensation::ObservedArtifactState::Other
+            ));
+
+            let huge = temp.path().join("huge");
+            let file = std::fs::File::create(&huge).unwrap();
+            file.set_len(1024 * 1024 * 1024).unwrap();
+            let symlink_expected =
+                crate::lifecycle::ArtifactStateV3::Symlink(crate::lifecycle::SymlinkStateV3 {
+                    target: std::path::PathBuf::from("/target").into(),
+                    target_digest: test_oid(b"/target"),
+                });
+            assert!(matches!(
+                readonly_observe_artifact(&huge, &symlink_expected).unwrap(),
+                crate::compensation::ObservedArtifactState::Other
+            ));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn compensation_observer_preserves_raw_symlink_targets_and_never_follows_them() {
+            use std::os::unix::ffi::OsStringExt;
+            use std::os::unix::fs::symlink;
+            let temp = TempDir::new().unwrap();
+            let path = temp.path().join("link");
+            let raw = std::ffi::OsString::from_vec(vec![b'x', 0x80, b'y']);
+            symlink(&raw, &path).unwrap();
+            let target = StoredPath::from(std::path::PathBuf::from(raw.clone()));
+            let expected =
+                crate::lifecycle::ArtifactStateV3::Symlink(crate::lifecycle::SymlinkStateV3 {
+                    target: target.clone(),
+                    target_digest: test_oid(raw.as_encoded_bytes()),
+                });
+            assert!(
+                matches!(readonly_observe_artifact(&path, &expected).unwrap(), crate::compensation::ObservedArtifactState::Symlink { target: actual, .. } if actual == target)
+            );
+            assert!(!readonly_final_absent(&path).unwrap());
+            assert!(matches!(
+                readonly_observe_artifact(&temp.path().join("missing"), &expected).unwrap(),
+                crate::compensation::ObservedArtifactState::Absent
+            ));
+            std::fs::create_dir(temp.path().join("directory")).unwrap();
+            assert!(matches!(
+                readonly_observe_artifact(&temp.path().join("directory"), &expected).unwrap(),
+                crate::compensation::ObservedArtifactState::Other
+            ));
+            symlink("directory", temp.path().join("ancestor")).unwrap();
+            assert!(matches!(
+                readonly_observe_artifact(&temp.path().join("ancestor/child"), &expected).unwrap(),
+                crate::compensation::ObservedArtifactState::Absent
+            ));
+            let swap = temp.path().join("swap");
+            std::fs::write(&swap, b"old").unwrap();
+            std::fs::remove_file(&swap).unwrap();
+            symlink("new-target", &swap).unwrap();
+            assert!(matches!(
+                readonly_observe_artifact(&swap, &expected).unwrap(),
+                crate::compensation::ObservedArtifactState::Symlink { .. }
+            ));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn compensation_observer_reports_registered_worktree_and_local_ref_exactly() {
+            let temp = TempDir::new().unwrap();
+            let repo = temp.path().join("repo");
+            let worktree = temp.path().join("worktree");
+            test_git(temp.path(), &["init", "-b", "main", repo.to_str().unwrap()]);
+            test_git(&repo, &["config", "user.name", "observer"]);
+            test_git(&repo, &["config", "user.email", "observer@example.invalid"]);
+            std::fs::write(repo.join("tracked"), b"x").unwrap();
+            test_git(&repo, &["add", "tracked"]);
+            test_git(&repo, &["commit", "-m", "initial"]);
+            test_git(&repo, &["branch", "feature"]);
+            test_git(
+                &repo,
+                &["worktree", "add", worktree.to_str().unwrap(), "feature"],
+            );
+            let oid = readonly_ref_oid(&repo, "refs/heads/feature")
+                .unwrap()
+                .unwrap();
+            let observed = readonly_observe_registered_worktree(&repo, &worktree)
+                .unwrap()
+                .unwrap();
+            assert_eq!(observed.path, StoredPath::from(worktree.clone()));
+            assert_eq!(observed.branch, BranchName::new("feature").unwrap());
+            assert_eq!(observed.head_oid, oid.clone());
+            assert_eq!(observed.classification, WorktreeClass::Linked);
+            assert_eq!(
+                InfrastructureCompensationObserver
+                    .observe_local_ref(&repo, &observed.branch)
+                    .unwrap(),
+                Some(oid)
+            );
+            assert_eq!(
+                InfrastructureCompensationObserver
+                    .observe_local_ref(&repo, &BranchName::new("missing").unwrap())
+                    .unwrap(),
+                None
             );
         }
     }

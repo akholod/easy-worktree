@@ -409,6 +409,7 @@ pub enum ResponseData {
     JournalList(Vec<crate::journal::Journal>),
     Journal(crate::journal::Journal),
     Execution(ExecutionResponse),
+    CompensationProposal(crate::compensation::CompensationProposalV1),
 }
 
 pub fn operation_plan_data(plan: crate::lifecycle::OperationPlan) -> ResponseData {

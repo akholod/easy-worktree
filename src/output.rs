@@ -38,6 +38,7 @@ enum JsonData {
         operation_id: String,
         outcome: &'static str,
     },
+    CompensationProposal(crate::compensation::CompensationProposalV1),
 }
 
 #[derive(serde::Serialize)]
@@ -120,6 +121,9 @@ pub fn render_text(outcome: &AppOutcome) -> Result<String, String> {
             result.operation_id,
             execution_name(result.outcome)
         )),
+        Ok(ResponseData::CompensationProposal(proposal)) => serde_json::to_string_pretty(proposal)
+            .map_err(|e| e.to_string())
+            .map(|s| format!("{s}\n")),
         Err(failure) => Err(format!(
             "{}: {}",
             failure.diagnostic.code, failure.diagnostic.message
@@ -153,6 +157,7 @@ fn json_data(data: &ResponseData) -> JsonData {
             operation_id: value.operation_id.to_string(),
             outcome: execution_name(value.outcome),
         },
+        ResponseData::CompensationProposal(value) => JsonData::CompensationProposal(value.clone()),
     }
 }
 
@@ -239,11 +244,12 @@ fn render_doctor(report: &DoctorReport) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::render_text;
+    use super::{render_json, render_text};
     use crate::{
         application::{AppOutcome, ResponseData},
         domain::{ListData, RepositorySummary},
     };
+    use std::str::FromStr;
 
     #[test]
     fn list_text_is_tabular_not_json() {
@@ -279,6 +285,77 @@ mod tests {
             super::render_text(&outcome)
                 .unwrap()
                 .ends_with("already_applied\n")
+        );
+    }
+
+    #[test]
+    fn compensation_output_is_bare_pretty_json_and_enveloped_json() {
+        let value = crate::compensation::CompensationProposalV1 {
+            proposal_schema_version: 1,
+            proposal_id: crate::compensation::ProposalId::from_str(
+                "00000000-0000-4000-8000-000000000000",
+            )
+            .unwrap(),
+            executable: false,
+            repository: crate::lifecycle::RepositoryIdentity {
+                common_dir: std::path::PathBuf::from("/repo/.git").into(),
+                primary_root: std::path::PathBuf::from("/repo").into(),
+                repository_oid: crate::lifecycle::ObjectId::new("0".repeat(40)).unwrap(),
+            },
+            source: crate::compensation::CompensationProposalSourceV1 {
+                operation_id: crate::lifecycle::OperationId::new(uuid::Uuid::nil()),
+                plan_schema_version: 3,
+                journal_schema_version: 1,
+                journal_revision: 1,
+                forward_plan_digest: crate::compensation::Sha256Digest::new("a".repeat(64))
+                    .unwrap(),
+                forward_journal_digest: crate::compensation::Sha256Digest::new("b".repeat(64))
+                    .unwrap(),
+            },
+            allowed_categories: vec![crate::compensation::CompensationAllowanceV1::Worktree],
+            steps: vec![crate::compensation::CompensationProposalStepV1 {
+                forward_step_id: crate::lifecycle::StepId::new("step").unwrap(),
+                action: crate::compensation::CompensationActionV1::RemoveCreatedWorktree(
+                    crate::lifecycle::CreatedWorktree {
+                        path: std::path::PathBuf::from("/repo/worktree").into(),
+                        branch: crate::lifecycle::BranchName::new("branch").unwrap(),
+                        expected_oid: crate::lifecycle::ObjectId::new("0".repeat(40)).unwrap(),
+                        branch_was_created: false,
+                    },
+                ),
+            }],
+        };
+        let outcome = AppOutcome::ok(
+            "recover_propose_compensation",
+            ResponseData::CompensationProposal(value),
+            Vec::new(),
+        );
+        let text = render_text(&outcome).unwrap();
+        assert!(text.starts_with('{') && text.ends_with("}\n"));
+        assert!(text.contains("\n  \"proposal_id\""));
+        let json: serde_json::Value =
+            serde_json::from_str(&render_json(&outcome).unwrap()).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["command"], "recover_propose_compensation");
+        assert_eq!(json["ok"], true);
+        assert!(json["data"]["proposal_id"].is_string());
+    }
+
+    #[test]
+    fn compensation_failure_text_is_fixed_diagnostic() {
+        let outcome = AppOutcome::fail(
+            "recover_propose_compensation",
+            crate::application::DiagnosticDto {
+                code: "compensation_state_changed".into(),
+                message: "compensation state changed".into(),
+                path: None,
+                line: None,
+                column: None,
+            },
+        );
+        assert_eq!(
+            render_text(&outcome).unwrap_err(),
+            "compensation_state_changed: compensation state changed"
         );
     }
 }

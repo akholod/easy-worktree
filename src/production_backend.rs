@@ -669,30 +669,8 @@ impl ExecutionBackend for ProductionBackend {
     type Repository = ProductionRepository;
 
     fn discover_repository(&mut self) -> Result<Self::Repository, Self::Error> {
-        let data = infrastructure::readonly_list(&self.anchor)?.data;
-        if data.repository.bare {
-            return Err(ProductionBackendError::Git(GitError::Discovery(
-                "bare repository".into(),
-            )));
-        }
-        let primary = data
-            .worktrees
-            .iter()
-            .find(|w| w.classification == WorktreeClass::Primary)
-            .ok_or_else(|| GitError::Discovery("no primary worktree".into()))?;
-        let oid = primary
-            .head_oid
-            .as_deref()
-            .ok_or_else(|| GitError::Discovery("unborn primary".into()))
-            .and_then(|v| ObjectId::new(v).map_err(GitError::Parse))?;
-        let common = data.repository.common_dir.canonicalize()?;
-        let root = primary.path.canonicalize()?;
         Ok(ProductionRepository {
-            identity: crate::lifecycle::RepositoryIdentity {
-                common_dir: common.into(),
-                primary_root: root.into(),
-                repository_oid: oid,
-            },
+            identity: infrastructure::readonly_repository_identity(&self.anchor)?,
         })
     }
     fn repository_common_dir<'a>(&self, repository: &'a Self::Repository) -> &'a Path {

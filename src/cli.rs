@@ -64,6 +64,38 @@ pub enum RecoverAction {
         #[arg(long, value_name = "PATH")]
         repo: Option<std::path::PathBuf>,
     },
+    ProposeCompensation(ProposeCompensationArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ProposeCompensationArgs {
+    pub forward_id: String,
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<std::path::PathBuf>,
+    #[arg(long)]
+    pub allow_file_artifact: bool,
+    #[arg(long)]
+    pub allow_worktree: bool,
+    #[arg(long)]
+    pub allow_local_branch: bool,
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl ProposeCompensationArgs {
+    pub fn allowances(&self) -> Vec<crate::compensation::CompensationAllowanceV1> {
+        let mut result = Vec::new();
+        if self.allow_file_artifact {
+            result.push(crate::compensation::CompensationAllowanceV1::FileArtifact);
+        }
+        if self.allow_worktree {
+            result.push(crate::compensation::CompensationAllowanceV1::Worktree);
+        }
+        if self.allow_local_branch {
+            result.push(crate::compensation::CompensationAllowanceV1::LocalBranch);
+        }
+        result
+    }
 }
 
 #[derive(Debug, Args)]
@@ -286,7 +318,7 @@ impl From<ConfigOverrideArgs> for crate::config::ConfigOverrides {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, Command};
+    use super::{Action, Command, RecoverAction};
     use crate::application::RemovePlanRequest;
     use clap::{CommandFactory, Parser};
 
@@ -462,5 +494,83 @@ mod tests {
             granted_consents
                 .contains(&crate::lifecycle::ConsentId::new("remove:remote:origin/topic").unwrap())
         );
+        assert!(
+            !granted_consents
+                .contains(&crate::lifecycle::ConsentId::new("remove:worktree").unwrap())
+        );
+    }
+
+    #[test]
+    fn compensation_command_has_exact_typed_surface() {
+        let command = Command::try_parse_from([
+            "ewtm",
+            "recover",
+            "propose-compensation",
+            "00000000-0000-4000-8000-000000000001",
+            "--repo",
+            "/repo",
+            "--allow-local-branch",
+            "--allow-file-artifact",
+            "--json",
+        ])
+        .unwrap();
+        let Action::Recover {
+            action: RecoverAction::ProposeCompensation(args),
+        } = command.action.unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(args.repo.as_deref(), Some(std::path::Path::new("/repo")));
+        assert!(args.json);
+        assert_eq!(
+            args.allowances(),
+            vec![
+                crate::compensation::CompensationAllowanceV1::FileArtifact,
+                crate::compensation::CompensationAllowanceV1::LocalBranch,
+            ]
+        );
+        assert!(
+            Command::try_parse_from([
+                "ewtm",
+                "recover",
+                "propose-compensation",
+                "id",
+                "--allow-foo"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn compensation_allowances_are_sorted_by_wire_order() {
+        let command = Command::try_parse_from([
+            "ewtm",
+            "recover",
+            "propose-compensation",
+            "00000000-0000-4000-8000-000000000001",
+            "--allow-local-branch",
+            "--allow-worktree",
+            "--allow-file-artifact",
+        ])
+        .unwrap();
+        let Action::Recover {
+            action: RecoverAction::ProposeCompensation(args),
+        } = command.action.unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            args.allowances(),
+            vec![
+                crate::compensation::CompensationAllowanceV1::FileArtifact,
+                crate::compensation::CompensationAllowanceV1::Worktree,
+                crate::compensation::CompensationAllowanceV1::LocalBranch,
+            ]
+        );
+    }
+
+    #[test]
+    fn compensation_requires_forward_id() {
+        assert!(Command::try_parse_from(["ewtm", "recover", "propose-compensation"]).is_err());
     }
 }
