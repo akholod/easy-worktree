@@ -405,9 +405,9 @@ fn applied_new_branch_proposes_read_only_reverse_plan_in_text_and_json() {
 #[test]
 fn proposal_refusals_have_stable_text_output_and_no_stdout() {
     let repo = Repo::new();
+    let existing = create_and_apply(&repo, &repo.temp.path().join("existing-worktree"));
     let id = "00000000-0000-4000-8000-000000000001";
-    let outside = repo.temp.path().join("outside");
-    fs::create_dir_all(&outside).unwrap();
+    assert_ne!(existing, id);
     let output = propose(
         &repo,
         &[
