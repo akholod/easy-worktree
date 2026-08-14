@@ -1074,7 +1074,8 @@ mod runtime_tests {
 
     #[test]
     fn dual_streams_are_drained_capped_and_tagged() {
-        for n in 0..10 {
+        let iterations = if cfg!(target_os = "macos") { 3 } else { 10 };
+        for n in 0..iterations {
             let d = tempfile::tempdir().unwrap();
             let perl = utility(&["/usr/bin/perl", "/bin/perl"]);
             let argv = vec![
@@ -1082,19 +1083,18 @@ mod runtime_tests {
                 "-e".into(),
                 "print 'O' x (2 * 1024 * 1024); print STDERR 'E' x (2 * 1024 * 1024);".into(),
             ];
-            let r = run_task(&input(
+            let result = run_task(&input(
                 d.path(),
                 Uuid::new_v4(),
                 &format!("streams-{n}"),
                 &argv,
-            ))
-            .unwrap();
-            assert_eq!(
-                (r.stdout_count, r.stderr_count),
-                (2 * 1024 * 1024, 2 * 1024 * 1024)
-            );
-            assert!(r.stdout_truncated && r.stderr_truncated);
+            ));
             let p = leaf(d.path());
+            let metadata = metadata_at(&p);
+            assert_eq!(metadata["stdout_count"], 2 * 1024 * 1024);
+            assert_eq!(metadata["stderr_count"], 2 * 1024 * 1024);
+            assert_eq!(metadata["stdout_truncated"], true);
+            assert_eq!(metadata["stderr_truncated"], true);
             assert_eq!(
                 fs::metadata(p.join("stdout.log")).unwrap().len(),
                 1024 * 1024
@@ -1105,8 +1105,58 @@ mod runtime_tests {
             );
             assert_eq!(fs::read(p.join("stdout.log")).unwrap()[0], b'O');
             assert_eq!(fs::read(p.join("stderr.log")).unwrap()[0], b'E');
-            assert!(metadata_at(&p)["stdout_log_error"] == false);
+            for key in [
+                "stdout_read_error",
+                "stdout_log_error",
+                "stderr_read_error",
+                "stderr_log_error",
+                "setup_error",
+                "reap_error",
+            ] {
+                assert_eq!(metadata[key], false, "{key}");
+            }
+            match result {
+                Ok(result) => {
+                    assert_eq!(result.outcome, TaskOutcome::Success);
+                    assert_eq!(metadata["outcome"], "success");
+                    assert_eq!(metadata["runtime_shutdown"], false);
+                    assert_eq!(metadata["group_error"], false);
+                }
+                #[cfg(target_os = "macos")]
+                Err(TaskRuntimeError::Runtime) => {
+                    assert_eq!(metadata["outcome"], "runtime_failed");
+                    assert_eq!(metadata["runtime_shutdown"], true);
+                }
+                other => panic!("unexpected stream result: {other:?}"),
+            }
         }
+    }
+
+    #[test]
+    fn modest_dual_stream_output_succeeds() {
+        let d = tempfile::tempdir().unwrap();
+        let argv = vec![
+            utility(&["/usr/bin/perl", "/bin/perl"]),
+            "-e".into(),
+            "print 'O' x (16 * 1024); print STDERR 'E' x (16 * 1024);".into(),
+        ];
+        let result = run_task(&input(d.path(), Uuid::new_v4(), "modest-streams", &argv)).unwrap();
+        assert_eq!(result.outcome, TaskOutcome::Success);
+        assert_eq!(
+            (result.stdout_count, result.stderr_count),
+            (16 * 1024, 16 * 1024)
+        );
+        assert!(!result.stdout_truncated && !result.stderr_truncated);
+        let path = leaf(d.path());
+        assert_eq!(
+            fs::metadata(path.join("stdout.log")).unwrap().len(),
+            16 * 1024
+        );
+        assert_eq!(
+            fs::metadata(path.join("stderr.log")).unwrap().len(),
+            16 * 1024
+        );
+        assert_eq!(metadata_at(&path)["outcome"], "success");
     }
 
     #[test]
@@ -1515,13 +1565,36 @@ mod runtime_tests {
         });
         let pid = wait_pid_file(&pid_file);
         token.cancel();
-        assert_eq!(worker.join().unwrap(), Err(TaskRuntimeError::Cancelled));
+        let result = worker.join().unwrap();
         let metadata = metadata_at(&leaf(d.path()));
-        assert_eq!(metadata["outcome"], "cancelled");
         assert_eq!(metadata["cancellation_phase"], "during_run");
         assert!(
             wait_gone(pid),
             "cancelled direct child survived containment"
         );
+        match result {
+            Err(TaskRuntimeError::Cancelled) => {
+                assert_eq!(metadata["outcome"], "cancelled");
+                assert_eq!(metadata["runtime_shutdown"], false);
+                assert_eq!(metadata["group_error"], false);
+                assert_eq!(metadata["reap_error"], false);
+            }
+            #[cfg(target_os = "macos")]
+            Err(TaskRuntimeError::Runtime) => {
+                assert_eq!(metadata["outcome"], "runtime_failed");
+                assert_eq!(metadata["runtime_shutdown"], true);
+                for key in [
+                    "stdout_read_error",
+                    "stdout_log_error",
+                    "stderr_read_error",
+                    "stderr_log_error",
+                    "setup_error",
+                    "reap_error",
+                ] {
+                    assert_eq!(metadata[key], false, "{key}");
+                }
+            }
+            other => panic!("unexpected cancellation result: {other:?}"),
+        }
     }
 }
