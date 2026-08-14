@@ -3115,7 +3115,7 @@ pub(crate) fn mutate_create_worktree(
                 OsString::from("worktree"),
                 OsString::from("add"),
                 destination,
-                OsString::from(reference),
+                OsString::from(branch.as_str()),
             ]
         }
         crate::lifecycle::CreateSource::RemoteTracking {

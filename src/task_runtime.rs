@@ -11,7 +11,6 @@ use uuid::Uuid;
 #[derive(Clone, Default)]
 pub(crate) struct CancellationToken(Arc<AtomicBool>);
 impl CancellationToken {
-    #[cfg(test)]
     pub(crate) fn cancel(&self) {
         self.0.store(true, Ordering::Release);
     }

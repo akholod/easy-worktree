@@ -17,6 +17,7 @@ pub enum Action {
     Tui,
     Create(CreateArgs),
     Remove(RemoveArgs),
+    Apply(ApplyArgs),
     List {
         #[arg(long)]
         json: bool,
@@ -37,6 +38,15 @@ pub enum Action {
         #[command(subcommand)]
         action: RecoverAction,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct ApplyArgs {
+    pub plan: std::path::PathBuf,
+    #[arg(long = "confirm-plan")]
+    pub confirm_plan: String,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -283,6 +293,40 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Command::command().debug_assert();
+    }
+
+    #[test]
+    fn apply_syntax_requires_path_and_confirmation() {
+        let command = Command::try_parse_from([
+            "ewtm",
+            "apply",
+            "plan.json",
+            "--confirm-plan",
+            &"a".repeat(64),
+            "--json",
+        ])
+        .unwrap();
+        let Action::Apply(args) = command.action.unwrap() else {
+            panic!("apply");
+        };
+        assert_eq!(args.plan, std::path::PathBuf::from("plan.json"));
+        assert!(args.json);
+        assert!(Command::try_parse_from(["ewtm", "apply", "plan.json"]).is_err());
+        assert!(
+            Command::try_parse_from([
+                "ewtm",
+                "apply",
+                "plan.json",
+                "--json",
+                "--confirm-plan",
+                &"a".repeat(64),
+            ])
+            .is_ok()
+        );
+        assert!(
+            Command::try_parse_from(["ewtm", "apply", "-", "--confirm-plan", &"a".repeat(64),])
+                .is_ok()
+        );
     }
 
     #[test]

@@ -1,8 +1,14 @@
 #[cfg(unix)]
 use crate::task_runtime::RuntimeInput;
 use crate::{
+    application::{
+        ApplyError, ExecutionOutcomeKind, ExecutionResult, ForwardExecutionPort, PreparedApply,
+    },
     domain::{CheckoutStatus, WorktreeClass},
-    execution::{ConditionResult, ExecutionBackend, ProbeCapability, ProbeContext, ProbeVerdict},
+    execution::{
+        ConditionResult, ExecutionBackend, ExecutionEngine, ExecutionError, ExecutionOutcome,
+        ProbeCapability, ProbeContext, ProbeVerdict,
+    },
     infrastructure::{self, GitError},
     lifecycle::{ObjectId, OperationPlan, PlanStep, Postcondition, Precondition, StepAction},
     task_runtime::{CancellationToken, TimingPolicy},
@@ -81,7 +87,7 @@ impl ProductionBackend {
         }
     }
 
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         self.cancellation.clone()
     }
@@ -346,6 +352,189 @@ impl ProductionBackend {
                 matches!(infrastructure::readonly_observe_absolute_node(path.as_path())?, Some(infrastructure::ObservedNode::Symlink { target }) if target == expected.target.as_path())
             }
         })
+    }
+}
+
+pub(crate) trait SignalGuard {
+    fn exit_override(&self) -> Option<u8>;
+}
+
+pub(crate) trait SignalScope {
+    type Guard: SignalGuard;
+
+    fn install(&self, token: &CancellationToken) -> Result<Self::Guard, ApplyError>;
+}
+
+pub(crate) struct NoopSignalScope;
+
+impl SignalScope for NoopSignalScope {
+    type Guard = ();
+
+    fn install(&self, _token: &CancellationToken) -> Result<Self::Guard, ApplyError> {
+        Ok(())
+    }
+}
+
+impl SignalGuard for () {
+    fn exit_override(&self) -> Option<u8> {
+        None
+    }
+}
+
+pub(crate) struct ProductionForwardExecution<S = NoopSignalScope> {
+    signal_scope: S,
+}
+
+impl ProductionForwardExecution<NoopSignalScope> {
+    #[allow(dead_code)]
+    pub(crate) fn new() -> Self {
+        Self {
+            signal_scope: NoopSignalScope,
+        }
+    }
+}
+
+impl<S: SignalScope> ProductionForwardExecution<S> {
+    pub(crate) fn with_signal_scope(signal_scope: S) -> Self {
+        Self { signal_scope }
+    }
+}
+
+impl<S: SignalScope> ForwardExecutionPort for ProductionForwardExecution<S> {
+    fn execute(&self, prepared: PreparedApply) -> Result<ExecutionResult, ApplyError> {
+        let backend = ProductionBackend::new(prepared.anchor().as_path().to_owned());
+        let token = backend.cancellation_token();
+        let signal_guard = self.signal_scope.install(&token)?;
+        let mut engine = ExecutionEngine::new(backend);
+        let execution = engine.execute(prepared.into_plan());
+        let exit_override = signal_guard.exit_override();
+        let result = match execution {
+            Ok(outcome) => Ok(map_execution_outcome(outcome)),
+            Err(error) => Err(map_execution_error(error)),
+        };
+        drop(signal_guard);
+        result
+            .map(|mut value| {
+                value.exit_override = exit_override;
+                value
+            })
+            .map_err(|mut error| {
+                error.exit_override = exit_override;
+                error
+            })
+    }
+}
+
+pub(crate) fn map_execution_outcome(outcome: ExecutionOutcome) -> ExecutionResult {
+    match outcome {
+        ExecutionOutcome::Applied { operation_id } => ExecutionResult {
+            operation_id,
+            outcome: ExecutionOutcomeKind::Applied,
+            step_id: None,
+            detail: None,
+            exit_override: None,
+        },
+        ExecutionOutcome::AlreadyApplied { operation_id } => ExecutionResult {
+            operation_id,
+            outcome: ExecutionOutcomeKind::AlreadyApplied,
+            step_id: None,
+            detail: None,
+            exit_override: None,
+        },
+        ExecutionOutcome::PreflightRefused { operation_id, .. } => ExecutionResult {
+            operation_id,
+            outcome: ExecutionOutcomeKind::PreflightRefused,
+            step_id: None,
+            detail: Some("precondition refused".into()),
+            exit_override: None,
+        },
+        ExecutionOutcome::Paused {
+            operation_id,
+            step_id,
+            ..
+        } => ExecutionResult {
+            operation_id,
+            outcome: ExecutionOutcomeKind::Paused,
+            step_id: Some(step_id),
+            detail: Some("execution paused".into()),
+            exit_override: None,
+        },
+        ExecutionOutcome::NeedsAttention {
+            operation_id,
+            step_id,
+        } => ExecutionResult {
+            operation_id,
+            outcome: ExecutionOutcomeKind::NeedsAttention,
+            step_id: Some(step_id),
+            detail: Some("execution needs attention".into()),
+            exit_override: None,
+        },
+        ExecutionOutcome::ExistingOperation {
+            operation_id,
+            status,
+        } => ExecutionResult {
+            operation_id,
+            outcome: ExecutionOutcomeKind::ExistingOperation,
+            step_id: None,
+            detail: Some(status.as_str().into()),
+            exit_override: None,
+        },
+    }
+}
+
+pub(crate) fn map_execution_error<E>(error: ExecutionError<E>) -> ApplyError {
+    match error {
+        ExecutionError::Backend(_) => ApplyError {
+            code: "backend_error",
+            message: "execution backend failed",
+            exit_override: None,
+        },
+        ExecutionError::Journal(error) => match error {
+            crate::journal_store::JournalError::RepositoryBusy => ApplyError {
+                code: "repository_busy",
+                message: "repository is busy",
+                exit_override: None,
+            },
+            crate::journal_store::JournalError::Corrupt(_)
+            | crate::journal_store::JournalError::InvalidId
+            | crate::journal_store::JournalError::RevisionConflict
+            | crate::journal_store::JournalError::ImmutableMismatch
+            | crate::journal_store::JournalError::InvalidTransition => ApplyError {
+                code: "journal_corrupt",
+                message: "journal is corrupt",
+                exit_override: None,
+            },
+            crate::journal_store::JournalError::NotFound => ApplyError {
+                code: "journal_io",
+                message: "journal I/O failed",
+                exit_override: None,
+            },
+            crate::journal_store::JournalError::Io(_) => ApplyError {
+                code: "journal_io",
+                message: "journal I/O failed",
+                exit_override: None,
+            },
+        },
+        ExecutionError::UnsupportedPlan(_) => ApplyError {
+            code: "unsupported_plan",
+            message: "execution plan is unsupported",
+            exit_override: None,
+        },
+        ExecutionError::MissingConsent(_) => ApplyError {
+            code: "missing_consent",
+            message: "required execution consent is missing",
+            exit_override: None,
+        },
+        ExecutionError::RepositoryIdentityMismatch => ApplyError {
+            code: "repository_identity_mismatch",
+            message: "repository identity does not match plan",
+            exit_override: None,
+        },
+        ExecutionError::ImmutableCollision => ApplyError {
+            code: "immutable_collision",
+            message: "operation identity collides with another plan",
+            exit_override: None,
+        },
     }
 }
 
@@ -4284,5 +4473,159 @@ mod tests {
                 .unwrap(),
             ProbeVerdict::Unknown
         );
+    }
+
+    #[test]
+    fn application_outcome_mapping_is_exhaustive_and_truthful() {
+        let operation_id = crate::planner::new_operation_id();
+        let step_id = StepId::new("mapping-step").unwrap();
+        let outcomes = [
+            (
+                ExecutionOutcome::Applied { operation_id },
+                ExecutionOutcomeKind::Applied,
+                true,
+            ),
+            (
+                ExecutionOutcome::AlreadyApplied { operation_id },
+                ExecutionOutcomeKind::AlreadyApplied,
+                true,
+            ),
+            (
+                ExecutionOutcome::PreflightRefused {
+                    operation_id,
+                    condition: crate::lifecycle::Precondition::BareRepositoryFalse,
+                },
+                ExecutionOutcomeKind::PreflightRefused,
+                false,
+            ),
+            (
+                ExecutionOutcome::Paused {
+                    operation_id,
+                    step_id: step_id.clone(),
+                    condition: crate::lifecycle::Precondition::BareRepositoryFalse,
+                },
+                ExecutionOutcomeKind::Paused,
+                false,
+            ),
+            (
+                ExecutionOutcome::NeedsAttention {
+                    operation_id,
+                    step_id: step_id.clone(),
+                },
+                ExecutionOutcomeKind::NeedsAttention,
+                false,
+            ),
+            (
+                ExecutionOutcome::ExistingOperation {
+                    operation_id,
+                    status: crate::journal::OperationStatus::Running,
+                },
+                ExecutionOutcomeKind::ExistingOperation,
+                false,
+            ),
+        ];
+        for (outcome, kind, success) in outcomes {
+            let result = map_execution_outcome(outcome);
+            assert_eq!(result.outcome, kind);
+            assert_eq!(result.is_success(), success);
+            assert_eq!(result.operation_id, operation_id);
+        }
+    }
+
+    #[test]
+    fn application_error_mapping_is_exhaustive_and_stable() {
+        let consent = crate::lifecycle::ConsentId::new("test-consent").unwrap();
+        let errors = [
+            (
+                ExecutionError::Backend(ProductionBackendError::TaskExecutionFailed),
+                "backend_error",
+                "execution backend failed",
+            ),
+            (
+                ExecutionError::Journal(crate::journal_store::JournalError::NotFound),
+                "journal_io",
+                "journal I/O failed",
+            ),
+            (
+                ExecutionError::UnsupportedPlan("secret".into()),
+                "unsupported_plan",
+                "execution plan is unsupported",
+            ),
+            (
+                ExecutionError::MissingConsent(consent),
+                "missing_consent",
+                "required execution consent is missing",
+            ),
+            (
+                ExecutionError::<ProductionBackendError>::RepositoryIdentityMismatch,
+                "repository_identity_mismatch",
+                "repository identity does not match plan",
+            ),
+            (
+                ExecutionError::<ProductionBackendError>::ImmutableCollision,
+                "immutable_collision",
+                "operation identity collides with another plan",
+            ),
+        ];
+        for (error, code, message) in errors {
+            let mapped = map_execution_error(error);
+            assert_eq!((mapped.code, mapped.message), (code, message));
+        }
+        let journal_errors = [
+            (
+                crate::journal_store::JournalError::RepositoryBusy,
+                "repository_busy",
+            ),
+            (crate::journal_store::JournalError::NotFound, "journal_io"),
+            (
+                crate::journal_store::JournalError::Corrupt("secret".into()),
+                "journal_corrupt",
+            ),
+            (
+                crate::journal_store::JournalError::InvalidId,
+                "journal_corrupt",
+            ),
+            (
+                crate::journal_store::JournalError::RevisionConflict,
+                "journal_corrupt",
+            ),
+            (
+                crate::journal_store::JournalError::ImmutableMismatch,
+                "journal_corrupt",
+            ),
+            (
+                crate::journal_store::JournalError::InvalidTransition,
+                "journal_corrupt",
+            ),
+            (
+                crate::journal_store::JournalError::Io(std::io::Error::other("secret")),
+                "journal_io",
+            ),
+        ];
+        for (error, code) in journal_errors {
+            assert_eq!(
+                map_execution_error::<ProductionBackendError>(ExecutionError::Journal(error)).code,
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn signal_scope_can_cancel_the_backend_token_before_execution() {
+        struct CancellingScope(std::cell::Cell<bool>);
+        impl SignalScope for CancellingScope {
+            type Guard = ();
+            fn install(&self, token: &CancellationToken) -> Result<Self::Guard, ApplyError> {
+                token.cancel();
+                self.0.set(true);
+                Ok(())
+            }
+        }
+
+        let backend = ProductionBackend::new(PathBuf::from("/unused"));
+        let token = backend.cancellation_token();
+        let scope = CancellingScope(std::cell::Cell::new(false));
+        let _ = scope.install(&token);
+        assert!(scope.0.get());
     }
 }

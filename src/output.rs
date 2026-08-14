@@ -21,13 +21,23 @@ pub struct Envelope<T> {
 enum JsonData {
     List(ListData),
     Config(crate::config::LoadedConfig),
-    Validated { valid: bool },
+    Validated {
+        valid: bool,
+    },
     Imported(crate::worktreerc::ImportResult),
-    Edited { path: crate::domain::PathDto },
-    Doctor { checks: Vec<JsonCheck> },
+    Edited {
+        path: crate::domain::PathDto,
+    },
+    Doctor {
+        checks: Vec<JsonCheck>,
+    },
     OperationPlan(crate::lifecycle::OperationPlan),
     JournalList(Vec<crate::journal::Journal>),
     Journal(crate::journal::Journal),
+    Execution {
+        operation_id: String,
+        outcome: &'static str,
+    },
 }
 
 #[derive(serde::Serialize)]
@@ -105,6 +115,11 @@ pub fn render_text(outcome: &AppOutcome) -> Result<String, String> {
             item.status().as_str(),
             item.revision()
         )),
+        Ok(ResponseData::Execution(result)) => Ok(format!(
+            "{}\t{}\n",
+            result.operation_id,
+            execution_name(result.outcome)
+        )),
         Err(failure) => Err(format!(
             "{}: {}",
             failure.diagnostic.code, failure.diagnostic.message
@@ -134,6 +149,21 @@ fn json_data(data: &ResponseData) -> JsonData {
         ResponseData::OperationPlan(value) => JsonData::OperationPlan(value.clone()),
         ResponseData::JournalList(value) => JsonData::JournalList(value.clone()),
         ResponseData::Journal(value) => JsonData::Journal(value.clone()),
+        ResponseData::Execution(value) => JsonData::Execution {
+            operation_id: value.operation_id.to_string(),
+            outcome: execution_name(value.outcome),
+        },
+    }
+}
+
+fn execution_name(outcome: crate::application::ExecutionOutcomeKind) -> &'static str {
+    match outcome {
+        crate::application::ExecutionOutcomeKind::Applied => "applied",
+        crate::application::ExecutionOutcomeKind::AlreadyApplied => "already_applied",
+        crate::application::ExecutionOutcomeKind::PreflightRefused => "preflight_refused",
+        crate::application::ExecutionOutcomeKind::Paused => "paused",
+        crate::application::ExecutionOutcomeKind::NeedsAttention => "needs_attention",
+        crate::application::ExecutionOutcomeKind::ExistingOperation => "existing_operation",
     }
 }
 
@@ -230,5 +260,25 @@ mod tests {
         );
         let text = render_text(&outcome).unwrap();
         assert!(!text.starts_with('{'));
+    }
+
+    #[test]
+    fn execution_output_uses_stable_names() {
+        let id = crate::lifecycle::OperationId::new(uuid::Uuid::new_v4());
+        let outcome = AppOutcome::ok(
+            "apply",
+            ResponseData::Execution(crate::application::ExecutionResponse {
+                operation_id: id,
+                outcome: crate::application::ExecutionOutcomeKind::AlreadyApplied,
+            }),
+            Vec::new(),
+        );
+        let json = super::render_json(&outcome).unwrap();
+        assert!(json.contains("\"outcome\":\"already_applied\""));
+        assert!(
+            super::render_text(&outcome)
+                .unwrap()
+                .ends_with("already_applied\n")
+        );
     }
 }

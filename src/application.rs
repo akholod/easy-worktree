@@ -49,6 +49,186 @@ pub trait ProcessPort {
     fn import(&self, source: &str, path: &Path) -> Result<ImportResult, Vec<Diagnostic>>;
 }
 
+pub trait PlanFilePort {
+    fn read_plan(&self, path: &Path) -> Result<Vec<u8>, PlanFileError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanFileError {
+    Missing,
+    InvalidPath,
+    NotRegular,
+    TooLarge,
+    Io,
+}
+
+impl PlanFileError {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Missing | Self::Io => "plan_file_open",
+            Self::InvalidPath => "plan_file_not_regular",
+            Self::NotRegular => "plan_file_not_regular",
+            Self::TooLarge => "plan_file_too_large",
+        }
+    }
+}
+
+pub trait ForwardExecutionPort {
+    fn execute(&self, prepared: PreparedApply) -> Result<ExecutionResult, ApplyError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedApply {
+    plan: crate::lifecycle::OperationPlan,
+    anchor: crate::domain::StoredPath,
+    raw_digest: String,
+}
+
+impl PreparedApply {
+    fn new(
+        plan: crate::lifecycle::OperationPlan,
+        raw_digest: String,
+    ) -> Result<Self, PlanPreparationError> {
+        let anchor = match plan.intent() {
+            crate::lifecycle::OperationIntent::Create(intent) => intent
+                .current_worktree_root
+                .clone()
+                .ok_or(PlanPreparationError::NonCanonical)?,
+            crate::lifecycle::OperationIntent::Remove(intent) => {
+                intent.repository.primary_root.clone()
+            }
+        };
+        Ok(Self {
+            plan,
+            anchor,
+            raw_digest,
+        })
+    }
+    pub fn plan(&self) -> &crate::lifecycle::OperationPlan {
+        &self.plan
+    }
+    pub fn anchor(&self) -> &crate::domain::StoredPath {
+        &self.anchor
+    }
+    pub fn raw_digest(&self) -> &str {
+        &self.raw_digest
+    }
+    pub fn into_plan(self) -> crate::lifecycle::OperationPlan {
+        self.plan
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionOutcomeKind {
+    Applied,
+    AlreadyApplied,
+    PreflightRefused,
+    Paused,
+    NeedsAttention,
+    ExistingOperation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionResult {
+    pub operation_id: crate::lifecycle::OperationId,
+    pub outcome: ExecutionOutcomeKind,
+    pub step_id: Option<crate::lifecycle::StepId>,
+    pub detail: Option<String>,
+    pub exit_override: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionResponse {
+    pub operation_id: crate::lifecycle::OperationId,
+    pub outcome: ExecutionOutcomeKind,
+}
+
+impl ExecutionResult {
+    pub fn is_success(&self) -> bool {
+        matches!(
+            self.outcome,
+            ExecutionOutcomeKind::Applied | ExecutionOutcomeKind::AlreadyApplied
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyError {
+    pub code: &'static str,
+    pub message: &'static str,
+    pub exit_override: Option<u8>,
+}
+
+pub struct ApplyService<'a, R, S, F, E> {
+    pub planner: &'a Application<'a, R, S>,
+    pub files: &'a F,
+    pub forward: &'a E,
+}
+
+impl<'a, R, S, F, E> ApplyService<'a, R, S, F, E>
+where
+    R: RepositoryPort + RecoveryPort,
+    S: ConfigLocationPort
+        + ConfigFilePort
+        + EditorPort
+        + EnvironmentPort
+        + ProcessPort
+        + LifecyclePlanningPort
+        + ManifestPlanningPort,
+    F: PlanFilePort,
+    E: ForwardExecutionPort,
+{
+    pub fn prepare(
+        &self,
+        path: &Path,
+        expected_digest: &str,
+    ) -> Result<PreparedApply, PlanPreparationError> {
+        let raw = self.files.read_plan(path).map_err(|error| match error {
+            PlanFileError::Missing => PlanPreparationError::FileMissing,
+            PlanFileError::InvalidPath => PlanPreparationError::FileInvalidPath,
+            PlanFileError::NotRegular => PlanPreparationError::FileNotRegular,
+            PlanFileError::Io => PlanPreparationError::FileIo,
+            PlanFileError::TooLarge => PlanPreparationError::TooLarge,
+        })?;
+        let confirmed = crate::plan_authority::confirm_plan(&raw, expected_digest).map_err(
+            |error| match error {
+                crate::plan_authority::PlanAuthorityError::DigestInvalid => {
+                    PlanPreparationError::DigestInvalid
+                }
+                crate::plan_authority::PlanAuthorityError::DigestMismatch => {
+                    PlanPreparationError::DigestMismatch
+                }
+                crate::plan_authority::PlanAuthorityError::TooLarge => {
+                    PlanPreparationError::TooLarge
+                }
+                crate::plan_authority::PlanAuthorityError::JsonInvalid => {
+                    PlanPreparationError::JsonInvalid
+                }
+                crate::plan_authority::PlanAuthorityError::NonCanonical => {
+                    PlanPreparationError::NonCanonical
+                }
+                crate::plan_authority::PlanAuthorityError::NotExecutable => {
+                    PlanPreparationError::NotExecutable
+                }
+            },
+        )?;
+        let raw_digest = confirmed.raw_digest().to_owned();
+        let plan = self.planner.prepare_confirmed_plan(&confirmed)?;
+        PreparedApply::new(plan, raw_digest)
+    }
+
+    pub fn apply(&self, path: &Path, expected_digest: &str) -> Result<ExecutionResult, ApplyError> {
+        let prepared = self
+            .prepare(path, expected_digest)
+            .map_err(|error| ApplyError {
+                code: error.code(),
+                message: error.message(),
+                exit_override: None,
+            })?;
+        self.forward.execute(prepared)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum CreateSourceRequest {
     New {
@@ -96,6 +276,10 @@ pub struct PlanningError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanPreparationError {
+    FileMissing,
+    FileInvalidPath,
+    FileNotRegular,
+    FileIo,
     DigestInvalid,
     DigestMismatch,
     TooLarge,
@@ -108,6 +292,9 @@ pub enum PlanPreparationError {
 impl PlanPreparationError {
     pub const fn code(self) -> &'static str {
         match self {
+            Self::FileMissing | Self::FileIo => "plan_file_open",
+            Self::FileInvalidPath => "plan_file_not_regular",
+            Self::FileNotRegular => "plan_file_not_regular",
             Self::DigestInvalid => "plan_digest_invalid",
             Self::DigestMismatch => "plan_digest_mismatch",
             Self::TooLarge => "plan_file_too_large",
@@ -116,6 +303,22 @@ impl PlanPreparationError {
             Self::NotExecutable => "plan_not_executable",
             Self::RegenerationFailed => "plan_regeneration_failed",
             Self::RegenerationMismatch => "plan_regeneration_mismatch",
+        }
+    }
+
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::FileMissing | Self::FileIo => "plan file could not be opened",
+            Self::FileInvalidPath => "plan file is not regular",
+            Self::FileNotRegular => "plan file is not regular",
+            Self::DigestInvalid => "plan digest is invalid",
+            Self::DigestMismatch => "plan digest does not match",
+            Self::TooLarge => "plan file is too large",
+            Self::JsonInvalid => "plan JSON is invalid",
+            Self::NonCanonical => "plan is noncanonical",
+            Self::NotExecutable => "plan is not executable",
+            Self::RegenerationFailed => "plan regeneration failed",
+            Self::RegenerationMismatch => "plan regeneration drifted",
         }
     }
 }
@@ -205,6 +408,7 @@ pub enum ResponseData {
     OperationPlan(crate::lifecycle::OperationPlan),
     JournalList(Vec<crate::journal::Journal>),
     Journal(crate::journal::Journal),
+    Execution(ExecutionResponse),
 }
 
 pub fn operation_plan_data(plan: crate::lifecycle::OperationPlan) -> ResponseData {
@@ -343,6 +547,16 @@ where
         confirmed: &crate::plan_authority::ConfirmedPlan,
     ) -> Result<crate::lifecycle::OperationPlan, PlanPreparationError> {
         let plan = confirmed.plan();
+        if let Ok(journal) = self.repository.recover_show(
+            plan.repository().primary_root.as_path(),
+            plan.operation_id(),
+        ) {
+            if journal.status() == crate::journal::OperationStatus::Applied
+                && journal.plan() == plan
+            {
+                return Ok(plan.clone());
+            }
+        }
         let outcome = match plan.intent() {
             crate::lifecycle::OperationIntent::Create(intent) => {
                 let destination = intent
@@ -2070,5 +2284,176 @@ mod tests {
         assert!(prepare(&fixture, &raw).is_err());
         let after_failure = snapshot_tree(fixture.create.primary_root.as_path().parent().unwrap());
         assert_eq!(before, after_failure);
+    }
+
+    struct ApplyFiles {
+        result: Result<Vec<u8>, PlanFileError>,
+    }
+    impl PlanFilePort for ApplyFiles {
+        fn read_plan(&self, _: &Path) -> Result<Vec<u8>, PlanFileError> {
+            self.result.clone()
+        }
+    }
+
+    struct CountingForward {
+        calls: Rc<RefCell<usize>>,
+    }
+    impl ForwardExecutionPort for CountingForward {
+        fn execute(&self, prepared: PreparedApply) -> Result<ExecutionResult, ApplyError> {
+            *self.calls.borrow_mut() += 1;
+            Ok(ExecutionResult {
+                operation_id: *prepared.plan().operation_id(),
+                outcome: ExecutionOutcomeKind::Applied,
+                step_id: None,
+                detail: None,
+                exit_override: None,
+            })
+        }
+    }
+
+    fn apply_service<'a>(
+        fixture: &'a PlanningFixture,
+        raw: Result<Vec<u8>, PlanFileError>,
+        calls: &'a Rc<RefCell<usize>>,
+    ) -> ApplyService<'a, FakeRepository, PlanningSystem<'a>, ApplyFiles, CountingForward> {
+        let system = Box::leak(Box::new(PlanningSystem { fixture }));
+        let application = Box::leak(Box::new(Application {
+            repository: &fixture.repository,
+            system,
+        }));
+        let files = Box::leak(Box::new(ApplyFiles { result: raw }));
+        let forward = Box::leak(Box::new(CountingForward {
+            calls: calls.clone(),
+        }));
+        ApplyService {
+            planner: application,
+            files,
+            forward,
+        }
+    }
+
+    #[test]
+    fn apply_does_not_forward_invalid_or_drifted_inputs() {
+        let cases = [
+            (b"{}".to_vec(), "not-a-digest", "digest_invalid"),
+            (
+                b"{}".to_vec(),
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                "digest_mismatch",
+            ),
+            (b"{".to_vec(), "", "json_invalid"),
+            (br#"{"a":1,"a":2}"#.to_vec(), "", "json_invalid"),
+        ];
+        for (raw, expected, expected_error) in cases {
+            let fixture = PlanningFixture::new();
+            let calls = Rc::new(RefCell::new(0));
+            let service = apply_service(&fixture, Ok(raw.clone()), &calls);
+            let expected = if expected.is_empty() {
+                digest(&raw)
+            } else {
+                expected.to_owned()
+            };
+            let error = service.apply(Path::new("plan"), &expected).unwrap_err();
+            assert_eq!(error.code, format!("plan_{expected_error}"));
+            assert_eq!(*calls.borrow(), 0);
+        }
+
+        let fixture = PlanningFixture::new();
+        let (_, raw) = create_plan_and_raw(&fixture);
+        let mut noncanonical = serde_json::from_slice::<serde_json::Value>(&raw).unwrap();
+        noncanonical["intent"]["Create"]
+            .as_object_mut()
+            .unwrap()
+            .remove("task_contracts");
+        let raw_noncanonical = serde_json::to_vec(&noncanonical).unwrap();
+        let calls = Rc::new(RefCell::new(0));
+        let service = apply_service(&fixture, Ok(raw_noncanonical.clone()), &calls);
+        assert_eq!(
+            service
+                .apply(Path::new("plan"), &digest(&raw_noncanonical))
+                .unwrap_err()
+                .code,
+            "plan_noncanonical"
+        );
+        assert_eq!(*calls.borrow(), 0);
+
+        let mut drifted = serde_json::from_slice::<serde_json::Value>(&raw).unwrap();
+        drifted["intent"]["Create"]["destination"] = serde_json::json!(
+            fixture
+                .create
+                .destination
+                .path
+                .as_path()
+                .with_file_name("drifted")
+        );
+        let drifted = serde_json::to_vec(&drifted).unwrap();
+        let calls = Rc::new(RefCell::new(0));
+        let service = apply_service(&fixture, Ok(drifted.clone()), &calls);
+        assert!(matches!(
+            service
+                .apply(Path::new("plan"), &digest(&drifted))
+                .unwrap_err()
+                .code,
+            "plan_regeneration_mismatch" | "plan_not_executable"
+        ));
+        assert_eq!(*calls.borrow(), 0);
+
+        let calls = Rc::new(RefCell::new(0));
+        let service = apply_service(&fixture, Err(PlanFileError::Io), &calls);
+        assert_eq!(
+            service
+                .apply(Path::new("plan"), &"0".repeat(64))
+                .unwrap_err()
+                .code,
+            "plan_file_open"
+        );
+        assert_eq!(*calls.borrow(), 0);
+    }
+
+    #[test]
+    fn apply_preparation_preserves_plan_digest_and_persisted_anchor() {
+        let fixture = PlanningFixture::new();
+        let (create_plan, create_raw) = create_plan_and_raw(&fixture);
+        let calls = Rc::new(RefCell::new(0));
+        let service = apply_service(&fixture, Ok(create_raw.clone()), &calls);
+        let prepared = service
+            .prepare(Path::new("plan"), &digest(&create_raw))
+            .unwrap();
+        assert_eq!(prepared.plan(), &create_plan);
+        assert_eq!(prepared.raw_digest(), digest(&create_raw));
+        assert_eq!(prepared.anchor(), &fixture.create.current_worktree_root);
+
+        let fixture = PlanningFixture::new();
+        let remove_plan = plan(fixture.run(Request::RemovePlan(fixture.remove_request())));
+        let remove_raw = serde_json::to_vec(&remove_plan).unwrap();
+        let calls = Rc::new(RefCell::new(0));
+        let service = apply_service(&fixture, Ok(remove_raw.clone()), &calls);
+        let prepared = service
+            .prepare(Path::new("plan"), &digest(&remove_raw))
+            .unwrap();
+        assert_eq!(prepared.plan(), &remove_plan);
+        assert_eq!(prepared.anchor(), &fixture.remove.repository.primary_root);
+    }
+
+    #[test]
+    fn apply_error_distinctions_are_stable() {
+        let fixture = PlanningFixture::new();
+        let calls = Rc::new(RefCell::new(0));
+        for (file_error, code) in [
+            (PlanFileError::Missing, "plan_file_open"),
+            (PlanFileError::InvalidPath, "plan_file_not_regular"),
+            (PlanFileError::NotRegular, "plan_file_not_regular"),
+            (PlanFileError::Io, "plan_file_open"),
+            (PlanFileError::TooLarge, "plan_file_too_large"),
+        ] {
+            let service = apply_service(&fixture, Err(file_error), &calls);
+            assert_eq!(
+                service
+                    .apply(Path::new("plan"), &"0".repeat(64))
+                    .unwrap_err()
+                    .code,
+                code
+            );
+        }
     }
 }

@@ -11,6 +11,7 @@ mod output;
 pub mod plan_authority;
 pub mod planner;
 pub mod production_backend;
+mod signals;
 mod system;
 mod task_runtime;
 mod tui;
@@ -78,6 +79,7 @@ fn main() -> ExitCode {
             };
             (Request::RemovePlan(request), args.json)
         }
+        cli::Action::Apply(args) => return apply(args),
         cli::Action::List { json, path } => (
             Request::List {
                 path: path.unwrap_or_else(|| PathBuf::from(".")),
@@ -187,6 +189,107 @@ fn main() -> ExitCode {
         }
     }
     if outcome.is_success() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+fn apply(args: cli::ApplyArgs) -> ExitCode {
+    let repository = infrastructure::GitCli;
+    let system = system::System;
+    let planner = Application {
+        repository: &repository,
+        system: &system,
+    };
+    let forward =
+        production_backend::ProductionForwardExecution::with_signal_scope(signals::UnixSignalScope);
+    let service = application::ApplyService {
+        planner: &planner,
+        files: &system,
+        forward: &forward,
+    };
+    let (outcome, exit_override) = match service.apply(&args.plan, &args.confirm_plan) {
+        Ok(result) if result.is_success() => (
+            application::AppOutcome::ok(
+                "apply",
+                application::ResponseData::Execution(application::ExecutionResponse {
+                    operation_id: result.operation_id,
+                    outcome: result.outcome,
+                }),
+                Vec::new(),
+            ),
+            result.exit_override,
+        ),
+        Ok(result) => {
+            let (code, message) = match result.outcome {
+                application::ExecutionOutcomeKind::PreflightRefused => {
+                    ("preflight_refused", "execution preflight was refused")
+                }
+                application::ExecutionOutcomeKind::Paused => {
+                    ("operation_paused", "execution paused")
+                }
+                application::ExecutionOutcomeKind::NeedsAttention => {
+                    ("needs_attention", "execution needs attention")
+                }
+                application::ExecutionOutcomeKind::ExistingOperation => {
+                    ("existing_operation", "an existing operation is in progress")
+                }
+                _ => ("execution_failed", "execution failed"),
+            };
+            (
+                application::AppOutcome::fail(
+                    "apply",
+                    application::DiagnosticDto {
+                        code: code.into(),
+                        message: message.into(),
+                        path: None,
+                        line: None,
+                        column: None,
+                    },
+                ),
+                result.exit_override,
+            )
+        }
+        Err(error) => (
+            application::AppOutcome::fail(
+                "apply",
+                application::DiagnosticDto {
+                    code: error.code.into(),
+                    message: error.message.into(),
+                    path: None,
+                    line: None,
+                    column: None,
+                },
+            ),
+            error.exit_override,
+        ),
+    };
+    if args.json {
+        match output::render_json(&outcome) {
+            Ok(text) => println!("{text}"),
+            Err(error) => {
+                eprintln!("failed to serialize response: {error}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        match output::render_text(&outcome) {
+            Ok(text) => {
+                if outcome.is_success() {
+                    print!("{text}");
+                } else {
+                    eprintln!("{text}");
+                }
+            }
+            Err(error) => {
+                eprintln!("{error}");
+            }
+        }
+    }
+    if let Some(code) = exit_override {
+        ExitCode::from(code)
+    } else if outcome.is_success() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)

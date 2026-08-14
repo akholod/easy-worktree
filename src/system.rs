@@ -2,7 +2,7 @@ use crate::{
     application::{
         ConfigFilePort, ConfigLocationPort, CreatePlanRequest, CreatePlanningFacts, EditorPort,
         EnvironmentPort, LifecyclePlanningPort, ManifestPlanningPort, ManifestRuleSpec,
-        PlanningError, ProcessPort, RemovePlanRequest,
+        PlanFileError, PlanFilePort, PlanningError, ProcessPort, RemovePlanRequest,
     },
     config::{ConfigLocations, LayerContents, LayerSource},
     worktreerc,
@@ -64,6 +64,64 @@ impl ConfigFilePort for System {
     fn read_import(&self, path: &Path) -> Result<String, String> {
         fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
     }
+}
+
+impl PlanFilePort for System {
+    fn read_plan(&self, path: &Path) -> Result<Vec<u8>, PlanFileError> {
+        if path == Path::new("-") || path.as_os_str().is_empty() {
+            return Err(PlanFileError::NotRegular);
+        }
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            let flags = rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC;
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(flags.bits() as i32)
+                .open(path)
+                .map_err(|error| match error.kind() {
+                    std::io::ErrorKind::NotFound => PlanFileError::Io,
+                    std::io::ErrorKind::IsADirectory | std::io::ErrorKind::InvalidInput => {
+                        PlanFileError::NotRegular
+                    }
+                    _ if (cfg!(target_os = "linux") && error.raw_os_error() == Some(40))
+                        || (cfg!(target_os = "macos") && error.raw_os_error() == Some(62)) =>
+                    {
+                        PlanFileError::NotRegular
+                    }
+                    _ => PlanFileError::Io,
+                })?
+        };
+        #[cfg(unix)]
+        {
+            let metadata = file.metadata().map_err(|_| PlanFileError::Io)?;
+            if !metadata.is_file() {
+                return Err(PlanFileError::NotRegular);
+            }
+            read_held_plan(file)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(PlanFileError::Io)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_held_plan(file: fs::File) -> Result<Vec<u8>, PlanFileError> {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    file.take(crate::plan_authority::MAX_PLAN_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| PlanFileError::Io)?;
+    if bytes.len() > crate::plan_authority::MAX_PLAN_BYTES {
+        return Err(PlanFileError::TooLarge);
+    }
+    Ok(bytes)
 }
 
 impl EnvironmentPort for System {
@@ -155,7 +213,9 @@ impl ManifestPlanningPort for System {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_home;
+    use super::{PlanFilePort, System, resolve_home};
+    use std::{fs, path::Path, process::Command};
+    use tempfile::tempdir;
 
     #[test]
     fn home_resolution_rejects_missing_and_relative_values() {
@@ -169,5 +229,92 @@ mod tests {
             resolve_home(Some("/tmp/home".into())).unwrap().to_str(),
             Some("/tmp/home")
         );
+    }
+
+    #[test]
+    fn plan_reader_accepts_exact_limit_and_rejects_limit_plus_one() {
+        let dir = tempdir().unwrap();
+        let ordinary = dir.path().join("plan.json");
+        let exact = vec![b'x'; crate::plan_authority::MAX_PLAN_BYTES];
+        fs::write(&ordinary, &exact).unwrap();
+        assert_eq!(System.read_plan(&ordinary).unwrap(), exact);
+        fs::write(
+            &ordinary,
+            vec![b'x'; crate::plan_authority::MAX_PLAN_BYTES + 1],
+        )
+        .unwrap();
+        assert_eq!(
+            System.read_plan(&ordinary),
+            Err(crate::application::PlanFileError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn plan_reader_rejects_missing_empty_and_nonregular_paths() {
+        let dir = tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        fs::write(&empty, []).unwrap();
+        assert_eq!(System.read_plan(&empty).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            System.read_plan(Path::new("-")),
+            Err(crate::application::PlanFileError::NotRegular)
+        );
+        assert_eq!(
+            System.read_plan(Path::new("")),
+            Err(crate::application::PlanFileError::NotRegular)
+        );
+        assert_eq!(
+            System.read_plan(&dir.path().join("missing")),
+            Err(crate::application::PlanFileError::Io)
+        );
+        assert_eq!(
+            System.read_plan(dir.path()),
+            Err(crate::application::PlanFileError::NotRegular)
+        );
+        #[cfg(unix)]
+        {
+            let ordinary = dir.path().join("ordinary");
+            fs::write(&ordinary, b"data").unwrap();
+            std::os::unix::fs::symlink(&ordinary, dir.path().join("link")).unwrap();
+            assert_eq!(
+                System.read_plan(&dir.path().join("link")),
+                Err(crate::application::PlanFileError::NotRegular)
+            );
+
+            let fifo = dir.path().join("fifo");
+            assert!(
+                Command::new("mkfifo")
+                    .arg(&fifo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert_eq!(
+                System.read_plan(&fifo),
+                Err(crate::application::PlanFileError::NotRegular)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_plan_reader_survives_path_replacement() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("plan");
+        let replacement = dir.path().join("replacement");
+        fs::write(&path, b"original").unwrap();
+        fs::write(&replacement, b"replacement").unwrap();
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC).bits() as i32,
+            )
+            .open(&path)
+            .unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&replacement, &path).unwrap();
+        assert_eq!(super::read_held_plan(file).unwrap(), b"original");
     }
 }
