@@ -429,20 +429,22 @@ fn proposal_refusals_have_stable_text_output_and_no_stdout() {
 #[test]
 fn invalid_operation_id_is_stable_and_does_not_access_repository() {
     let repo = Repo::new();
-    let output = propose(
-        &repo,
+    let missing = repo.temp.path().join("missing-repository");
+    let output = repo.run(
+        &repo.temp.path().join("outside"),
         &[
             "recover",
             "propose-compensation",
             "not-an-operation-id",
             "--repo",
-            repo.root.to_str().unwrap(),
+            missing.to_str().unwrap(),
             "--json",
         ],
     );
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(json(&output)["error"]["code"], "invalid_operation_id");
     assert_eq!(json(&output)["error"]["message"], "invalid operation id");
+    assert!(!missing.exists());
 }
 
 #[test]
