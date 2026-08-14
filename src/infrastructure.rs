@@ -111,7 +111,7 @@ pub(crate) fn readonly_observe_registered_worktree(
         return Err(GitError::Parse("incomplete worktree observation".into()));
     }
     Ok(Some(crate::compensation::ObservedWorktree {
-        path: StoredPath::from(item.path.clone()),
+        path: StoredPath::from(path.to_owned()),
         branch: BranchName::new(branch.to_owned()).map_err(GitError::Parse)?,
         head_oid: ObjectId::new(head_oid.to_owned()).map_err(GitError::Parse)?,
         classification: item.classification,

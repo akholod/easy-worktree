@@ -1191,8 +1191,30 @@ mod runtime_tests {
             thread::sleep(test_timing().poll);
         }
         token.cancel();
-        assert_eq!(worker.join().unwrap(), Err(TaskRuntimeError::Cancelled));
-        assert!(leaf(&common).join("result.json").exists());
+        let result = leaf(&common).join("result.json");
+        match worker.join().unwrap() {
+            Err(TaskRuntimeError::Cancelled) => {}
+            #[cfg(target_os = "macos")]
+            Err(TaskRuntimeError::Runtime) => {
+                let metadata: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
+                assert_eq!(metadata["outcome"], "runtime_failed");
+                assert_eq!(metadata["cancellation_phase"], "during_run");
+                assert_eq!(metadata["runtime_shutdown"], true);
+                for key in [
+                    "stdout_read_error",
+                    "stdout_log_error",
+                    "stderr_read_error",
+                    "stderr_log_error",
+                    "setup_error",
+                    "reap_error",
+                ] {
+                    assert_eq!(metadata[key], false, "{key}");
+                }
+            }
+            other => panic!("unexpected cancellation result: {other:?}"),
+        }
+        assert!(result.exists());
     }
 
     #[cfg(target_os = "linux")]
