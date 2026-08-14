@@ -30,7 +30,7 @@ impl Default for TimingPolicy {
         Self {
             poll: Duration::from_millis(25),
             term_grace: Duration::from_secs(2),
-            drain_grace: Duration::from_millis(250),
+            drain_grace: Duration::from_secs(2),
         }
     }
 }
@@ -39,7 +39,7 @@ fn test_timing() -> TimingPolicy {
     TimingPolicy {
         poll: Duration::from_millis(2),
         term_grace: Duration::from_millis(40),
-        drain_grace: Duration::from_millis(250),
+        drain_grace: Duration::from_secs(2),
     }
 }
 pub(crate) struct RuntimeInput<'a> {
@@ -1018,16 +1018,22 @@ mod runtime_tests {
         );
         let arg = format!("$(touch '{}');*?'\"", side.display());
         let argv = shell(&body, &[&arg]);
-        let r = run_task(&input(d.path(), Uuid::new_v4(), "a/b?*", &argv)).unwrap();
+        let operation_id = Uuid::new_v4();
+        let step_id = "a/b?*";
+        let r = run_task(&input(d.path(), operation_id, step_id, &argv)).unwrap();
         assert_eq!(r.outcome, TaskOutcome::Success);
         assert_eq!(fs::read_to_string(&marker).unwrap().trim_end(), arg);
         assert!(!side.exists());
-        let child_cwd = fs::read_to_string(leaf(d.path()).join("stdout.log")).unwrap();
+        let actual = leaf(d.path());
+        let child_cwd = fs::read_to_string(actual.join("stdout.log")).unwrap();
         assert_eq!(
             fs::canonicalize(child_cwd.trim_end()).unwrap(),
             fs::canonicalize(d.path()).unwrap()
         );
-        assert!(!leaf(d.path()).to_string_lossy().contains("a/b"));
+        assert_eq!(actual, layout(d.path(), operation_id, step_id));
+        let root = d.path().join("ewtm/task-logs/v1");
+        assert_eq!(actual.strip_prefix(&root).unwrap().components().count(), 2);
+        assert!(!root.join(operation_id.to_string()).join("a").exists());
     }
 
     #[test]
