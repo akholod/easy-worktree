@@ -3480,6 +3480,7 @@ where
 {
     let output = Command::new("git")
         .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
         .output()
         .map_err(|e| GitError::Command(e.to_string()))?;

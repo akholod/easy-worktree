@@ -104,14 +104,10 @@ fn json(output: &Output) -> Value {
 }
 
 fn append_snapshot(out: &mut Vec<u8>, root: &Path, path: &Path) {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-        Err(error) => panic!("failed to inspect {}: {error}", path.display()),
-    };
     let relative = path.strip_prefix(root).unwrap();
     out.extend_from_slice(b"path:");
     out.extend_from_slice(relative.as_os_str().as_encoded_bytes());
+    let metadata = fs::symlink_metadata(path).unwrap();
     #[cfg(unix)]
     out.extend_from_slice(
         format!(
