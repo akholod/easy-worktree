@@ -803,7 +803,6 @@ fn verify_regular(
 }
 
 #[cfg(unix)]
-#[cfg(unix)]
 fn observe_artifact(
     path: &Path,
     expected: &ArtifactStateV3,
