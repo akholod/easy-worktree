@@ -940,6 +940,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let primary = dir.path().join("primary");
         fs::create_dir_all(&primary).unwrap();
+        let primary = primary.canonicalize().unwrap();
         git(
             dir.path(),
             &["init", "-b", "main", primary.to_str().unwrap()],
