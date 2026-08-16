@@ -14,7 +14,7 @@ use crate::{
     application::{
         CreatePlanRequest, CreatePlanningFacts, CreateSourceRequest, LifecyclePlanningPort,
         ManifestPlanningPort, ManifestRuleSpec, PlanningError, RecoveryPort, RemovePlanRequest,
-        RemovePlanningFacts, RepositoryPort,
+        CreateFactsNaming, RemovePlanningFacts, RepositoryPort,
     },
     domain::{
         CheckoutStatus, ListResult, Reason, RepositorySummary, StoredPath, Warning, Worktree,
@@ -336,6 +336,7 @@ impl LifecyclePlanningPort for GitCli {
         remote: &str,
         worktree_root: Option<&str>,
         directory_prefix: Option<&str>,
+        naming: CreateFactsNaming,
     ) -> Result<CreatePlanningFacts, PlanningError> {
         let listing = self.list(&request.repo).map_err(plan_error)?;
         let primary = listing
@@ -402,11 +403,19 @@ impl LifecyclePlanningPort for GitCli {
                 }
             })
             .unwrap_or_else(|| {
+                let branch_for_path = match naming {
+                    CreateFactsNaming::Generate(ref suffix)
+                        if matches!(source, CreateSource::ExistingLocal { .. }) =>
+                    {
+                        destination_branch(branch.as_str(), Some(suffix))
+                    }
+                    _ => branch.as_str().to_owned(),
+                };
                 planner::destination_for_options(
                     worktree_root,
                     directory_prefix,
                     primary.path.as_path(),
-                    branch.as_str(),
+                    &branch_for_path,
                     request.invocation_cwd.as_path(),
                 )
             });
@@ -1239,6 +1248,10 @@ fn planning(code: &str, message: &str) -> PlanningError {
         code: code.into(),
         message: message.into(),
     }
+}
+
+fn destination_branch(branch: &str, suffix: Option<&str>) -> String {
+    suffix.map_or_else(|| branch.to_owned(), |suffix| format!("{branch}-{suffix}"))
 }
 fn plan_error(error: GitError) -> PlanningError {
     planning("git_facts", &error.to_string())
@@ -3581,6 +3594,28 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn fixed_id_destination_names_cover_source_modes_and_persistence() {
+        assert_eq!(
+            planner::destination_for_options(
+                None,
+                None,
+                Path::new("/repo/main"),
+                "feature/a-aaisem2e",
+                Path::new("/repo"),
+            ),
+            PathBuf::from("/repo/main-feature-a-aaisem2e")
+        );
+        assert_eq!(
+            destination_branch("existing", Some("aaisem2e")),
+            "existing-aaisem2e"
+        );
+        assert_eq!(
+            destination_branch("existing-aaisem2e", None),
+            "existing-aaisem2e"
+        );
+    }
+
+    #[test]
     fn destination_facts_are_read_only_and_distinguish_absent_present() {
         let temp = TempDir::new().unwrap();
         let parent = temp.path().join("parent");
@@ -3634,7 +3669,7 @@ mod tests {
             granted_consents: BTreeSet::new(),
         };
         let facts = GitCli
-            .create_facts(&request, None, "origin", None, None)
+            .create_facts(&request, None, "origin", None, None, CreateFactsNaming::Persisted)
             .unwrap();
         assert_eq!(facts.primary_count, 1);
         assert!(!facts.bare);
@@ -3646,6 +3681,235 @@ mod tests {
         let refs_before = git(&repo, ["show-ref"]).unwrap().stdout;
         let _ = facts;
         assert_eq!(git(&repo, ["show-ref"]).unwrap().stdout, refs_before);
+    }
+
+    fn facts_plan(
+        facts: CreatePlanningFacts,
+        operation_id: crate::lifecycle::OperationId,
+    ) -> planner::CreatePlanInput {
+        planner::CreatePlanInput {
+            operation_id,
+            intent: crate::lifecycle::CreateIntent {
+                repository: facts.repository.clone(),
+                source: facts.source.clone(),
+                destination: Some(facts.destination.path.clone()),
+                selected_tasks: BTreeSet::new(),
+                skipped_rules: BTreeSet::new(),
+                granted_consents: BTreeSet::new(),
+                task_contracts: Default::default(),
+                current_worktree_root: Some(facts.current_worktree_root.clone()),
+                artifact_rule_contracts: Default::default(),
+            },
+            repository: facts.repository,
+            bare: facts.bare,
+            primary_count: facts.primary_count,
+            invocation_cwd: facts.invocation_cwd.into(),
+            primary_root: facts.primary_root,
+            current_worktree_root: facts.current_worktree_root,
+            destination: facts.destination,
+            source_facts: facts.source_facts,
+            branch_checked_out: facts.branch_checked_out,
+            branch_collision: facts.branch_collision,
+            known_rules: BTreeSet::new(),
+            enabled_rules: BTreeSet::new(),
+            known_tasks: BTreeSet::new(),
+            manifests: Vec::new(),
+            tasks: Vec::new(),
+        }
+    }
+
+    fn fixed_operation_id() -> crate::lifecycle::OperationId {
+        crate::lifecycle::OperationId::new(
+            uuid::Uuid::parse_str("00112233-4455-4677-8899-aabbccddeeff").unwrap(),
+        )
+    }
+
+    fn committed_repo(temp: &TempDir) -> PathBuf {
+        let repo = temp.path().join("collision-repo");
+        run_git(temp.path(), ["init", "-b", "main", repo.to_str().unwrap()]);
+        run_git(&repo, ["config", "user.name", "facts-test"]);
+        run_git(&repo, ["config", "user.email", "facts@example.invalid"]);
+        std::fs::write(repo.join("tracked"), b"value").unwrap();
+        run_git(&repo, ["add", "tracked"]);
+        run_git(&repo, ["commit", "-m", "initial"]);
+        repo
+    }
+
+    #[test]
+    fn real_new_suffixed_branch_collision_is_observed_without_retry() {
+        let temp = TempDir::new().unwrap();
+        let repo = committed_repo(&temp);
+        let operation_id = fixed_operation_id();
+        let suffix = planner::generated_name_suffix(&operation_id);
+        let request = crate::application::CreatePlanRequest {
+            repo: repo.clone(),
+            invocation_cwd: temp.path().to_owned(),
+            source: crate::application::CreateSourceRequest::New {
+                branch: format!("feature-{suffix}"),
+                base: Some("HEAD".into()),
+            },
+            custom_path: None,
+            selected_tasks: BTreeSet::new(),
+            skipped_rules: BTreeSet::new(),
+            granted_consents: BTreeSet::new(),
+        };
+        let facts = GitCli
+            .create_facts(
+                &request,
+                None,
+                "origin",
+                None,
+                None,
+                CreateFactsNaming::Generate(suffix.clone()),
+            )
+            .unwrap();
+        let plan = planner::plan_create(facts_plan(facts, operation_id)).unwrap();
+        assert_eq!(*plan.operation_id(), operation_id);
+        assert!(matches!(
+            plan.intent(),
+            crate::lifecycle::OperationIntent::Create(intent)
+                if matches!(&intent.source, CreateSource::NewBranch { branch, .. } if branch.as_str() == format!("feature-{suffix}"))
+                    && intent.destination.as_ref().unwrap().as_path().ends_with("collision-repo-feature-aaisem2e")
+        ));
+        let explicit = temp.path().join("new-explicit");
+        std::fs::create_dir_all(&explicit).unwrap();
+        let mut explicit_request = request.clone();
+        explicit_request.custom_path = Some(explicit.clone());
+        let explicit_facts = GitCli
+            .create_facts(
+                &explicit_request,
+                None,
+                "origin",
+                None,
+                None,
+                CreateFactsNaming::Generate(suffix.clone()),
+            )
+            .unwrap();
+        assert_eq!(explicit_facts.destination.path.as_path(), explicit.as_path());
+        assert_eq!(explicit_facts.destination.state, DestinationState::Present);
+        assert!(planner::plan_create(facts_plan(explicit_facts, operation_id)).is_err());
+        run_git(&repo, ["branch", "feature-aaisem2e"]);
+        let error = match GitCli.create_facts(
+                &request,
+                None,
+                "origin",
+                None,
+                None,
+                CreateFactsNaming::Generate(suffix),
+            ) {
+            Ok(_) => panic!("suffixed branch collision was not observed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "branch_collision");
+    }
+
+    #[test]
+    fn real_remote_suffixed_local_collision_preserves_remote_ref() {
+        let temp = TempDir::new().unwrap();
+        let repo = committed_repo(&temp);
+        let remote_repo = temp.path().join("origin.git");
+        run_git(temp.path(), ["init", "--bare", remote_repo.to_str().unwrap()]);
+        run_git(&repo, ["remote", "add", "origin", remote_repo.to_str().unwrap()]);
+        run_git(&repo, ["push", "origin", "main"]);
+        run_git(&repo, ["fetch", "origin"]);
+        let custom = temp.path().join("remote-explicit");
+        let request = crate::application::CreatePlanRequest {
+            repo: repo.clone(),
+            invocation_cwd: temp.path().to_owned(),
+            source: crate::application::CreateSourceRequest::RemoteTracking {
+                remote: "origin".into(),
+                remote_branch: "main".into(),
+                local_branch: "local-aaisem2e".into(),
+            },
+            custom_path: Some(custom.clone()),
+            selected_tasks: BTreeSet::new(),
+            skipped_rules: BTreeSet::new(),
+            granted_consents: BTreeSet::new(),
+        };
+        let facts = GitCli
+            .create_facts(
+                &request,
+                None,
+                "origin",
+                None,
+                None,
+                CreateFactsNaming::Generate("aaisem2e".into()),
+            )
+            .unwrap();
+        assert_eq!(facts.destination.path.as_path(), custom.as_path());
+        run_git(&repo, ["branch", "local-aaisem2e"]);
+        let error = match GitCli.create_facts(
+                &request,
+                None,
+                "origin",
+                None,
+                None,
+                CreateFactsNaming::Generate("aaisem2e".into()),
+            ) {
+            Ok(_) => panic!("suffixed remote branch collision was not observed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "branch_collision");
+        assert!(!git(&repo, ["rev-parse", "refs/remotes/origin/main"])
+            .unwrap()
+            .stdout
+            .is_empty());
+    }
+
+    #[test]
+    fn real_existing_generated_destination_and_explicit_path_are_observed_exactly() {
+        let temp = TempDir::new().unwrap();
+        let repo = committed_repo(&temp);
+        run_git(&repo, ["branch", "existing"]);
+        let generated = planner::destination_for_options(
+            None,
+            None,
+            &repo,
+            "existing-aaisem2e",
+            temp.path(),
+        );
+        std::fs::create_dir_all(&generated).unwrap();
+        let request = crate::application::CreatePlanRequest {
+            repo: repo.clone(),
+            invocation_cwd: temp.path().to_owned(),
+            source: crate::application::CreateSourceRequest::ExistingLocal {
+                branch: "existing".into(),
+            },
+            custom_path: None,
+            selected_tasks: BTreeSet::new(),
+            skipped_rules: BTreeSet::new(),
+            granted_consents: BTreeSet::new(),
+        };
+        let facts = GitCli
+            .create_facts(
+                &request,
+                None,
+                "origin",
+                None,
+                None,
+                CreateFactsNaming::Generate("aaisem2e".into()),
+            )
+            .unwrap();
+        assert_eq!(facts.destination.state, DestinationState::Present);
+        assert!(planner::plan_create(facts_plan(facts, fixed_operation_id())).is_err());
+
+        let explicit = temp.path().join("explicit");
+        std::fs::create_dir_all(&explicit).unwrap();
+        let mut explicit_request = request;
+        explicit_request.custom_path = Some(explicit.clone());
+        let explicit_facts = GitCli
+            .create_facts(
+                &explicit_request,
+                None,
+                "origin",
+                None,
+                None,
+                CreateFactsNaming::Generate("aaisem2e".into()),
+            )
+            .unwrap();
+        assert_eq!(explicit_facts.destination.path.as_path(), explicit.as_path());
+        assert_eq!(explicit_facts.destination.state, DestinationState::Present);
+        assert!(planner::plan_create(facts_plan(explicit_facts, fixed_operation_id())).is_err());
     }
 
     #[test]

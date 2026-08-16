@@ -381,11 +381,47 @@ pub trait LifecyclePlanningPort {
         remote: &str,
         worktree_root: Option<&str>,
         directory_prefix: Option<&str>,
+        naming: CreateFactsNaming,
     ) -> Result<CreatePlanningFacts, PlanningError>;
     fn remove_facts(
         &self,
         request: &RemovePlanRequest,
     ) -> Result<RemovePlanningFacts, PlanningError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateNamingMode {
+    Generate,
+    Persisted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateFactsNaming {
+    Generate(String),
+    Persisted,
+}
+
+fn generated_branch_name(stem: &str, suffix: &str) -> String {
+    format!("{stem}-{suffix}")
+}
+
+fn generated_source(source: CreateSourceRequest, suffix: &str) -> CreateSourceRequest {
+    match source {
+        CreateSourceRequest::New { branch, base } => CreateSourceRequest::New {
+            branch: generated_branch_name(&branch, suffix),
+            base,
+        },
+        CreateSourceRequest::RemoteTracking {
+            remote,
+            remote_branch,
+            local_branch,
+        } => CreateSourceRequest::RemoteTracking {
+            remote,
+            remote_branch,
+            local_branch: generated_branch_name(&local_branch, suffix),
+        },
+        other => other,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -534,7 +570,14 @@ where
             Request::ConfigImport { repo, file } => self.import(&repo, file.as_deref()),
             Request::ConfigEdit { repo, scope } => self.edit(&repo, &scope),
             Request::Doctor { path } => self.doctor(&path),
-            Request::CreatePlan(request) => self.create_plan(request, None),
+            Request::CreatePlan(request) => {
+                let operation_id = crate::planner::new_operation_id();
+                self.create_plan(
+                    request,
+                    operation_id,
+                    CreateNamingMode::Generate,
+                )
+            }
             Request::RemovePlan(request) => self.remove_plan(request, None),
             Request::RecoverList { repo } => self.recover_list(&repo),
             Request::RecoverShow { repo, operation_id } => self.recover_show(&repo, &operation_id),
@@ -601,7 +644,8 @@ where
                         skipped_rules: intent.skipped_rules.clone(),
                         granted_consents: plan.granted_consents().clone(),
                     },
-                    Some(*plan.operation_id()),
+                    *plan.operation_id(),
+                    CreateNamingMode::Persisted,
                 )
             }
             crate::lifecycle::OperationIntent::Remove(intent) => {
@@ -716,8 +760,18 @@ where
     fn create_plan(
         &self,
         request: CreatePlanRequest,
-        operation_id: Option<crate::lifecycle::OperationId>,
+        operation_id: crate::lifecycle::OperationId,
+        naming: CreateNamingMode,
     ) -> AppOutcome {
+        let mut request = request;
+        let facts_naming = match naming {
+            CreateNamingMode::Generate => {
+                let suffix = crate::planner::generated_name_suffix(&operation_id);
+                request.source = generated_source(request.source, &suffix);
+                CreateFactsNaming::Generate(suffix)
+            }
+            CreateNamingMode::Persisted => CreateFactsNaming::Persisted,
+        };
         let loaded = match self.loaded(&request.repo, &ConfigOverrides::default()) {
             Ok(value) => value,
             Err(error) => return AppOutcome::fail("create", *error),
@@ -728,6 +782,7 @@ where
             &loaded.config.git.remote,
             loaded.config.create.worktree_root.as_deref(),
             loaded.config.create.directory_prefix.as_deref(),
+            facts_naming,
         ) {
             Ok(value) => value,
             Err(error) => {
@@ -856,7 +911,7 @@ where
             artifact_rule_contracts: BTreeMap::new(),
         };
         let input = CreatePlanInput {
-            operation_id: operation_id.unwrap_or_else(crate::planner::new_operation_id),
+            operation_id,
             repository: facts.repository,
             intent,
             bare: facts.bare,
@@ -1276,6 +1331,7 @@ mod tests {
             _remote: &str,
             _worktree_root: Option<&str>,
             _directory_prefix: Option<&str>,
+            _naming: CreateFactsNaming,
         ) -> Result<CreatePlanningFacts, PlanningError> {
             Err(PlanningError {
                 code: "test_unimplemented".into(),
@@ -1308,6 +1364,45 @@ mod tests {
             repository: &FakeRepository,
             system,
         }
+    }
+
+    #[test]
+    fn fixed_id_generate_source_modes_bind_final_names() {
+        let id = crate::lifecycle::OperationId::new(
+            uuid::Uuid::parse_str("00112233-4455-4677-8899-aabbccddeeff").unwrap(),
+        );
+        let suffix = crate::planner::generated_name_suffix(&id);
+        assert_eq!(suffix, "aaisem2e");
+        assert!(matches!(
+            generated_source(
+                CreateSourceRequest::New {
+                    branch: "feature/a".into(),
+                    base: None,
+                },
+                &suffix,
+            ),
+            CreateSourceRequest::New { branch, .. } if branch == "feature/a-aaisem2e"
+        ));
+        assert!(matches!(
+            generated_source(
+                CreateSourceRequest::RemoteTracking {
+                    remote: "origin".into(),
+                    remote_branch: "feature/a".into(),
+                    local_branch: "local".into(),
+                },
+                &suffix,
+            ),
+            CreateSourceRequest::RemoteTracking { remote, remote_branch, local_branch }
+                if remote == "origin" && remote_branch == "feature/a" && local_branch == "local-aaisem2e"
+        ));
+        assert!(matches!(
+            generated_source(
+                CreateSourceRequest::ExistingLocal { branch: "existing".into() },
+                &suffix,
+            ),
+            CreateSourceRequest::ExistingLocal { branch } if branch == "existing"
+        ));
+        assert_eq!(generated_branch_name("already-aaisem2e", &suffix), "already-aaisem2e-aaisem2e");
     }
 
     #[test]
@@ -1699,6 +1794,7 @@ mod tests {
             _: &str,
             _: Option<&str>,
             _: Option<&str>,
+            _: CreateFactsNaming,
         ) -> Result<CreatePlanningFacts, PlanningError> {
             self.fixture
                 .trace

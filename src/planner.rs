@@ -489,6 +489,22 @@ pub fn new_operation_id() -> OperationId {
     OperationId::new(Uuid::new_v4())
 }
 
+/// Returns the eight-character, ref-safe suffix bound to an operation ID.
+pub fn generated_name_suffix(operation_id: &OperationId) -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let uuid = operation_id.as_uuid();
+    let bytes = uuid.as_bytes();
+    let mut output = String::with_capacity(8);
+    let mut value = 0u64;
+    for byte in &bytes[..5] {
+        value = (value << 8) | u64::from(*byte);
+    }
+    for shift in (0..8).rev() {
+        output.push(ALPHABET[((value >> (shift * 5)) & 31) as usize] as char);
+    }
+    output
+}
+
 pub fn destination_for(
     config: Option<&CreateConfig>,
     primary: &Path,
@@ -1698,6 +1714,71 @@ pub(crate) mod tests {
     use super::*;
     use serde_json::json;
     use std::{collections::BTreeSet, path::PathBuf};
+
+    #[test]
+    fn generated_suffix_is_exact_base32_and_deterministic() {
+        let id = OperationId::new(Uuid::parse_str("00112233-4455-4677-8899-aabbccddeeff").unwrap());
+        assert_eq!(generated_name_suffix(&id), "aaisem2e");
+        assert_eq!(generated_name_suffix(&id), generated_name_suffix(&id));
+        assert!(generated_name_suffix(&id)
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte)));
+    }
+
+    #[test]
+    fn fixed_id_collision_observations_fail_without_retry() {
+        let operation_id = OperationId::new(
+            Uuid::parse_str("00112233-4455-4677-8899-aabbccddeeff").unwrap(),
+        );
+        let branch = BranchName::new("feature-aaisem2e").unwrap();
+        let oid = oid();
+        let facts = CreateSourceFacts::NewBranch {
+            branch: branch.clone(),
+            base_ref: RefName::new("HEAD").unwrap(),
+            base_oid: oid.clone(),
+            branch_absent: false,
+        };
+        let mut branch_collision = input(
+            CreateSource::NewBranch {
+                branch: branch.clone(),
+                base: None,
+            },
+            facts.clone(),
+        );
+        branch_collision.operation_id = operation_id;
+        branch_collision.branch_collision = true;
+        assert!(plan_create(branch_collision).is_err());
+
+        let mut path_collision = input(
+            CreateSource::NewBranch {
+                branch,
+                base: None,
+            },
+            facts,
+        );
+        path_collision.operation_id = operation_id;
+        path_collision.destination.state = DestinationState::Present;
+        assert!(plan_create(path_collision).is_err());
+
+        let remote_facts = CreateSourceFacts::RemoteTracking {
+            remote: RemoteName::new("origin").unwrap(),
+            remote_branch: BranchName::new("feature").unwrap(),
+            remote_oid: oid,
+            local_branch: BranchName::new("local-aaisem2e").unwrap(),
+            local_absent: false,
+        };
+        let mut remote_collision = input(
+            CreateSource::RemoteTracking {
+                remote: RemoteName::new("origin").unwrap(),
+                remote_branch: BranchName::new("feature").unwrap(),
+                local_branch: BranchName::new("local-aaisem2e").unwrap(),
+            },
+            remote_facts,
+        );
+        remote_collision.operation_id = operation_id;
+        remote_collision.branch_collision = true;
+        assert!(plan_create(remote_collision).is_err());
+    }
 
     fn oid() -> ObjectId {
         ObjectId::new("0123456789012345678901234567890123456789").unwrap()

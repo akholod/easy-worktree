@@ -207,9 +207,8 @@ fn destination_present_and_dangling_are_refused() {
 }
 
 #[test]
-fn branch_collision_and_checked_out_branch_are_refused() {
+fn generated_branch_avoids_unsuffixed_stem_and_checked_out_branch_is_refused() {
     let fixture = RepoFixture::new();
-    git(&fixture.repo, ["branch", "collision"]);
     let collision = fixture.command(&[
         "create",
         "--new",
@@ -221,8 +220,14 @@ fn branch_collision_and_checked_out_branch_are_refused() {
         "--plan",
         "--json",
     ]);
-    assert_eq!(collision.status.code(), Some(1));
-    assert_eq!(json(&collision)["error"]["code"], "branch_collision");
+    assert_eq!(collision.status.code(), Some(0));
+    assert!(json(&collision)["data"]["operation_id"].is_string());
+    let collision_json = json(&collision);
+    let planned_branch = collision_json["data"]["intent"]["Create"]["source"]["NewBranch"]["branch"]
+        .as_str()
+        .unwrap();
+    assert!(planned_branch.starts_with("collision-"));
+    assert_ne!(planned_branch, "collision");
     let checked_out = fixture.command(&[
         "create",
         "--existing-local",

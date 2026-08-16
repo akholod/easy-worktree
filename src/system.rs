@@ -3,6 +3,7 @@ use crate::{
         ConfigFilePort, ConfigLocationPort, CreatePlanRequest, CreatePlanningFacts, EditorPort,
         EnvironmentPort, LifecyclePlanningPort, ManifestPlanningPort, ManifestRuleSpec,
         PlanFileError, PlanFilePort, PlanningError, ProcessPort, RemovePlanRequest,
+        CreateFactsNaming,
     },
     config::{ConfigLocations, LayerContents, LayerSource},
     worktreerc,
@@ -183,6 +184,7 @@ impl LifecyclePlanningPort for System {
         remote: &str,
         worktree_root: Option<&str>,
         directory_prefix: Option<&str>,
+        naming: CreateFactsNaming,
     ) -> Result<crate::application::CreatePlanningFacts, PlanningError> {
         crate::infrastructure::GitCli.create_facts(
             request,
@@ -190,6 +192,7 @@ impl LifecyclePlanningPort for System {
             remote,
             worktree_root,
             directory_prefix,
+            naming,
         )
     }
     fn remove_facts(

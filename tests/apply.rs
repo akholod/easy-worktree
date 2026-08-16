@@ -137,6 +137,24 @@ fn plan_with_source(repo: &Repo, destination: &Path, source: &[&str]) -> Vec<u8>
     output.stdout
 }
 
+fn planned_branch(bytes: &[u8]) -> String {
+    let value: Value = serde_json::from_slice(bytes).unwrap();
+    let source = &value["intent"]["Create"]["source"];
+    source
+        .as_object()
+        .unwrap()
+        .values()
+        .find_map(|variant| {
+            variant
+                .get("branch")
+                .or_else(|| variant.get("local_branch"))
+        })
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
 #[test]
 fn apply_existing_local_create_and_replay() {
     let repo = Repo::new();
@@ -201,6 +219,7 @@ fn apply_remote_tracking_create_and_replay() {
         &destination,
         &["--remote", "origin/main", "--local-branch", "remote-branch"],
     );
+    let branch = planned_branch(&bytes);
     let path = repo.temp.path().join("remote-plan.json");
     fs::write(&path, &bytes).unwrap();
     let args = [
@@ -219,12 +238,13 @@ fn apply_remote_tracking_create_and_replay() {
             ["rev-parse", "--abbrev-ref", "HEAD"],
         ))
         .unwrap(),
-        "remote-branch\n"
+        format!("{branch}\n")
     );
+    let remote_config = format!("branch.{branch}.remote");
     assert!(
         String::from_utf8(git_output(
             &repo.root,
-            ["config", "--get", "branch.remote-branch.remote"],
+            ["config", "--get", remote_config.as_str()],
         ))
         .unwrap()
         .contains("origin")
@@ -405,6 +425,7 @@ fn apply_create_and_replay_are_idempotent() {
     fs::create_dir_all(&outside).unwrap();
     let destination = repo.temp.path().join("worktree");
     let bytes = plan(&repo, &destination);
+    let branch = planned_branch(&bytes);
     let plan_path = repo.temp.path().join("plan.json");
     fs::write(&plan_path, &bytes).unwrap();
     let before = repo.state();
@@ -428,10 +449,10 @@ fn apply_create_and_replay_are_idempotent() {
     assert!(
         String::from_utf8(git_output(
             &repo.root,
-            ["branch", "--list", "applied-branch"],
+            ["branch", "--list", &branch],
         ))
         .unwrap()
-        .contains("applied-branch")
+        .contains(&branch)
     );
     let recovery = repo.command(
         &outside,
