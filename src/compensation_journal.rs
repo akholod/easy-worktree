@@ -427,6 +427,9 @@ fn legal(previous: &CompensationJournalV1, next: &CompensationJournalV1) -> bool
 pub type CompensationStepState = CompensationStepStatus;
 
 #[cfg(test)]
+pub(crate) use tests::{test_sample, test_three_step};
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::compensation::*;
@@ -653,8 +656,3 @@ mod tests {
         assert!(applied.clone().successor(applied).is_err());
     }
 }
-
-#[cfg(test)]
-pub(crate) use tests::test_sample;
-#[cfg(test)]
-pub(crate) use tests::test_three_step;

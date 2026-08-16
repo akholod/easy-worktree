@@ -352,7 +352,7 @@ fn write_durable(f: &mut File, bytes: &[u8]) -> Result<(), CompensationStoreErro
             "injected temp write fault",
         )));
     }
-    f.write_all(&bytes)?;
+    f.write_all(bytes)?;
     f.flush()?;
     #[cfg(test)]
     if take_fault(StoreFault::TempFileSync) {
@@ -522,9 +522,7 @@ mod tests {
     fn missing_read_and_list_do_not_create_namespace() {
         let dir = tempdir().unwrap();
         let store = CompensationStore::new(dir.path());
-        let id = journal("00000000-0000-4000-8000-000000000000")
-            .proposal_id()
-            .clone();
+        let id = *journal("00000000-0000-4000-8000-000000000000").proposal_id();
         assert!(matches!(
             store.read(&id),
             Err(CompensationStoreError::NotFound)
@@ -913,9 +911,7 @@ mod tests {
     fn fifo_read_is_nonblocking_and_fail_closed() {
         let dir = tempdir().unwrap();
         let locked = LockedCompensationStore::acquire(dir.path()).unwrap();
-        let id = journal("00000000-0000-4000-8000-000000000000")
-            .proposal_id()
-            .clone();
+        let id = *journal("00000000-0000-4000-8000-000000000000").proposal_id();
         let path = dir
             .path()
             .join("ewtm/compensation/v1/operations/00000000-0000-4000-8000-000000000000.json");
