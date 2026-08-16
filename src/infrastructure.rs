@@ -12,9 +12,9 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::{
     application::{
-        CreatePlanRequest, CreatePlanningFacts, CreateSourceRequest, LifecyclePlanningPort,
-        ManifestPlanningPort, ManifestRuleSpec, PlanningError, RecoveryPort, RemovePlanRequest,
-        CreateFactsNaming, RemovePlanningFacts, RepositoryPort,
+        CreateFactsNaming, CreatePlanRequest, CreatePlanningFacts, CreateSourceRequest,
+        LifecyclePlanningPort, ManifestPlanningPort, ManifestRuleSpec, PlanningError, RecoveryPort,
+        RemovePlanRequest, RemovePlanningFacts, RepositoryPort,
     },
     domain::{
         CheckoutStatus, ListResult, Reason, RepositorySummary, StoredPath, Warning, Worktree,
@@ -3669,7 +3669,14 @@ mod tests {
             granted_consents: BTreeSet::new(),
         };
         let facts = GitCli
-            .create_facts(&request, None, "origin", None, None, CreateFactsNaming::Persisted)
+            .create_facts(
+                &request,
+                None,
+                "origin",
+                None,
+                None,
+                CreateFactsNaming::Persisted,
+            )
             .unwrap();
         assert_eq!(facts.primary_count, 1);
         assert!(!facts.bare);
@@ -3785,18 +3792,21 @@ mod tests {
                 CreateFactsNaming::Generate(suffix.clone()),
             )
             .unwrap();
-        assert_eq!(explicit_facts.destination.path.as_path(), explicit.as_path());
+        assert_eq!(
+            explicit_facts.destination.path.as_path(),
+            explicit.as_path()
+        );
         assert_eq!(explicit_facts.destination.state, DestinationState::Present);
         assert!(planner::plan_create(facts_plan(explicit_facts, operation_id)).is_err());
         run_git(&repo, ["branch", "feature-aaisem2e"]);
         let error = match GitCli.create_facts(
-                &request,
-                None,
-                "origin",
-                None,
-                None,
-                CreateFactsNaming::Generate(suffix),
-            ) {
+            &request,
+            None,
+            "origin",
+            None,
+            None,
+            CreateFactsNaming::Generate(suffix),
+        ) {
             Ok(_) => panic!("suffixed branch collision was not observed"),
             Err(error) => error,
         };
@@ -3808,8 +3818,14 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let repo = committed_repo(&temp);
         let remote_repo = temp.path().join("origin.git");
-        run_git(temp.path(), ["init", "--bare", remote_repo.to_str().unwrap()]);
-        run_git(&repo, ["remote", "add", "origin", remote_repo.to_str().unwrap()]);
+        run_git(
+            temp.path(),
+            ["init", "--bare", remote_repo.to_str().unwrap()],
+        );
+        run_git(
+            &repo,
+            ["remote", "add", "origin", remote_repo.to_str().unwrap()],
+        );
         run_git(&repo, ["push", "origin", "main"]);
         run_git(&repo, ["fetch", "origin"]);
         let custom = temp.path().join("remote-explicit");
@@ -3839,21 +3855,23 @@ mod tests {
         assert_eq!(facts.destination.path.as_path(), custom.as_path());
         run_git(&repo, ["branch", "local-aaisem2e"]);
         let error = match GitCli.create_facts(
-                &request,
-                None,
-                "origin",
-                None,
-                None,
-                CreateFactsNaming::Generate("aaisem2e".into()),
-            ) {
+            &request,
+            None,
+            "origin",
+            None,
+            None,
+            CreateFactsNaming::Generate("aaisem2e".into()),
+        ) {
             Ok(_) => panic!("suffixed remote branch collision was not observed"),
             Err(error) => error,
         };
         assert_eq!(error.code, "branch_collision");
-        assert!(!git(&repo, ["rev-parse", "refs/remotes/origin/main"])
-            .unwrap()
-            .stdout
-            .is_empty());
+        assert!(
+            !git(&repo, ["rev-parse", "refs/remotes/origin/main"])
+                .unwrap()
+                .stdout
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3861,13 +3879,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let repo = committed_repo(&temp);
         run_git(&repo, ["branch", "existing"]);
-        let generated = planner::destination_for_options(
-            None,
-            None,
-            &repo,
-            "existing-aaisem2e",
-            temp.path(),
-        );
+        let generated =
+            planner::destination_for_options(None, None, &repo, "existing-aaisem2e", temp.path());
         std::fs::create_dir_all(&generated).unwrap();
         let request = crate::application::CreatePlanRequest {
             repo: repo.clone(),
@@ -3907,7 +3920,10 @@ mod tests {
                 CreateFactsNaming::Generate("aaisem2e".into()),
             )
             .unwrap();
-        assert_eq!(explicit_facts.destination.path.as_path(), explicit.as_path());
+        assert_eq!(
+            explicit_facts.destination.path.as_path(),
+            explicit.as_path()
+        );
         assert_eq!(explicit_facts.destination.state, DestinationState::Present);
         assert!(planner::plan_create(facts_plan(explicit_facts, fixed_operation_id())).is_err());
     }

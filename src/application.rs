@@ -572,11 +572,7 @@ where
             Request::Doctor { path } => self.doctor(&path),
             Request::CreatePlan(request) => {
                 let operation_id = crate::planner::new_operation_id();
-                self.create_plan(
-                    request,
-                    operation_id,
-                    CreateNamingMode::Generate,
-                )
+                self.create_plan(request, operation_id, CreateNamingMode::Generate)
             }
             Request::RemovePlan(request) => self.remove_plan(request, None),
             Request::RecoverList { repo } => self.recover_list(&repo),
@@ -1402,7 +1398,10 @@ mod tests {
             ),
             CreateSourceRequest::ExistingLocal { branch } if branch == "existing"
         ));
-        assert_eq!(generated_branch_name("already-aaisem2e", &suffix), "already-aaisem2e-aaisem2e");
+        assert_eq!(
+            generated_branch_name("already-aaisem2e", &suffix),
+            "already-aaisem2e-aaisem2e"
+        );
     }
 
     #[test]

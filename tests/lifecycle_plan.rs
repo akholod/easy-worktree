@@ -223,9 +223,10 @@ fn generated_branch_avoids_unsuffixed_stem_and_checked_out_branch_is_refused() {
     assert_eq!(collision.status.code(), Some(0));
     assert!(json(&collision)["data"]["operation_id"].is_string());
     let collision_json = json(&collision);
-    let planned_branch = collision_json["data"]["intent"]["Create"]["source"]["NewBranch"]["branch"]
-        .as_str()
-        .unwrap();
+    let planned_branch =
+        collision_json["data"]["intent"]["Create"]["source"]["NewBranch"]["branch"]
+            .as_str()
+            .unwrap();
     assert!(planned_branch.starts_with("collision-"));
     assert_ne!(planned_branch, "collision");
     let checked_out = fixture.command(&[

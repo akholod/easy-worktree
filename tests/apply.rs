@@ -447,12 +447,9 @@ fn apply_create_and_replay_are_idempotent() {
     assert_eq!(first_value["data"]["outcome"], "applied");
     assert!(destination.is_dir());
     assert!(
-        String::from_utf8(git_output(
-            &repo.root,
-            ["branch", "--list", &branch],
-        ))
-        .unwrap()
-        .contains(&branch)
+        String::from_utf8(git_output(&repo.root, ["branch", "--list", &branch],))
+            .unwrap()
+            .contains(&branch)
     );
     let recovery = repo.command(
         &outside,

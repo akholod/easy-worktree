@@ -1720,16 +1720,17 @@ pub(crate) mod tests {
         let id = OperationId::new(Uuid::parse_str("00112233-4455-4677-8899-aabbccddeeff").unwrap());
         assert_eq!(generated_name_suffix(&id), "aaisem2e");
         assert_eq!(generated_name_suffix(&id), generated_name_suffix(&id));
-        assert!(generated_name_suffix(&id)
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte)));
+        assert!(
+            generated_name_suffix(&id)
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
+        );
     }
 
     #[test]
     fn fixed_id_collision_observations_fail_without_retry() {
-        let operation_id = OperationId::new(
-            Uuid::parse_str("00112233-4455-4677-8899-aabbccddeeff").unwrap(),
-        );
+        let operation_id =
+            OperationId::new(Uuid::parse_str("00112233-4455-4677-8899-aabbccddeeff").unwrap());
         let branch = BranchName::new("feature-aaisem2e").unwrap();
         let oid = oid();
         let facts = CreateSourceFacts::NewBranch {
@@ -1749,13 +1750,7 @@ pub(crate) mod tests {
         branch_collision.branch_collision = true;
         assert!(plan_create(branch_collision).is_err());
 
-        let mut path_collision = input(
-            CreateSource::NewBranch {
-                branch,
-                base: None,
-            },
-            facts,
-        );
+        let mut path_collision = input(CreateSource::NewBranch { branch, base: None }, facts);
         path_collision.operation_id = operation_id;
         path_collision.destination.state = DestinationState::Present;
         assert!(plan_create(path_collision).is_err());
