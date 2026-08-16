@@ -94,6 +94,17 @@ impl crate::compensation::LockedForwardEvidence for LockedForwardEvidence {
 }
 
 pub struct JournalEvidencePort;
+pub(crate) fn read_forward_raw_locked(
+    _lock: &RepositoryLock,
+    common_dir: &Path,
+    id: &OperationId,
+) -> Result<Vec<u8>, String> {
+    let path = common_dir.join("ewtm/journal").join(format!("{id}.json"));
+    let file = open_no_follow(&path).map_err(|e| e.to_string())?;
+    read_bounded_held_journal(file, id)
+        .map(|(_, raw)| raw)
+        .map_err(|e| e.to_string())
+}
 impl crate::compensation::ForwardEvidencePort for JournalEvidencePort {
     type Guard = LockedForwardEvidence;
     fn acquire(

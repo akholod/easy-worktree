@@ -37,8 +37,18 @@ enum StoreFault {
 #[cfg(test)]
 thread_local! { static STORE_FAULT: std::cell::Cell<Option<StoreFault>> = const { std::cell::Cell::new(None) }; }
 #[cfg(test)]
+thread_local! { static STORE_MAX_BYTES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
 pub(crate) fn inject_fault(fault: StoreFault) {
     STORE_FAULT.with(|slot| slot.set(Some(fault)));
+}
+#[cfg(test)]
+pub(crate) fn inject_max_bytes(max_bytes: usize) {
+    STORE_MAX_BYTES.with(|slot| slot.set(Some(max_bytes)));
+}
+#[cfg(test)]
+fn take_test_max_bytes() -> Option<usize> {
+    STORE_MAX_BYTES.with(|slot| slot.take())
 }
 #[cfg(test)]
 pub(crate) fn inject_fail_before_publish() {
@@ -77,12 +87,14 @@ impl From<io::Error> for CompensationStoreError {
 }
 pub struct CompensationStore {
     dir: PathBuf,
+    common_dir: PathBuf,
     max_bytes: usize,
 }
 impl CompensationStore {
     pub fn new(common: &Path) -> Self {
         Self {
             dir: common.join("ewtm/compensation/v1/operations"),
+            common_dir: common.to_path_buf(),
             max_bytes: MAX_COMPENSATION_JOURNAL_BYTES,
         }
     }
@@ -90,6 +102,7 @@ impl CompensationStore {
     fn with_max_bytes(common: &Path, max_bytes: usize) -> Self {
         Self {
             dir: common.join("ewtm/compensation/v1/operations"),
+            common_dir: common.to_path_buf(),
             max_bytes,
         }
     }
@@ -285,7 +298,7 @@ impl CompensationStore {
     }
 }
 pub struct LockedCompensationStore {
-    _lock: RepositoryLock,
+    lock: RepositoryLock,
     store: CompensationStore,
 }
 impl LockedCompensationStore {
@@ -293,8 +306,16 @@ impl LockedCompensationStore {
         let lock = RepositoryLock::acquire(common)?;
         prepare_namespace(common).map_err(JournalError::Io)?;
         Ok(Self {
-            _lock: lock,
-            store: CompensationStore::new(common),
+            lock,
+            store: {
+                #[allow(unused_mut)]
+                let mut store = CompensationStore::new(common);
+                #[cfg(test)]
+                if let Some(max_bytes) = take_test_max_bytes() {
+                    store.max_bytes = max_bytes;
+                }
+                store
+            },
         })
     }
     #[cfg(test)]
@@ -302,7 +323,7 @@ impl LockedCompensationStore {
         let lock = RepositoryLock::acquire(common)?;
         prepare_namespace(common).map_err(JournalError::Io)?;
         Ok(Self {
-            _lock: lock,
+            lock,
             store: CompensationStore::with_max_bytes(common, max_bytes),
         })
     }
@@ -331,6 +352,13 @@ impl LockedCompensationStore {
     }
     pub fn list(&self) -> Result<Vec<CompensationJournalV1>, CompensationStoreError> {
         self.store.list()
+    }
+    pub fn read_forward_raw(
+        &self,
+        id: &crate::lifecycle::OperationId,
+    ) -> Result<Vec<u8>, CompensationStoreError> {
+        crate::journal_store::read_forward_raw_locked(&self.lock, &self.store.common_dir, id)
+            .map_err(CompensationStoreError::Corrupt)
     }
 }
 fn serialize_bounded(

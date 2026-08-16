@@ -155,6 +155,24 @@ impl CompensationJournalV1 {
     pub fn steps(&self) -> &[CompensationStep] {
         &self.steps
     }
+    pub fn current_step(&self) -> Option<&CompensationStep> {
+        self.steps.iter().find(|s| {
+            matches!(
+                s.status,
+                CompensationStepStatus::Started | CompensationStepStatus::NeedsAttention
+            )
+        })
+    }
+    pub fn pending_step(&self) -> Option<&CompensationStep> {
+        self.steps
+            .iter()
+            .find(|s| s.status == CompensationStepStatus::Pending)
+    }
+    pub fn started_step(&self) -> Option<&CompensationStep> {
+        self.steps
+            .iter()
+            .find(|s| s.status == CompensationStepStatus::Started)
+    }
 
     pub fn is_canonical_initial(&self) -> bool {
         self.revision == 0
