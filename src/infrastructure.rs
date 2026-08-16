@@ -2253,6 +2253,37 @@ pub(crate) fn readonly_ref_oid(
         .map_err(GitError::Parse)
 }
 
+/// Reads the object named by a ref without asking Git to peel it to a commit.
+/// Symbolic refs are intentionally reported separately by the caller.
+pub(crate) fn readonly_direct_ref_oid(
+    cwd: &Path,
+    reference: &str,
+) -> Result<Option<crate::lifecycle::ObjectId>, GitError> {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            reference,
+        ])
+        .output()
+        .map_err(|e| GitError::Command(e.to_string()))?;
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        return Err(GitError::Command(
+            String::from_utf8_lossy(&output.stderr).trim().into(),
+        ));
+    }
+    let value = parse_line(&output.stdout)?;
+    crate::lifecycle::ObjectId::new(value.to_owned())
+        .map(Some)
+        .map_err(GitError::Parse)
+}
+
 pub(crate) fn readonly_ancestor(
     cwd: &Path,
     ancestor: &crate::lifecycle::ObjectId,
@@ -2645,7 +2676,11 @@ fn validate_mutation_path(path: &Path) -> Result<PathBuf, GitError> {
 }
 
 #[cfg(unix)]
-fn mutation_parent(path: &Path) -> Result<(rustix::fd::OwnedFd, OsString), GitError> {
+/// Opens every parent component with `NOFOLLOW`, retaining the alias handling
+/// used by forward mutations (notably macOS `/var` versus `/private/var`).
+pub(crate) fn compensation_parent(
+    path: &Path,
+) -> Result<(rustix::fd::OwnedFd, OsString), GitError> {
     use rustix::fs::{Mode, OFlags, open, openat};
     let path = validate_mutation_path(path)?;
     let name = path
@@ -2682,6 +2717,47 @@ fn mutation_parent(path: &Path) -> Result<(rustix::fd::OwnedFd, OsString), GitEr
         .map_err(|e| GitError::Command(e.to_string()))?;
     }
     Ok((fd, name))
+}
+
+#[cfg(unix)]
+pub(crate) fn mutation_parent(path: &Path) -> Result<(rustix::fd::OwnedFd, OsString), GitError> {
+    compensation_parent(path)
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+#[cfg(unix)]
+pub(crate) fn file_identity(stat: &rustix::fs::Stat) -> FileIdentity {
+    FileIdentity {
+        dev: normalize_u64(stat.st_dev),
+        ino: normalize_u64(stat.st_ino),
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn permission_mode(stat: &rustix::fs::Stat) -> u32 {
+    normalize_u32(stat.st_mode) & 0o7777
+}
+
+#[cfg(unix)]
+fn normalize_u64<T: TryInto<u64>>(value: T) -> u64 {
+    match value.try_into() {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    }
+}
+
+#[cfg(unix)]
+fn normalize_u32<T: TryInto<u32>>(value: T) -> u32 {
+    match value.try_into() {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    }
 }
 
 #[cfg(unix)]

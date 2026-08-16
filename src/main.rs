@@ -17,6 +17,7 @@ mod output;
 pub mod plan_authority;
 pub mod planner;
 pub mod production_backend;
+pub mod production_compensation_backend;
 mod signals;
 mod system;
 mod task_runtime;
