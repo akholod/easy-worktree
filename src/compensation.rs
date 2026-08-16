@@ -308,6 +308,77 @@ pub fn forward_journal_digest(raw: &[u8]) -> Sha256Digest {
     digest(b"ewtm:forward-journal:v1\0", raw)
 }
 
+/// Re-checks every immutable fact used to create a proposal.  This is pure: it
+/// performs no observation or persistence and is intended to sit inside the
+/// repository-lock guard used by a later executor.
+pub fn revalidate_proposal(
+    proposal: &CompensationProposalV1,
+    repository: &RepositoryIdentity,
+    raw_journal: &[u8],
+) -> Result<(), CompensationError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(raw_journal).map_err(|_| CompensationError::JournalCorrupt)?;
+    if !value.is_object() || crate::compensation_authority::has_duplicate_keys(raw_journal) {
+        return Err(CompensationError::JournalCorrupt);
+    }
+    let journal: Journal =
+        serde_json::from_slice(raw_journal).map_err(|_| CompensationError::JournalCorrupt)?;
+    let canonical =
+        serde_json::to_value(&journal).map_err(|_| CompensationError::JournalCorrupt)?;
+    if canonical != value {
+        return Err(CompensationError::JournalCorrupt);
+    }
+    proposal
+        .validate()
+        .map_err(|_| CompensationError::JournalCorrupt)?;
+    if proposal.repository != *repository
+        || journal.status() != OperationStatus::Applied
+        || journal.operation_id() != &proposal.source.operation_id
+        || journal.plan().repository() != &proposal.repository
+        || journal.plan().plan_schema_version() != proposal.source.plan_schema_version
+        || journal.schema_version() != proposal.source.journal_schema_version
+        || journal.revision() != proposal.source.journal_revision
+        || journal.steps().len() != journal.plan().steps().len()
+        || journal
+            .steps()
+            .iter()
+            .any(|s| s.status() != StepStatus::Applied)
+        || !matches!(
+            journal.plan().intent(),
+            crate::lifecycle::OperationIntent::Create(_)
+        )
+    {
+        return Err(CompensationError::StateChanged);
+    }
+    journal
+        .plan()
+        .validate_executable_plan()
+        .map_err(|_| CompensationError::StateChanged)?;
+    let plan_digest =
+        forward_plan_digest(journal.plan()).map_err(|_| CompensationError::Internal)?;
+    if plan_digest != proposal.source.forward_plan_digest
+        || forward_journal_digest(raw_journal) != proposal.source.forward_journal_digest
+    {
+        return Err(CompensationError::StateChanged);
+    }
+    let steps = reverse_map(&journal)?;
+    let mut allows = categories(&steps).into_iter().collect::<Vec<_>>();
+    allows.sort();
+    let regenerated = CompensationProposalV1 {
+        proposal_schema_version: 1,
+        proposal_id: proposal.proposal_id,
+        executable: false,
+        repository: repository.clone(),
+        source: proposal.source.clone(),
+        allowed_categories: allows,
+        steps,
+    };
+    if regenerated != *proposal {
+        return Err(CompensationError::StateChanged);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObservedArtifactState {
     Absent,
@@ -1245,6 +1316,38 @@ mod tests {
         Journal::new(crate::lifecycle::test_plan(1))
     }
 
+    fn revalidation_fixture() -> (CompensationProposalV1, RepositoryIdentity, Vec<u8>) {
+        let mut journal = test_journal();
+        let step_id = journal.steps()[0].id().clone();
+        journal.start_step(&step_id).unwrap();
+        journal.apply_step(&step_id).unwrap();
+        let raw = serde_json::to_vec(&journal).unwrap();
+        let repository = journal.plan().repository().clone();
+        let service = CompensationProposalService {
+            evidence: TestEvidence(TestGuard {
+                raw: raw.clone(),
+                journal: journal.clone(),
+            }),
+            observer: TestObserver {
+                discoveries: std::cell::Cell::new(0),
+                observations: std::cell::Cell::new(0),
+                repository: repository.clone(),
+            },
+            next_id: || ProposalId::from_str("00000000-0000-4000-8000-000000000001").unwrap(),
+        };
+        let proposal = service
+            .propose(
+                Path::new("/r"),
+                journal.operation_id(),
+                &[
+                    CompensationAllowanceV1::Worktree,
+                    CompensationAllowanceV1::LocalBranch,
+                ],
+            )
+            .unwrap();
+        (proposal, repository, raw)
+    }
+
     #[test]
     fn service_refuses_all_non_applied_statuses_before_mapping_observation_or_id() {
         let mut journals = Vec::new();
@@ -1447,6 +1550,180 @@ mod tests {
             String::from_utf8(bytes)
                 .unwrap()
                 .contains("\"operation_id\":\"00000000-0000-4000-8000-000000000001\"")
+        );
+    }
+
+    #[test]
+    fn revalidation_binds_exact_raw_forward_journal_and_proposal_shape() {
+        let mut journal = test_journal();
+        let id = journal.steps()[0].id().clone();
+        journal.start_step(&id).unwrap();
+        journal.apply_step(&id).unwrap();
+        let raw = serde_json::to_vec(&journal).unwrap();
+        let repository = journal.plan().repository().clone();
+        let observer = TestObserver {
+            discoveries: std::cell::Cell::new(0),
+            observations: std::cell::Cell::new(0),
+            repository: repository.clone(),
+        };
+        let service = CompensationProposalService {
+            evidence: TestEvidence(TestGuard {
+                raw: raw.clone(),
+                journal: journal.clone(),
+            }),
+            observer,
+            next_id: || ProposalId::from_str("00000000-0000-4000-8000-000000000001").unwrap(),
+        };
+        let proposal = service
+            .propose(
+                Path::new("/r"),
+                journal.operation_id(),
+                &[
+                    CompensationAllowanceV1::Worktree,
+                    CompensationAllowanceV1::LocalBranch,
+                ],
+            )
+            .unwrap();
+        assert!(revalidate_proposal(&proposal, &repository, &raw).is_ok());
+        let mut changed = proposal.clone();
+        changed.allowed_categories.clear();
+        assert_eq!(
+            revalidate_proposal(&changed, &repository, &raw),
+            Err(CompensationError::JournalCorrupt)
+        );
+        assert_eq!(
+            revalidate_proposal(&proposal, &repository, &[raw.as_slice(), b" "].concat()),
+            Err(CompensationError::StateChanged)
+        );
+        assert_eq!(
+            revalidate_proposal(&proposal, &repository, br#"{"revision":1,"revision":1}"#),
+            Err(CompensationError::JournalCorrupt)
+        );
+        assert_eq!(
+            revalidate_proposal(&proposal, &repository, &[raw.as_slice(), b"{}"].concat()),
+            Err(CompensationError::JournalCorrupt)
+        );
+        let mut wrong_repository = repository.clone();
+        wrong_repository.repository_oid =
+            ObjectId::new("1111111111111111111111111111111111111111").unwrap();
+        assert_eq!(
+            revalidate_proposal(&proposal, &wrong_repository, &raw),
+            Err(CompensationError::StateChanged)
+        );
+    }
+
+    #[test]
+    fn revalidation_axes_are_isolated_and_named() {
+        let (proposal, repository, raw) = revalidation_fixture();
+        let mut repository_drift = repository.clone();
+        repository_drift.primary_root = StoredPath::new("/other".into());
+        assert!(
+            revalidate_proposal(&proposal, &repository_drift, &raw).is_err(),
+            "proposal repository mismatch"
+        );
+
+        let mut plan_repository = serde_json::from_slice::<serde_json::Value>(&raw).unwrap();
+        plan_repository["plan"]["repository"]["primary_root"] = serde_json::json!("/other");
+        assert!(
+            revalidate_proposal(
+                &proposal,
+                &repository,
+                &serde_json::to_vec(&plan_repository).unwrap()
+            )
+            .is_err(),
+            "forward plan repository mismatch"
+        );
+
+        let mut plan_schema = serde_json::from_slice::<serde_json::Value>(&raw).unwrap();
+        plan_schema["plan"]["plan_schema_version"] = serde_json::json!(99);
+        assert!(
+            revalidate_proposal(
+                &proposal,
+                &repository,
+                &serde_json::to_vec(&plan_schema).unwrap()
+            )
+            .is_err(),
+            "plan schema"
+        );
+
+        let mut journal_schema = serde_json::from_slice::<serde_json::Value>(&raw).unwrap();
+        journal_schema["schema_version"] = serde_json::json!(99);
+        assert!(
+            revalidate_proposal(
+                &proposal,
+                &repository,
+                &serde_json::to_vec(&journal_schema).unwrap()
+            )
+            .is_err(),
+            "journal schema"
+        );
+        assert!(
+            revalidate_proposal(&proposal, &repository, b"{}").is_err(),
+            "journal corruption"
+        );
+
+        let mut journal_revision = serde_json::from_slice::<serde_json::Value>(&raw).unwrap();
+        journal_revision["revision"] = serde_json::json!(0);
+        assert!(
+            revalidate_proposal(
+                &proposal,
+                &repository,
+                &serde_json::to_vec(&journal_revision).unwrap()
+            )
+            .is_err(),
+            "journal revision"
+        );
+
+        let mut pending = serde_json::from_slice::<serde_json::Value>(&raw).unwrap();
+        pending["status"] = serde_json::json!("pending");
+        pending["steps"][0]["status"] = serde_json::json!("pending");
+        assert!(
+            revalidate_proposal(
+                &proposal,
+                &repository,
+                &serde_json::to_vec(&pending).unwrap()
+            )
+            .is_err(),
+            "non-applied operation/step"
+        );
+        assert!(
+            revalidate_proposal(&proposal, &repository, &[raw.as_slice(), b" "].concat()).is_err(),
+            "exact raw whitespace drift"
+        );
+
+        let mut plan_digest = proposal.clone();
+        plan_digest.source.forward_plan_digest = Sha256Digest::new("c".repeat(64)).unwrap();
+        assert!(
+            revalidate_proposal(&plan_digest, &repository, &raw).is_err(),
+            "plan digest"
+        );
+        let mut journal_digest = proposal.clone();
+        journal_digest.source.forward_journal_digest = Sha256Digest::new("d".repeat(64)).unwrap();
+        assert!(
+            revalidate_proposal(&journal_digest, &repository, &raw).is_err(),
+            "journal digest"
+        );
+        let mut allowance = proposal.clone();
+        allowance.allowed_categories.reverse();
+        assert!(
+            revalidate_proposal(&allowance, &repository, &raw).is_err(),
+            "allowance drift"
+        );
+        let mut action = proposal.clone();
+        if let CompensationActionV1::RemoveCreatedWorktree(ref mut worktree) =
+            action.steps[0].action
+        {
+            worktree.path = StoredPath::new("/repo/other".into());
+        }
+        assert!(
+            revalidate_proposal(&action, &repository, &raw).is_err(),
+            "action/path drift"
+        );
+        let mut order = proposal.clone();
+        order.steps.reverse();
+        assert!(
+            revalidate_proposal(&order, &repository, &raw).is_err(),
+            "regenerated reverse mismatch"
         );
     }
 }

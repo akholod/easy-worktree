@@ -111,6 +111,59 @@ impl PlanFilePort for System {
     }
 }
 
+/// Opens and reads a proposal while retaining the descriptor for the whole read.
+pub(crate) fn read_proposal_file(
+    path: &Path,
+) -> Result<Vec<u8>, crate::compensation_authority::ProposalFileError> {
+    if path == Path::new("-") || path.as_os_str().is_empty() {
+        return Err(crate::compensation_authority::ProposalFileError::NotRegular);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let flags = rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::CLOEXEC;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags.bits() as i32)
+            .open(path)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    crate::compensation_authority::ProposalFileError::Io
+                }
+                std::io::ErrorKind::IsADirectory => {
+                    crate::compensation_authority::ProposalFileError::NotRegular
+                }
+                _ if matches!(e.raw_os_error(), Some(21 | 40 | 62)) => {
+                    crate::compensation_authority::ProposalFileError::NotRegular
+                }
+                _ => crate::compensation_authority::ProposalFileError::Io,
+            })?;
+        if !file
+            .metadata()
+            .map_err(|_| crate::compensation_authority::ProposalFileError::Io)?
+            .is_file()
+        {
+            return Err(crate::compensation_authority::ProposalFileError::NotRegular);
+        }
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        file.take(crate::compensation_authority::MAX_PROPOSAL_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| crate::compensation_authority::ProposalFileError::Io)?;
+        if bytes.len() > crate::compensation_authority::MAX_PROPOSAL_BYTES {
+            return Err(crate::compensation_authority::ProposalFileError::TooLarge);
+        }
+        Ok(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(crate::compensation_authority::ProposalFileError::PlatformUnsupported)
+    }
+}
+
 #[cfg(unix)]
 fn read_held_plan(file: fs::File) -> Result<Vec<u8>, PlanFileError> {
     use std::io::Read;

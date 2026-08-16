@@ -1,6 +1,9 @@
 pub mod application;
 pub mod cli;
 pub mod compensation;
+pub mod compensation_authority;
+pub mod compensation_journal;
+pub mod compensation_store;
 pub mod config;
 pub mod domain;
 pub mod execution;

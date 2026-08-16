@@ -249,8 +249,8 @@ pub struct RepositoryLock {
 }
 impl RepositoryLock {
     pub fn acquire(common_dir: &Path) -> Result<Self, JournalError> {
+        Self::prepare_ewtm(common_dir)?;
         let dir = common_dir.join("ewtm");
-        fs::create_dir_all(&dir)?;
         let path = dir.join("repository.lock");
         let file = open_private(
             OpenOptions::new().create(true).read(true).write(true),
@@ -261,6 +261,28 @@ impl RepositoryLock {
             Ok(()) => Ok(Self { file }),
             Err(fs4::TryLockError::WouldBlock) => Err(JournalError::RepositoryBusy),
             Err(fs4::TryLockError::Error(error)) => Err(JournalError::Io(error)),
+        }
+    }
+
+    pub(crate) fn prepare_ewtm(common_dir: &Path) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags, mkdirat, open, openat};
+            let flags = OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::RDONLY;
+            let parent = open(common_dir, flags, Mode::empty()).map_err(io::Error::from)?;
+            match openat(&parent, "ewtm", flags, Mode::empty()) {
+                Ok(_) => Ok(()),
+                Err(error) if error == rustix::io::Errno::NOENT => {
+                    mkdirat(&parent, "ewtm", Mode::from_raw_mode(0o700))
+                        .map_err(io::Error::from)?;
+                    fsync_dir_fd(&parent)
+                }
+                Err(error) => Err(io::Error::from(error)),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            fs::create_dir_all(common_dir.join("ewtm"))
         }
     }
     #[cfg(unix)]
@@ -502,6 +524,11 @@ fn sync_dir(path: &Path) -> io::Result<()> {
     }
     let _ = path;
     Ok(())
+}
+
+#[cfg(unix)]
+fn fsync_dir_fd(fd: &rustix::fd::OwnedFd) -> io::Result<()> {
+    rustix::fs::fsync(fd).map_err(io::Error::from)
 }
 
 #[cfg(test)]
